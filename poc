@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+# Compute Factory POC lifecycle.
+#   ./poc up       create everything (assumes a clean slate)
+#   ./poc down     destroy everything, including user VMs, then verify nothing tagged cf:poc=true remains
+#   ./poc status   read-only overview
+# See DESIGN.md section 12.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+PROJECTS="$(dirname "$ROOT")"
+OWNER="amirasyraf"
+DOMAIN="idp.amirasyraf.dev"
+BUILDER_REPO="$OWNER/compute-factory-builder"
+PLATFORM_REPO="$OWNER/compute-factory-platform"
+PLATFORM_DIR="$PROJECTS/compute-factory-platform"
+IDP_DIR="$PROJECTS/compute-factory-idp"
+CF_DNS_DIR="$HOME/projects/cloudflare/amirasyraf.dev"
+INFRA_DIR="$ROOT/infra"
+GEN="$ROOT/.generated"
+HEALTH_URL="https://$DOMAIN/.backstage/health/v1/readiness"
+PARALLEL_DESTROYS="${PARALLEL_DESTROYS:-5}"
+
+export AWS_PROFILE="${AWS_PROFILE:-amirasyraf}"
+export AWS_REGION="ap-southeast-2" AWS_DEFAULT_REGION="ap-southeast-2"
+export AWS_PAGER=""
+export TF_IN_AUTOMATION=1 TF_INPUT=0
+export TF_PLUGIN_CACHE_DIR="$GEN/tf-plugin-cache"
+mkdir -p "$GEN/logs" "$TF_PLUGIN_CACHE_DIR"
+
+SSH_OPTS=(-i "$HOME/.ssh/id_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10)
+
+log()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+info() { printf '    %s\n' "$*"; }
+warn() { printf '    \033[33mWARN: %s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+
+tf_infra()  { terraform -chdir="$INFRA_DIR" "$@"; }
+infra_out() { tf_infra output -raw "$1" 2>/dev/null || true; }
+infra_has_state() { [[ -n "$(tf_infra state list 2>/dev/null || true)" ]]; }
+
+require_tools() {
+  local t
+  for t in terraform gh aws jq ssh git curl "$@"; do
+    command -v "$t" >/dev/null || die "missing tool: $t"
+  done
+  local acct
+  acct="$(aws sts get-caller-identity --query Account --output text 2>/dev/null)" || die "AWS profile $AWS_PROFILE not usable (aws sso login?)"
+  [[ "$acct" == "134584031874" ]] || die "AWS profile $AWS_PROFILE points at $acct, expected 134584031874"
+  gh auth status >/dev/null 2>&1 || die "gh is not authenticated"
+}
+
+ensure_repos() {
+  local r
+  for r in compute-factory-idp compute-factory-builder compute-factory-platform; do
+    if [[ ! -d "$PROJECTS/$r/.git" ]]; then
+      git clone -q "git@github.com:$OWNER/$r.git" "$PROJECTS/$r"
+    else
+      git -C "$PROJECTS/$r" pull -q --rebase || warn "could not update $r (local changes?) - using working copy as is"
+    fi
+  done
+}
+
+# Replace vms/ in the platform repo with an empty inventory, using a throwaway clone.
+reset_inventory() {
+  local tmp
+  tmp="$(mktemp -d)"
+  git clone -q --depth 1 "git@github.com:$PLATFORM_REPO.git" "$tmp/p"
+  (
+    cd "$tmp/p"
+    git rm -rq --ignore-unmatch vms
+    mkdir -p vms && touch vms/.gitkeep && git add vms/.gitkeep
+    if ! git diff --cached --quiet; then
+      git commit -qm "poc: reset VM inventory" && git push -q && echo "    inventory reset"
+    else
+      echo "    inventory already empty"
+    fi
+  )
+  rm -rf "$tmp"
+}
+
+# ---------------------------------------------------------------- up
+
+wait_for_ssh_ready() {
+  local ip="$1"
+  for _ in $(seq 1 60); do
+    if ssh "${SSH_OPTS[@]}" "ubuntu@$ip" 'test -f /var/lib/cloud/instance/cf-idp-ready' 2>/dev/null; then
+      return 0
+    fi
+    sleep 10
+  done
+  die "IDP host $ip not ready after 10 min"
+}
+
+dns_apply() { # $1 = ip or empty (remove)
+  terraform -chdir="$CF_DNS_DIR" apply -auto-approve -input=false \
+    -target=cloudflare_dns_record.idp -var "idp_ip=$1" >"$GEN/logs/dns.log" 2>&1 \
+    || { cat "$GEN/logs/dns.log" >&2; return 1; }
+}
+
+write_idp_env() {
+  # shellcheck disable=SC1091
+  set -a; source "$ROOT/.poc.env"; set +a
+  umask 077
+  cat >"$GEN/idp.env" <<EOF
+IDP_DOMAIN=$DOMAIN
+AUTH_GITHUB_CLIENT_ID=$AUTH_GITHUB_CLIENT_ID
+AUTH_GITHUB_CLIENT_SECRET=$AUTH_GITHUB_CLIENT_SECRET
+GITHUB_TOKEN=$GITHUB_TOKEN
+POSTGRES_PASSWORD=$(tf_infra output -raw postgres_password)
+BACKSTAGE_TOKEN=$(tf_infra output -raw backstage_token)
+AWS_REGION=$AWS_REGION
+SSH_CA_SECRET_ID=$(infra_out ssh_ca_secret_id)
+EOF
+}
+
+run_bake() {
+  local start id
+  start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  gh workflow run bake.yml -R "$BUILDER_REPO" --ref main
+  for _ in $(seq 1 30); do
+    id="$(gh run list -R "$BUILDER_REPO" --workflow bake.yml --event workflow_dispatch -L 5 \
+      --json databaseId,createdAt -q "[.[] | select(.createdAt >= \"$start\")][0].databaseId // empty")"
+    [[ -n "$id" ]] && break
+    sleep 5
+  done
+  [[ -n "${id:-}" ]] || die "bake run did not appear"
+  echo "bake run: https://github.com/$BUILDER_REPO/actions/runs/$id"
+  gh run watch "$id" -R "$BUILDER_REPO" --exit-status --interval 30 >/dev/null
+  aws ec2 describe-images --owners self \
+    --filters Name=tag:cf:managed,Values=true Name=tag:cf:os,Values=ubuntu \
+    --query 'sort_by(Images,&CreationDate)[-1].[ImageId,Name]' --output text
+}
+
+deploy_idp() {
+  local ip="$1"
+  wait_for_ssh_ready "$ip"
+  echo "host ready"
+  dns_apply "$ip"
+  echo "dns: $DOMAIN -> $ip"
+  write_idp_env
+  "$IDP_DIR/deploy/deploy.sh" "$ip" "$GEN/idp.env"
+  echo "waiting for $HEALTH_URL"
+  for _ in $(seq 1 60); do
+    if [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$HEALTH_URL" || true)" == "200" ]]; then
+      echo "IDP healthy"
+      return 0
+    fi
+    sleep 10
+  done
+  echo "IDP not healthy after 10 min" >&2
+  return 1
+}
+
+cmd_up() {
+  log "Preflight"
+  require_tools docker
+  [[ -f "$ROOT/.poc.env" ]] || die "missing $ROOT/.poc.env (copy poc.env.example and fill it in)"
+  # shellcheck disable=SC1091
+  ( set -a; source "$ROOT/.poc.env"; : "${AUTH_GITHUB_CLIENT_ID:?}" "${AUTH_GITHUB_CLIENT_SECRET:?}" "${GITHUB_TOKEN:?}" ) \
+    || die ".poc.env must set AUTH_GITHUB_CLIENT_ID, AUTH_GITHUB_CLIENT_SECRET, GITHUB_TOKEN"
+  ensure_repos
+  terraform -chdir="$INFRA_DIR" init -input=false >/dev/null
+  if infra_has_state && [[ "${POC_FORCE_UP:-}" != "1" ]]; then
+    die "infra state already exists - run ./poc down first (or POC_FORCE_UP=1 to converge in place)"
+  fi
+
+  log "Shared AWS infra (state bucket, SSH CA, IDP host, tokens)"
+  tf_infra apply -auto-approve -input=false >"$GEN/logs/infra-apply.log" 2>&1 \
+    || { tail -40 "$GEN/logs/infra-apply.log" >&2; die "infra apply failed"; }
+  local ip bucket
+  ip="$(infra_out idp_ip)"; bucket="$(infra_out state_bucket)"
+  info "IDP host $ip, state bucket $bucket"
+
+  log "GitHub wiring"
+  gh variable set TF_STATE_BUCKET -R "$PLATFORM_REPO" -b "$bucket"
+  gh variable set BACKSTAGE_URL -R "$PLATFORM_REPO" -b "https://$DOMAIN"
+  tf_infra output -raw backstage_token | gh secret set BACKSTAGE_TOKEN -R "$PLATFORM_REPO"
+  reset_inventory
+
+  log "Bake golden image + deploy IDP (in parallel)"
+  run_bake   >"$GEN/logs/bake.log" 2>&1 & local bake_pid=$!
+  deploy_idp "$ip" >"$GEN/logs/idp.log" 2>&1 & local idp_pid=$!
+  info "logs: $GEN/logs/bake.log, $GEN/logs/idp.log"
+  local rc=0
+  wait "$bake_pid" || { warn "bake failed:"; tail -20 "$GEN/logs/bake.log" >&2; rc=1; }
+  wait "$idp_pid"  || { warn "IDP deploy failed:"; tail -30 "$GEN/logs/idp.log" >&2; rc=1; }
+  [[ $rc -eq 0 ]] || die "up failed (resources are left in place; run ./poc down to clean up)"
+
+  log "Up"
+  info "IDP:          https://$DOMAIN"
+  info "Golden image: $(tail -1 "$GEN/logs/bake.log")"
+  info "IDP host:     ssh ubuntu@$ip"
+}
+
+# ---------------------------------------------------------------- down
+
+cancel_runs() {
+  local repo ids id
+  for repo in "$PLATFORM_REPO" "$BUILDER_REPO"; do
+    ids="$(gh run list -R "$repo" -L 100 --json databaseId,status -q '.[] | select(.status != "completed") | .databaseId' 2>/dev/null || true)"
+    for id in $ids; do
+      gh run cancel "$id" -R "$repo" >/dev/null 2>&1 && info "cancelled $repo run $id" || true
+    done
+  done
+  # Let cancelled jobs finish their cleanup (Packer removes its build instance, Terraform releases locks).
+  for _ in $(seq 1 30); do
+    ids=""
+    for repo in "$PLATFORM_REPO" "$BUILDER_REPO"; do
+      ids+="$(gh run list -R "$repo" -L 100 --json status -q '.[] | select(.status != "completed") | .status' 2>/dev/null || true)"
+    done
+    [[ -z "$ids" ]] && return 0
+    sleep 10
+  done
+  warn "some runs still not completed after 5 min; continuing"
+}
+
+stop_idp() {
+  local ip
+  ip="$(infra_out idp_ip)"
+  [[ -n "$ip" ]] || return 0
+  ssh "${SSH_OPTS[@]}" "ubuntu@$ip" 'cd /opt/idp 2>/dev/null && docker compose down' >/dev/null 2>&1 \
+    && info "IDP stopped" || info "IDP not reachable (already gone?)"
+}
+
+# Called per VM by xargs: ./poc _destroy_vm <bucket> <platform> <name>
+cmd_destroy_vm() {
+  local bucket="$1" platform="$2" name="$3"
+  local key="vms/$platform/$name/terraform.tfstate"
+  local dir="$PLATFORM_DIR/terraform/platforms/$platform"
+  [[ -d "$dir" ]] || { echo "[$name] no terraform root for platform '$platform'; leaving it to the tag sweep"; return 0; }
+  export TF_DATA_DIR="$GEN/tf-vms/$platform-$name"
+  aws s3 rm "s3://$bucket/$key.tflock" >/dev/null 2>&1 || true # runs are cancelled; stale locks only
+  if terraform -chdir="$dir" init -input=false -reconfigure \
+       -backend-config="bucket=$bucket" -backend-config="key=$key" \
+       -backend-config="region=$AWS_REGION" -backend-config="use_lockfile=true" >"$GEN/logs/vm-$name.log" 2>&1 \
+     && terraform -chdir="$dir" destroy -auto-approve -input=false -var "name=$name" >>"$GEN/logs/vm-$name.log" 2>&1; then
+    echo "[$name] destroyed"
+  else
+    echo "[$name] terraform destroy failed (see $GEN/logs/vm-$name.log); the tag sweep will catch leftovers"
+  fi
+  rm -rf "$TF_DATA_DIR"
+}
+
+destroy_vms() {
+  local bucket="$1"
+  aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1 || { info "no state bucket; skipping"; return 0; }
+  local keys
+  keys="$(aws s3api list-objects-v2 --bucket "$bucket" --prefix vms/ --query 'Contents[].Key' --output text 2>/dev/null | tr '\t' '\n' | grep '/terraform.tfstate$' || true)"
+  [[ -n "$keys" ]] || { info "no VMs"; return 0; }
+  echo "$keys" | awk -F/ -v b="$bucket" '{print b, $2, $3}' \
+    | xargs -n 3 -P "$PARALLEL_DESTROYS" "$0" _destroy_vm
+}
+
+# Remove everything tagged cf:poc=true that Terraform does not (or no longer) know about.
+sweep_tagged() {
+  local exclude_infra="$1" ids q
+  q='Reservations[].Instances[]'
+  [[ "$exclude_infra" == "1" ]] && q+='[?!(Tags[?Key==`cf:module`&&Value==`infra`])]'
+  ids="$( {
+      aws ec2 describe-instances --filters Name=tag:cf:poc,Values=true \
+        Name=instance-state-name,Values=pending,running,stopping,stopped --query "$q.InstanceId" --output text
+      aws ec2 describe-instances --filters 'Name=key-name,Values=packer_*' \
+        Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].InstanceId' --output text
+    } | tr '\t' '\n' | sort -u | grep . || true)"
+  if [[ -n "$ids" ]]; then
+    info "terminating instances: $(echo $ids)"
+    # shellcheck disable=SC2086
+    aws ec2 terminate-instances --instance-ids $ids >/dev/null
+    # shellcheck disable=SC2086
+    aws ec2 wait instance-terminated --instance-ids $ids
+  fi
+
+  local ami snap
+  for ami in $(aws ec2 describe-images --owners self --filters Name=tag:cf:poc,Values=true --query 'Images[].ImageId' --output text); do
+    snap="$(aws ec2 describe-images --image-ids "$ami" --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' --output text)"
+    aws ec2 deregister-image --image-id "$ami" >/dev/null && info "deregistered $ami"
+    for s in $snap; do aws ec2 delete-snapshot --snapshot-id "$s" >/dev/null 2>&1 && info "deleted $s" || true; done
+  done
+  for s in $(aws ec2 describe-snapshots --owner-ids self --filters Name=tag:cf:poc,Values=true --query 'Snapshots[].SnapshotId' --output text); do
+    aws ec2 delete-snapshot --snapshot-id "$s" >/dev/null 2>&1 && info "deleted $s" || warn "could not delete $s"
+  done
+  for v in $(aws ec2 describe-volumes --filters Name=tag:cf:poc,Values=true Name=status,Values=available --query 'Volumes[].VolumeId' --output text); do
+    aws ec2 delete-volume --volume-id "$v" >/dev/null 2>&1 && info "deleted $v" || true
+  done
+
+  q='SecurityGroups[]'
+  [[ "$exclude_infra" == "1" ]] && q+='[?!(Tags[?Key==`cf:module`&&Value==`infra`])]'
+  for sg in $( { aws ec2 describe-security-groups --filters Name=tag:cf:poc,Values=true --query "$q.GroupId" --output text
+                 aws ec2 describe-security-groups --filters 'Name=group-name,Values=packer_*' --query 'SecurityGroups[].GroupId' --output text
+               } | tr '\t' '\n' | sort -u | grep . || true); do
+    for _ in 1 2 3 4 5 6; do # ENIs of just-terminated instances take a moment to go away
+      aws ec2 delete-security-group --group-id "$sg" >/dev/null 2>&1 && { info "deleted $sg"; break; }
+      sleep 10
+    done
+  done
+  for kp in $(aws ec2 describe-key-pairs --filters 'Name=key-name,Values=packer_*' --query 'KeyPairs[].KeyName' --output text); do
+    aws ec2 delete-key-pair --key-name "$kp" >/dev/null && info "deleted key pair $kp"
+  done
+}
+
+# Named singletons from infra/, in case local state was lost.
+sweep_infra_orphans() {
+  local bucket="cf-tfstate-134584031874-apse2"
+  aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1 && aws s3 rb "s3://$bucket" --force >/dev/null && info "deleted bucket $bucket"
+  aws secretsmanager describe-secret --secret-id compute-factory/ssh-ca >/dev/null 2>&1 \
+    && aws secretsmanager delete-secret --secret-id compute-factory/ssh-ca --force-delete-without-recovery >/dev/null && info "deleted CA secret"
+  aws ssm delete-parameter --name /compute-factory/ssh-ca-pub >/dev/null 2>&1 && info "deleted CA public key parameter" || true
+  for a in $(aws ec2 describe-addresses --filters Name=tag:cf:poc,Values=true --query 'Addresses[].AllocationId' --output text); do
+    aws ec2 release-address --allocation-id "$a" >/dev/null && info "released EIP $a"
+  done
+  aws ec2 delete-key-pair --key-name cf-idp-admin >/dev/null 2>&1 || true
+  if aws iam get-instance-profile --instance-profile-name cf-idp >/dev/null 2>&1; then
+    aws iam remove-role-from-instance-profile --instance-profile-name cf-idp --role-name cf-idp >/dev/null 2>&1 || true
+    aws iam delete-instance-profile --instance-profile-name cf-idp >/dev/null && info "deleted instance profile cf-idp"
+  fi
+  if aws iam get-role --role-name cf-idp >/dev/null 2>&1; then
+    for p in $(aws iam list-role-policies --role-name cf-idp --query 'PolicyNames' --output text); do
+      aws iam delete-role-policy --role-name cf-idp --policy-name "$p"
+    done
+    for p in $(aws iam list-attached-role-policies --role-name cf-idp --query 'AttachedPolicies[].PolicyArn' --output text); do
+      aws iam detach-role-policy --role-name cf-idp --policy-arn "$p"
+    done
+    aws iam delete-role --role-name cf-idp && info "deleted role cf-idp"
+  fi
+}
+
+verify_clean() {
+  local left=() x
+  x="$(aws ec2 describe-instances --filters Name=tag:cf:poc,Values=true Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].InstanceId' --output text)"; [[ -n "$x" ]] && left+=("instances: $x")
+  x="$(aws ec2 describe-images --owners self --filters Name=tag:cf:poc,Values=true --query 'Images[].ImageId' --output text)"; [[ -n "$x" ]] && left+=("AMIs: $x")
+  x="$(aws ec2 describe-snapshots --owner-ids self --filters Name=tag:cf:poc,Values=true --query 'Snapshots[].SnapshotId' --output text)"; [[ -n "$x" ]] && left+=("snapshots: $x")
+  x="$(aws ec2 describe-volumes --filters Name=tag:cf:poc,Values=true --query 'Volumes[].VolumeId' --output text)"; [[ -n "$x" ]] && left+=("volumes: $x")
+  x="$(aws ec2 describe-security-groups --filters Name=tag:cf:poc,Values=true --query 'SecurityGroups[].GroupId' --output text)"; [[ -n "$x" ]] && left+=("security groups: $x")
+  x="$(aws ec2 describe-addresses --filters Name=tag:cf:poc,Values=true --query 'Addresses[].PublicIp' --output text)"; [[ -n "$x" ]] && left+=("EIPs: $x")
+  aws s3api head-bucket --bucket cf-tfstate-134584031874-apse2 >/dev/null 2>&1 && left+=("state bucket")
+  aws secretsmanager describe-secret --secret-id compute-factory/ssh-ca >/dev/null 2>&1 && left+=("CA secret")
+  aws ssm get-parameter --name /compute-factory/ssh-ca-pub >/dev/null 2>&1 && left+=("CA public key parameter")
+  aws iam get-role --role-name cf-idp >/dev/null 2>&1 && left+=("IAM role cf-idp")
+  [[ -n "$(dig +short "$DOMAIN" @1.1.1.1 2>/dev/null || true)" ]] && left+=("DNS $DOMAIN (may be cache; TTL 60s)")
+
+  # Informational: anything else the tagging API still reports (can lag a few minutes behind deletes).
+  x="$(aws resourcegroupstaggingapi get-resources --tag-filters Key=cf:poc,Values=true --query 'ResourceTagMappingList[].ResourceARN' --output text 2>/dev/null | tr '\t' '\n' | grep -v ':instance/' || true)"
+  [[ -n "$x" ]] && info "tagging API still lists (eventual consistency, re-check with ./poc status):" && echo "$x" | sed 's/^/      /'
+
+  if [[ ${#left[@]} -eq 0 ]]; then
+    printf '\n\033[32mCLEAN: no Compute Factory resources remain.\033[0m\n'
+  else
+    printf '\n\033[31mNOT CLEAN:\033[0m\n'; printf '  - %s\n' "${left[@]}"
+    return 1
+  fi
+}
+
+cmd_down() {
+  log "Preflight"
+  require_tools
+  terraform -chdir="$INFRA_DIR" init -input=false >/dev/null
+  local bucket
+  bucket="$(infra_out state_bucket)"; bucket="${bucket:-cf-tfstate-134584031874-apse2}"
+
+  log "Freeze: cancel pipeline runs, stop IDP"
+  cancel_runs
+  stop_idp
+
+  log "Destroy user VMs (Terraform, $PARALLEL_DESTROYS in parallel)"
+  [[ -d "$PLATFORM_DIR/.git" ]] || git clone -q "git@github.com:$PLATFORM_REPO.git" "$PLATFORM_DIR"
+  destroy_vms "$bucket"
+
+  log "Sweep leftovers tagged cf:poc=true (VMs, AMIs, snapshots, Packer temp resources)"
+  sweep_tagged 1
+
+  log "DNS: remove $DOMAIN"
+  dns_apply "" && info "removed" || warn "DNS removal failed (see $GEN/logs/dns.log)"
+
+  log "Destroy shared infra"
+  if infra_has_state; then
+    tf_infra destroy -auto-approve -input=false >"$GEN/logs/infra-destroy.log" 2>&1 \
+      && info "infra destroyed" || { tail -30 "$GEN/logs/infra-destroy.log" >&2; warn "infra destroy failed; sweeping by name"; }
+  else
+    info "no infra state"
+  fi
+  sweep_infra_orphans
+  sweep_tagged 0
+
+  log "GitHub cleanup"
+  gh variable delete TF_STATE_BUCKET -R "$PLATFORM_REPO" >/dev/null 2>&1 || true
+  gh variable delete BACKSTAGE_URL -R "$PLATFORM_REPO" >/dev/null 2>&1 || true
+  gh secret delete BACKSTAGE_TOKEN -R "$PLATFORM_REPO" >/dev/null 2>&1 || true
+  reset_inventory
+  rm -rf "$GEN/idp.env" "$GEN/tf-vms"
+
+  log "Verify"
+  verify_clean
+}
+
+# ---------------------------------------------------------------- status
+
+cmd_status() {
+  require_tools
+  terraform -chdir="$INFRA_DIR" init -input=false >/dev/null
+  log "Shared infra"
+  if infra_has_state; then
+    info "IDP host:     $(infra_out idp_ip) ($(infra_out idp_instance_id))"
+    info "State bucket: $(infra_out state_bucket)"
+    info "IDP health:   $(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$HEALTH_URL" || echo unreachable)"
+  else
+    info "none"
+  fi
+  log "Golden images"
+  aws ec2 describe-images --owners self --filters Name=tag:cf:poc,Values=true \
+    --query 'Images[].[ImageId,Name,CreationDate]' --output text | sed 's/^/    /'
+  log "Instances tagged cf:poc=true"
+  aws ec2 describe-instances --filters Name=tag:cf:poc,Values=true Name=instance-state-name,Values=pending,running,stopping,stopped \
+    --query 'Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress,Tags[?Key==`Name`]|[0].Value]' --output text | sed 's/^/    /'
+  log "VM state files"
+  aws s3 ls "s3://cf-tfstate-134584031874-apse2/vms/" --recursive 2>/dev/null | sed 's/^/    /' || info "no bucket"
+  log "Active pipeline runs"
+  local repo
+  for repo in "$PLATFORM_REPO" "$BUILDER_REPO"; do
+    gh run list -R "$repo" -L 20 --json databaseId,status,displayTitle \
+      -q '.[] | select(.status != "completed") | "    \(.databaseId) \(.status) \(.displayTitle)"' 2>/dev/null || true
+  done
+}
+
+case "${1:-}" in
+  up)          cmd_up ;;
+  down)        cmd_down ;;
+  status)      cmd_status ;;
+  _destroy_vm) shift; cmd_destroy_vm "$@" ;;
+  *) echo "usage: $0 up|down|status" >&2; exit 2 ;;
+esac

@@ -276,8 +276,8 @@ Enforced in three places:
    - Unregistering or deleting catalog entities: `platform-admins` only, because VMs are removed through the destroy flow.
    - Scaffolder task read and cancel: `isTaskOwner`. Task logs contain inputs, so users only see their own runs.
 2. **Templates**:
-   - The team field only offers the user's own teams: an EntityPicker on `kind: Group`, filtered to the
-     user's `memberOf`.
+   - The team field only offers the user's own teams: the stock `MyGroupsPicker` field, which lists Groups
+     with `relations.hasMember` = the current user.
    - The destroy and manage templates look the VM up with `catalog:fetch` as the initiating user, so a VM
      the user can't read fails before anything is dispatched (to verify during build).
 3. **Workflow guard** (defense in depth, because Backstage dispatches with a shared token):
