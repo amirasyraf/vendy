@@ -1,0 +1,5 @@
+.poc.env
+infra/.terraform/
+infra/*.tfstate*
+infra/.terraform.lock.hcl.bak
+.generated/
