@@ -24,6 +24,7 @@ INFRA_DIR="$ROOT/infra"
 GEN="$ROOT/.generated"
 HEALTH_URL="https://$DOMAIN/.backstage/health/v1/readiness"
 USERS_FILE="$ROOT/.poc-users" # username:scrypt-hash lines, gitignored, persists across cycles
+PASSWORDS_FILE="$ROOT/.poc-passwords" # username:plaintext, gitignored; POC test logins for agents/scripts
 PARALLEL_DESTROYS="${PARALLEL_DESTROYS:-5}"
 
 export AWS_PROFILE="${AWS_PROFILE:-amirasyraf}"
@@ -516,7 +517,10 @@ cmd_set_password() {
   touch "$USERS_FILE"
   { grep -v "^$user:" "$USERS_FILE" || true; printf '%s:%s\n' "$user" "$hash"; } >"$USERS_FILE.tmp"
   mv "$USERS_FILE.tmp" "$USERS_FILE"
-  info "password set for $user; deploy with ./poc deploy-idp"
+  touch "$PASSWORDS_FILE"
+  { grep -v "^$user:" "$PASSWORDS_FILE" || true; printf '%s:%s\n' "$user" "$pw"; } >"$PASSWORDS_FILE.tmp"
+  mv "$PASSWORDS_FILE.tmp" "$PASSWORDS_FILE"
+  info "password set for $user (plaintext kept in .poc-passwords); deploy with ./poc deploy-idp"
 }
 
 # ---------------------------------------------------------------- status

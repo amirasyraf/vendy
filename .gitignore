@@ -4,3 +4,4 @@ infra/*.tfstate*
 infra/.terraform.lock.hcl.bak
 .generated/
 .poc-users
+.poc-passwords*

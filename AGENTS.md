@@ -41,6 +41,14 @@ verified and pushed, deploy the affected live environment and verify the deploye
 reporting completion. For IDP changes, use `./poc deploy-idp` against the existing POC host; do not
 tear down or recreate infrastructure just to deploy an application change.
 
+## POC credentials
+
+This is a POC: storing test credentials locally is expected; committing them is not. IDP login
+passwords are in `.poc-passwords` (`username:password`, gitignored, mode 600; `./poc set-password`
+maintains it alongside the hashes in `.poc-users`). Use them for signed-in live verification after every
+IDP change instead of stopping at fixture checks or asking. When a new credential is created or shared,
+store it there (or another gitignored file) immediately. Never commit or echo them into docs/logs.
+
 ## Troubleshooting lessons
 
 - Start with `./poc logs [backstage|caddy|postgres|all] [since]` and `./poc task <task-id>` (read-only).
