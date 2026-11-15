@@ -311,9 +311,11 @@ spec:
 - SSH: `ssh -i ~/.ssh/id_ed25519 ubuntu@<ip>` (EC2 key pair from that key).
 - `compute-factory-idp/deploy/deploy.sh <host> <env-file>`:
   - builds image `compute-factory-idp:latest` for `linux/arm64` locally;
-  - `docker save | ssh docker load`;
   - copies `docker-compose.yml`, `Caddyfile` and `<env-file>` (as `.env`) to `/opt/idp`;
-  - runs `docker compose up -d`.
+  - starts the host-local `registry` service (`127.0.0.1:15000` on the host only) and pushes the
+    image to it through an SSH tunnel (only missing layers transfer);
+  - runs `docker compose pull backstage` and `docker compose up -d`, reloads Caddy, then
+    garbage-collects the registry and prunes unused host images.
   It must be idempotent and must not prompt.
 - `.env` keys, produced by `./poc up`. Agent C must use exactly these:
 

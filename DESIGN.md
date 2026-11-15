@@ -251,7 +251,7 @@ backstage/                     # npx @backstage/create-app@latest
 deploy/                        # (the IDP EC2 itself is created by the compute-factory repo's infra/, see 12)
   docker-compose.yml           # caddy, backstage, postgres
   Caddyfile
-  deploy.sh                    # local: build image (linux/arm64) -> docker save | ssh docker load -> compose up -d
+  deploy.sh                    # local: build image (linux/arm64) -> push changed layers to host-local registry via SSH tunnel -> compose up -d
   .env.example                 # IDP_USERS_B64 (password hashes), integration token, PG password,
                                # static token for the GHA -> catalog refresh call
                                # (no CA key here; it's read from Secrets Manager via the instance role)
