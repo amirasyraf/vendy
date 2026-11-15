@@ -250,6 +250,12 @@ deploy/                        # (the IDP EC2 itself is created by the compute-f
 
 ## 5. Backstage design
 
+The `/catalog` list defaults to **Resource**. Normal users see only that kind; non-Resource list
+filter links are normalized to Resource. Platform admins retain every kind in the picker and explicit
+kind filter links. This is a frontend navigation restriction, not a new backend permission boundary;
+User/Group data remains available for sign-in, ownership and template team pickers, and direct entity
+pages retain existing authorization. `amirasyraf` is a normal user in `alpha`, not a platform admin.
+
 ### 5.1 Login, users and teams
 
 - Username/password login (replaced GitHub OAuth). A small custom auth provider in the idp repo checks the
