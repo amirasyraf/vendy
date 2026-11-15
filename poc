@@ -138,6 +138,7 @@ deploy_idp() {
   dns_apply "$ip"
   echo "dns: $DOMAIN -> $ip"
   write_idp_env
+  restore_caddy_data "$ip"
   "$IDP_DIR/deploy/deploy.sh" "$ip" "$GEN/idp.env"
   echo "waiting for $HEALTH_URL"
   for _ in $(seq 1 60); do
@@ -212,6 +213,33 @@ cancel_runs() {
     sleep 10
   done
   warn "some runs still not completed after 5 min; continuing"
+}
+
+# Caddy's TLS cert/account storage is kept on the laptop across cycles, so `up` doesn't hit
+# Let's Encrypt's duplicate-certificate limit (5/week). Compose project "idp" (dir /opt/idp).
+CADDY_BACKUP="$GEN/caddy-data.tgz"
+CADDY_VOLUME="idp_caddy_data"
+
+save_caddy_data() {
+  local ip tmp
+  ip="$(infra_out idp_ip)"
+  [[ -n "$ip" ]] || return 0
+  tmp="$(mktemp)"
+  if ssh "${SSH_OPTS[@]}" "ubuntu@$ip" "docker run --rm -v $CADDY_VOLUME:/data:ro alpine tar cz -C /data ." >"$tmp" 2>/dev/null \
+     && tar tzf "$tmp" 2>/dev/null | grep -q '\.crt$'; then
+    (umask 077; mv "$tmp" "$CADDY_BACKUP") && info "saved TLS cert storage to $CADDY_BACKUP"
+  else
+    rm -f "$tmp"; info "no TLS cert to save (keeping any previous backup)"
+  fi
+}
+
+restore_caddy_data() {
+  local ip="$1"
+  [[ -f "$CADDY_BACKUP" ]] || { echo "no saved TLS cert; Caddy will request one"; return 0; }
+  ssh "${SSH_OPTS[@]}" "ubuntu@$ip" "docker volume create \
+      --label com.docker.compose.project=idp --label com.docker.compose.volume=caddy_data $CADDY_VOLUME >/dev/null \
+    && docker run --rm -i -v $CADDY_VOLUME:/data alpine tar xz -C /data" <"$CADDY_BACKUP"
+  echo "restored saved TLS cert storage"
 }
 
 stop_idp() {
@@ -359,6 +387,7 @@ cmd_down() {
 
   log "Freeze: cancel pipeline runs, stop IDP"
   cancel_runs
+  save_caddy_data
   stop_idp
 
   log "Destroy user VMs (Terraform, $PARALLEL_DESTROYS in parallel)"

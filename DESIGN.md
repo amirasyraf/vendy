@@ -525,7 +525,10 @@ Verified during build:
 
 Goal: one command creates the whole POC from nothing, and one command removes all of it, including VMs
 users launched. Every run assumes a clean slate. Existing resources and values are disposable, and
-nothing is carried over between cycles except the code in Git and the two manual GitHub credentials (9).
+nothing is carried over between cycles except the code in Git, the two manual GitHub credentials (9), and
+Caddy's TLS storage. `down` saves that to `.generated/caddy-data.tgz` on the laptop (gitignored) and `up`
+restores it onto the new host, so a cycle doesn't request a new Let's Encrypt certificate (limit: 5 per week
+for the same domain). Caddy renews it itself when it's within 30 days of expiry.
 
 ### 12.1 What lives where
 
