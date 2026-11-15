@@ -401,7 +401,9 @@ cmd_status() {
   if infra_has_state; then
     info "IDP host:     $(infra_out idp_ip) ($(infra_out idp_instance_id))"
     info "State bucket: $(infra_out state_bucket)"
-    info "IDP health:   $(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$HEALTH_URL" || echo unreachable)"
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$HEALTH_URL" || true)"
+    info "IDP health:   $([[ "$code" == 000 || -z "$code" ]] && echo unreachable || echo "HTTP $code")"
   else
     info "none"
   fi
