@@ -4,6 +4,7 @@
 #   ./poc down     destroy everything, including user VMs, then verify nothing tagged cf:poc=true remains
 #   ./poc status   read-only overview
 #   ./poc deploy-idp   rebuild and redeploy Backstage onto the existing IDP host
+#   ./poc watch-bake <run-id>   monitor an existing bake without dispatching another
 #   ./poc set-password <user>   add/change an IDP login (hash stored in .poc-users)
 # See DESIGN.md section 12.
 set -euo pipefail
@@ -115,19 +116,64 @@ SSH_CA_SECRET_ID=$(infra_out ssh_ca_secret_id)
 EOF
 }
 
+watch_bake() {
+  local id="${1:-}" result status conclusion errors=0 deadline=$((SECONDS + 3600))
+  [[ "$id" =~ ^[1-9][0-9]*$ ]] || die "usage: $0 watch-bake <run-id>"
+  echo "bake run: https://github.com/$BUILDER_REPO/actions/runs/$id"
+  while (( SECONDS < deadline )); do
+    if result="$(gh run view "$id" -R "$BUILDER_REPO" --json status,conclusion)" \
+        && status="$(jq -er '.status | strings | select(length > 0)' <<<"$result")" \
+        && conclusion="$(jq -r '.conclusion // empty' <<<"$result")"; then
+      errors=0
+      echo "bake status: $status${conclusion:+ ($conclusion)}"
+      if [[ "$status" == completed ]]; then
+        if [[ "$conclusion" == success ]]; then
+          echo "bake succeeded"
+          return 0
+        fi
+        if [[ -n "$conclusion" ]]; then
+          warn "bake completed with conclusion: $conclusion"
+          return 1
+        fi
+        # A completed run without a conclusion is not proof of success or failure.
+        warn "bake conclusion not available yet; retrying"
+      fi
+    else
+      errors=$((errors + 1))
+      warn "could not read bake status ($errors/10 consecutive errors); this does not mean the bake failed"
+      if (( errors >= 10 )); then
+        break
+      fi
+    fi
+    sleep 30
+  done
+  warn "bake outcome unknown: monitoring stopped after repeated API errors or the one-hour limit"
+  warn "monitoring did not cancel the workflow; resume with: ./poc watch-bake $id"
+  return 2
+}
+
 run_bake() {
   local start id
   start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  gh workflow run bake.yml -R "$BUILDER_REPO" --ref main
+  # Never retry dispatch: a lost response could still have created a run.
+  gh workflow run bake.yml -R "$BUILDER_REPO" --ref main || {
+    warn "bake dispatch could not be confirmed; check https://github.com/$BUILDER_REPO/actions before retrying"
+    return 2
+  }
   for _ in $(seq 1 30); do
-    id="$(gh run list -R "$BUILDER_REPO" --workflow bake.yml --event workflow_dispatch -L 5 \
-      --json databaseId,createdAt -q "[.[] | select(.createdAt >= \"$start\")][0].databaseId // empty")"
-    [[ -n "$id" ]] && break
+    if id="$(gh run list -R "$BUILDER_REPO" --workflow bake.yml --event workflow_dispatch -L 5 \
+      --json databaseId,createdAt -q "[.[] | select(.createdAt >= \"$start\")][0].databaseId // empty")"; then
+      [[ -n "$id" ]] && break
+    else
+      warn "could not discover bake run; retrying without dispatching again"
+    fi
     sleep 5
   done
-  [[ -n "${id:-}" ]] || die "bake run did not appear"
-  echo "bake run: https://github.com/$BUILDER_REPO/actions/runs/$id"
-  gh run watch "$id" -R "$BUILDER_REPO" --exit-status --interval 30 >/dev/null
+  if [[ -z "${id:-}" ]]; then
+    warn "bake run not identified; outcome unknown. Find it at https://github.com/$BUILDER_REPO/actions, then use ./poc watch-bake <run-id>"
+    return 2
+  fi
+  watch_bake "$id" || return $?
   aws ec2 describe-images --owners self \
     --filters Name=tag:cf:managed,Values=true Name=tag:cf:os,Values=ubuntu \
     --query 'sort_by(Images,&CreationDate)[-1].[ImageId,Name]' --output text
@@ -199,9 +245,19 @@ cmd_up() {
   deploy_idp "$ip" >"$GEN/logs/idp.log" 2>&1 & local idp_pid=$!
   info "logs: $GEN/logs/bake.log, $GEN/logs/idp.log"
   local rc=0
-  wait "$bake_pid" || { warn "bake failed:"; tail -20 "$GEN/logs/bake.log" >&2; rc=1; }
+  local bake_rc=0
+  wait "$bake_pid" || bake_rc=$?
+  if (( bake_rc != 0 )); then
+    if (( bake_rc == 2 )); then
+      warn "bake outcome could not be verified:"
+    else
+      warn "bake or image lookup failed:"
+    fi
+    tail -20 "$GEN/logs/bake.log" >&2
+    rc=1
+  fi
   wait "$idp_pid"  || { warn "IDP deploy failed:"; tail -30 "$GEN/logs/idp.log" >&2; rc=1; }
-  [[ $rc -eq 0 ]] || die "up failed (resources are left in place; run ./poc down to clean up)"
+  [[ $rc -eq 0 ]] || die "up did not complete successfully; resources are left in place. Check ./poc status and the logs above. Only run ./poc down if you intend to destroy the POC and all requested VMs."
 
   log "Up"
   info "IDP:          https://$DOMAIN"
@@ -496,11 +552,14 @@ case "${1:-}" in
   up)          cmd_up ;;
   down)        cmd_down ;;
   status)      cmd_status ;;
+  watch-bake)  command -v gh >/dev/null || die "missing tool: gh"
+               command -v jq >/dev/null || die "missing tool: jq"
+               watch_bake "${2:-}" ;;
   set-password) shift; cmd_set_password "$@" ;;
   deploy-idp)  require_tools docker; terraform -chdir="$INFRA_DIR" init -input=false >/dev/null
                infra_has_state || die "no infra; run ./poc up"
                [[ -s "$USERS_FILE" ]] || die "no IDP users; run ./poc set-password <user> first"
                deploy_idp "$(infra_out idp_ip)" ;;
   _destroy_vm) shift; cmd_destroy_vm "$@" ;;
-  *) echo "usage: $0 up|down|status|deploy-idp|set-password <user>" >&2; exit 2 ;;
+  *) echo "usage: $0 up|down|status|deploy-idp|set-password <user>|watch-bake <run-id>" >&2; exit 2 ;;
 esac

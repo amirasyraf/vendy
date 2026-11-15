@@ -614,7 +614,12 @@ compute-factory/                 # 4th repo: the "home" of the POC
 3. **GitHub wiring** (`gh variable set` / `gh secret set` on the builder and platform repos): `AWS_ROLE_ARN`,
    `TF_STATE_BUCKET`, `BACKSTAGE_URL`, `BACKSTAGE_TOKEN`. Reset `vms/` in the platform repo to empty.
 4. **Run in parallel**:
-   - A. **Bake**: `gh workflow run bake.yml`, then `gh run watch` until the golden AMI exists.
+   - A. **Bake**: dispatch `bake.yml` once, retry run discovery without redispatching, then poll
+     `gh run view --json status,conclusion` every 30 seconds. Status-read errors are retried (up to
+     10 consecutive errors); monitoring has a one-hour limit. Only `completed` + `success` counts
+     as success; other completed conclusions fail. Exhausted monitoring or unconfirmed dispatch/run
+     discovery reports an unknown outcome, not a failed workflow. After confirmed success, query AWS
+     for the latest managed Ubuntu AMI.
    - B. **IDP**:
      - DNS: targeted apply of the `idp` record in `~/projects/cloudflare/amirasyraf.dev`, with the EIP passed in;
      - write `.env` from Terraform outputs and `.poc.env`;
@@ -622,6 +627,14 @@ compute-factory/                 # 4th repo: the "home" of the POC
       - wait for `https://idp.amirasyraf.dev/.backstage/health/v1/readiness` to return 200, which proves
         the Backstage runtime and Caddy/TLS path are healthy.
 5. **Done**: print the URL and a summary of what was created.
+
+On failure or an unknown bake outcome, `up` leaves resources and workflows in place and still waits
+for the parallel IDP deployment. Check `./poc status` and `.generated/logs/{bake,idp}.log`.
+`./poc watch-bake <run-id>` resumes the same read-only bake monitor without dispatching a workflow,
+changing GitHub wiring or resetting inventory. It exits 0 for success, 1 for a completed non-success
+conclusion, and 2 for an unknown outcome. It does not check IDP health or AMI existence. If the run ID
+was not discovered, find it in the builder's Actions page first. Do not rerun `up` to reconnect a
+watcher; it is not a resume command. `down` is intentional teardown, not a monitoring recovery step.
 
 ### 12.3 `./poc down` (about 5–10 min)
 

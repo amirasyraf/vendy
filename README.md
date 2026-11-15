@@ -27,9 +27,23 @@ cp poc.env.example .poc.env   # once: Backstage PAT
 ./poc set-password amirasyraf  # once per user: IDP login (hash kept in .poc-users)
 ./poc up                      # ~15-20 min: infra, GitHub wiring, bake, IDP deploy
 ./poc status                  # what exists right now
+./poc watch-bake <run-id>      # monitor an existing bake; never dispatches another
 ./poc deploy-idp              # rebuild + redeploy Backstage on the existing host
 ./poc down                    # ~5-10 min: cancels runs, destroys all VMs, sweeps, destroys infra, verifies CLEAN
 ```
+
+Bake monitoring polls GitHub every 30 seconds and retries status-read errors. A temporary API timeout
+does not mean the workflow failed. Monitoring stops after 10 consecutive read errors or one hour,
+reporting an **unknown outcome**, not a failed bake. Only a completed run with conclusion `success`
+counts as a successful bake. `watch-bake` exits 0 for success, 1 for a completed non-success conclusion,
+or 2 when monitoring cannot determine the outcome.
+
+If `up` cannot finish, it leaves resources and workflows in place. Check `./poc status` and
+`.generated/logs/{bake,idp}.log`; resume monitoring with `./poc watch-bake <run-id>` using the logged
+run ID. If dispatch/run discovery could not be confirmed, find the run in the builder repo's Actions
+page first; dispatch is never automatically retried. `watch-bake` only checks the bake, not IDP health
+or AMI existence. Do not rerun `up` just to reconnect the watcher: it is not a resume command and resets
+VM inventory. Use `./poc down` only for intentional teardown of the POC **and all requested VMs**.
 
 After a VM request, the Scaffolder task streams the complete workflow process graph. The VM's catalog page
 shows the same live, team-scoped view: validation, inventory registration, Terraform provisioning, every fry
