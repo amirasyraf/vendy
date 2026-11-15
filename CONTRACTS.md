@@ -158,6 +158,7 @@ metadata:
     cf/public-ip: ""               # filled after provision
     cf/ssh-user: ubuntu
     cf/instance-id: ""
+    cf/instance-type: ""   # launched EC2 type, set with cf/instance-id after apply
     cf/requested-by: amirasyraf
     cf/requested-at: "2026-11-15T12:00:00Z"
     cf/request-id: "scaffolder-task-id" # manual:<provision-run-id> for manual dispatch
@@ -341,7 +342,11 @@ spec:
 - Variables: `name` (required), `os` (default `ubuntu`), `size` (default `S`), `team` (default `""`),
   `requested_by` (default `""`). **`terraform destroy -var name=<name>` must work with nothing else**,
   because `./poc down` uses that.
-- Outputs: `public_ip`, `ssh_user`, `instance_id`.
+- Outputs: `public_ip`, `ssh_user`, `instance_id`, `instance_type`.
+- Size map: `terraform/platforms/aws/sizes.json` in the platform repo, a JSON object of size
+  (`S`/`M`/`L`) to EC2 instance type. Terraform reads it; the IDP `vm-sizes` backend reads the same file
+  from `main` via the GitHub API to label sizes in the request form (`ui:field: VmSizePicker`) and adds
+  live specs from `ec2:DescribeInstanceTypes` (IDP host role, read-only).
 - Resources are tagged `cf:poc=true`, `cf:vm=<name>`, `cf:team=<team>`. No key pair (the CA is used).
 - `./poc down` runs, for each key under `vms/aws/*/terraform.tfstate`:
   `terraform -chdir=~/projects/compute-factory-platform/terraform/platforms/aws init -reconfigure <backend-config…> && terraform … destroy -auto-approve -var name=<name>`.

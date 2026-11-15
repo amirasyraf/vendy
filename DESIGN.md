@@ -170,7 +170,7 @@ source file and a matrix row. Ansible roles branch on `ansible_os_family` (Windo
 terraform/
   platforms/
     aws/                       # root module for one VM on AWS (POC)
-      main.tf variables.tf outputs.tf sizes.tf
+      main.tf variables.tf outputs.tf sizes.tf sizes.json
     # azure/  vsphere/         # future, same variable/output contract
 ansible/
   fry/
@@ -229,9 +229,12 @@ docker: { linux: docker.io, windows: null }
 
 | Inputs | Outputs |
 |---|---|
-| `name`, `os`, `size` (S/M/L), `owner`, `tags` | `public_ip`, `ssh_user`, `instance_id` |
+| `name`, `os`, `size` (S/M/L), `owner`, `tags` | `public_ip`, `ssh_user`, `instance_id`, `instance_type` |
 
-- Each platform maps sizes in `sizes.tf`. AWS: S=`t3.small`, M=`t3.medium`, L=`t3.large`.
+- Each platform maps sizes in one data file. AWS: `sizes.json` (S=`t3.small`, M=`t3.medium`,
+  L=`t3.large`; all 2 vCPU, 2/4/8 GiB), read by `sizes.tf`. The IDP reads the same file and shows each
+  size's instance type with live AWS specs in the request form; VM pages show the launched type
+  (`cf/instance-type`).
 - Image lookup uses tags: `data "aws_ami"` with `cf:os=<os>`, `cf:managed=true`, `most_recent`.
 - `ssh_user` comes from the OS: `ubuntu` for Ubuntu, `Administrator` for Windows later.
 - State: S3 bucket `cf-tfstate-134584031874-apse2`, key `vms/<platform>/<name>/terraform.tfstate`, S3 native
