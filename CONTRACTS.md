@@ -210,6 +210,9 @@ spec:
   - pass `requester_teams: ${{ user.entity.spec.memberOf | join(',') }}`. `memberOf` may contain refs like
     `group:default/alpha`, so the workflow normalises by stripping everything up to the last `/` or `:`.
   - VM pickers use `EntityPicker` with `catalogFilter: { kind: Resource, spec.type: vm }`.
+  - The team picker is the stock `MyGroupsPicker` (Groups with `relations.hasMember` = the current user). It
+    returns an entity ref, which the workflow normalises to the bare name.
+  - The browser link to the run is the dispatch output `workflowRunHtmlUrl`. `workflowRunUrl` is the API URL.
 - Custom scaffolder action (idp repo, Agent C):
   - `cf:ssh:sign`, input `{ publicKey: string }`, output `{ certificate, principals, validUntil }`;
   - reads the CA key from Secrets Manager `compute-factory/ssh-ca` (region from `AWS_REGION`) using
