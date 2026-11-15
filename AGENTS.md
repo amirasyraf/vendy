@@ -40,3 +40,18 @@ Implementation is not complete when code is merely committed. After an implement
 verified and pushed, deploy the affected live environment and verify the deployed behavior before
 reporting completion. For IDP changes, use `./poc deploy-idp` against the existing POC host; do not
 tear down or recreate infrastructure just to deploy an application change.
+
+## Troubleshooting lessons
+
+- IDP host access: `ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+  ubuntu@$(terraform -chdir=infra output -raw idp_ip) bash -s <<'EOF' ... EOF` (the IP is reused across
+  `./poc` cycles, so known_hosts entries go stale). Stack is `/opt/idp` (`docker compose logs backstage|caddy`).
+  Add `</dev/null` to `docker compose exec -T` inside a here-doc, or it consumes the rest of the script.
+- Scaffolder task state is in Postgres DB `backstage_plugin_scaffolder` (`tasks`, `task_events`). If the
+  task page is blank but `task_events` has rows, the problem is delivery to the browser, not the task.
+- Check who the client is early: Backstage/Caddy logs carry the client IP; `whois` it. Corporate
+  TLS-inspecting proxies (Netskope at `24.239.130.53` was observed) buffer long-lived responses. That is
+  why the task page long-polls `/events` instead of SSE `/eventstream`
+  (`compute-factory-idp/packages/app/src/taskEventPolling.ts`; revert steps are in that file and the IDP
+  README). Prefer short, completing HTTP requests over SSE/WebSockets for user-facing live updates.
+- The static `BACKSTAGE_TOKEN` is restricted to `catalog` and `demo-mode`; it cannot read scaffolder tasks.

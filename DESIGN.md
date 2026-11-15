@@ -347,7 +347,9 @@ Steps:
    VM request, fry refry and destroy, even when destroy removes the VM entity. It uses the existing
    task-owner-authorized event stream and replays on reload, without exposing a GitHub token or adding
    an arbitrary-run API. The stock logs, controls and output links remain below the stage view.
-   Polls run about every 10 seconds. Old tasks without snapshots retain text logs; monitoring failures
+   The browser long-polls the task `/events` endpoint instead of SSE `/eventstream`, because
+   TLS-inspecting corporate proxies (e.g. Netskope) buffer SSE and leave the page blank; see the IDP
+   README for behavior and how to revert. GitHub is polled about every 10 seconds. Old tasks without snapshots retain text logs; monitoring failures
    or cancellation show the last observed state, not a claim that the GHA run stopped.
 4. Output links: "Open VM in catalog" (`resource:default/<name>`) and the full GitHub Actions run. The VM
    entity appears within seconds (see 5.3a).
