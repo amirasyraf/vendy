@@ -35,6 +35,10 @@ After a VM request, the Scaffolder task streams the complete workflow process gr
 shows the same live, team-scoped view: validation, inventory registration, Terraform provisioning, every fry
 job, finalization and failure handling, plus request details, refresh time and the full Actions run link.
 
+VM requests first demonstrate a real REST POST to the IDP's authenticated mock ServiceNow endpoint
+(`/mock-rest/servicenow`), returning HTTP 201 and a fake request number before GHA dispatch. It creates
+no real ticket and performs no approval. See `CONTRACTS.md` §8 and the IDP README for details.
+
 Requirements: `terraform`, `gh` (authenticated), `aws` (profile `amirasyraf`), `docker` (buildx, for the arm64 IDP image), `jq`, `ssh` with `~/.ssh/id_ed25519`.
 
 `down` is safe to run repeatedly and after a failed `up`. Everything in AWS is tagged `cf:poc=true`;

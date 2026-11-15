@@ -49,7 +49,7 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
      |  0. "Get SSH certificate" -> cert (instant)    |  ssh ubuntu@<ip>   (key + user cert)
      v                                                v
  idp.amirasyraf.dev  (EC2: Caddy -> Backstage -> Postgres)        VM (EC2, golden AMI)
-     |  1. Software Template form                                    ^
+     |  1. Software Template form -> mock ServiceNow REST (HTTP 201)  ^
      |  2. github:actions:dispatch  ------------------------------+  |  terraform / ansible over SSH
      |  5. reads catalog (vms/*/catalog-info.yaml)                 |  |  (pipeline uses its own short cert)
      v                                                             v  |
@@ -328,19 +328,26 @@ Form fields:
 | AD join | checkbox (mock) | baseline + access always run |
 
 Steps:
-1. `github:actions:dispatch` → `provision.yml` with `name` and JSON-string `spec_json`, plus
+1. `cf:servicenow:create` → a real HTTP POST to `https://idp.amirasyraf.dev/mock-rest/servicenow`.
+   A small authenticated backend receiver returns HTTP 201 and a fake `RITM…` number, shown in task
+   logs/output. This stateless mock demonstrates pre-GHA REST integration without ServiceNow, stored
+   tickets or approvals. It sends VM name/team/compute and server-derived requester/task identity;
+   failure prevents workflow dispatch. Caddy rewrites the public path to `/api/mock-rest/servicenow`;
+   only Scaffolder service credentials are accepted. See `CONTRACTS.md` §8 for the exact interface.
+2. `github:actions:dispatch` → `provision.yml` with `name` and JSON-string `spec_json`, plus
    `requested_by: ${{ user.entity.metadata.name }}`, `requester_teams` (see 5.1a) and
    `returnWorkflowRunDetails: true`.
-2. `cf:watch-workflow` polls the dispatched GitHub Actions run and streams every job and step into the
+3. `cf:watch-workflow` polls the dispatched GitHub Actions run and streams every job and step into the
    Scaffolder task, including a versioned structured snapshot on each change. The task detail page
    renders actual GHA jobs as individual stage cards with status, duration and expandable steps; this
-   is separate from the two Backstage template steps (dispatch and monitor). The same view covers
+   is separate from the Backstage template steps (mock REST, dispatch and monitor for VM requests;
+   dispatch and monitor for refry/destroy). The same view covers
    VM request, fry refry and destroy, even when destroy removes the VM entity. It uses the existing
    task-owner-authorized event stream and replays on reload, without exposing a GitHub token or adding
    an arbitrary-run API. The stock logs, controls and output links remain below the stage view.
    Polls run about every 10 seconds. Old tasks without snapshots retain text logs; monitoring failures
    or cancellation show the last observed state, not a claim that the GHA run stopped.
-3. Output links: "Open VM in catalog" (`resource:default/<name>`) and the full GitHub Actions run. The VM
+4. Output links: "Open VM in catalog" (`resource:default/<name>`) and the full GitHub Actions run. The VM
    entity appears within seconds (see 5.3a).
 
 Backstage uses a **backend integration token** (a fine-grained PAT you create, scoped to

@@ -227,6 +227,19 @@ spec:
 - Template names (`metadata.name`): `vm-request`, `vm-destroy`, `vm-refry` (platform repo, Agent B) and
   `ssh-cert` (idp repo, Agent C).
 - Templates dispatch with `github:actions:dispatch`:
+  - `vm-request` first runs step `servicenow`, action `cf:servicenow:create`, named
+    `Create ServiceNow request (mock)`. Inputs: `{vmName, team, platform, os, size}` from the form;
+    outputs: `{number: string, httpStatus: number}`. The action obtains requester identity from
+    initiating credentials, POSTs those details plus `requestId` (task ID) and `requestedBy` (user entity
+    ref) to `computeFactory.mockServiceNowUrl`, and requires a valid HTTP 201 response before dispatch.
+    Production URL: `https://idp.amirasyraf.dev/mock-rest/servicenow`; local default:
+    `http://localhost:7007/api/mock-rest/servicenow`. The URL is backend-only config, same IDP origin,
+    exact mock path, no redirects, ten-second timeout and task-cancellation support.
+    The `mock-rest` plugin accepts only `plugin:scaffolder` service credentials and returns
+    `{number: "RITM" + ten digits, status: "created", mock: true, requestId}`. Numbers are deterministic
+    per task ID; there is no persistent ticket store, real ServiceNow integration, approval or outcome
+    update. Only the number/status appear in task logs/output, not GHA inputs or VM inventory.
+    Template Editor dry-runs make the real stateless POST. Direct GHA dispatch and refry/destroy do not.
   - `repoUrl: github.com?owner=amirasyraf&repo=compute-factory-platform`, `branchOrTagName: main`;
   - pass `requested_by: ${{ user.entity.metadata.name }}`;
   - pass `requester_teams: ${{ user.entity.spec.memberOf | join(',') }}`. `memberOf` may contain refs like
@@ -276,6 +289,8 @@ spec:
 | `SSH_CA_SECRET_ID` | `compute-factory/ssh-ca` |
 
 - Caddy terminates TLS for `IDP_DOMAIN` and proxies to the backstage container on port 7007.
+  It rewrites only `/mock-rest/servicenow` to the authenticated `/api/mock-rest/servicenow` plugin route;
+  other paths are unchanged. No new environment variable or external-access token is introduced.
 - Health URL used by `./poc up`: `https://idp.amirasyraf.dev/.backstage/health/v1/readiness` must return 200.
 
 ## 10. Terraform platform contract (`terraform/platforms/aws`, Agent B)
