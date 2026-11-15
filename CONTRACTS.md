@@ -90,8 +90,9 @@ The `vm-request` template's software enum must be exactly `[git, htop, nginx, do
 
 ## 6. Platform repo: workflows
 
-All `workflow_dispatch` inputs are strings. Every dispatchable workflow sets
-`run-name: "<workflow> <name> by <requested_by>"`.
+All `workflow_dispatch` inputs are strings. Run names start with `<workflow> <name> by <requested_by>`;
+provision appends `[<request_id>]`, destroy appends `[<demo_generation>:<expected_request_id>]` for
+dispatch recovery. Optional manual-dispatch fields may be empty.
 
 ### 6.1 `provision.yml` inputs
 
@@ -101,10 +102,12 @@ All `workflow_dispatch` inputs are strings. Every dispatchable workflow sets
 | `spec_json` | serialized Resource spec | desired configuration as defined in §7; max 32 KiB |
 | `requested_by` | `amirasyraf` | Backstage user name |
 | `requester_teams` | `alpha,bravo` | comma-separated group names, server-side from Backstage |
+| `request_id` | Scaffolder task ID | optional for trusted manual dispatch; stable VM incarnation |
 
 ### 6.2 Other workflow inputs
 
-- `destroy.yml`: `name`, `requested_by`, `requester_teams`.
+- `destroy.yml`: `name`, `requested_by`, `requester_teams`; optional `demo_generation` and
+  `expected_request_id` for automatic cleanup. Both must match current policy/VM identity before deletion.
 - `fry.yml`: `name`, `stage` (`baseline`|`software`|`ad-join`|`access`), `software` (JSON string array, default `[]`, used when stage=software), `requested_by`, `requester_teams`.
 - `_fry-stage.yml` (`workflow_call`, internal): `name`, `stage`, `host`, `ssh_user`, `os`, `vars_json`.
   The caller grants `id-token: write` and `contents: write`.
@@ -157,6 +160,10 @@ metadata:
     cf/instance-id: ""
     cf/requested-by: amirasyraf
     cf/requested-at: "2026-11-15T12:00:00Z"
+    cf/request-id: "scaffolder-task-id" # manual:<provision-run-id> for manual dispatch
+    cf/provision-run-id: "1234567890" # immutable; cf/run-id may later refer to refry/destroy
+    cf/ready-at: "2026-11-15T12:03:00Z" # first readiness only; absent until ready
+    # cf/failed-at is set on first recorded failure; neither timestamp is reset by refry
     cf/run-id: "1234567890"
     cf/run-url: https://github.com/amirasyraf/compute-factory-platform/actions/runs/1234567890
 spec:
@@ -212,7 +219,9 @@ spec:
 ## 8. Backstage ↔ platform integration
 
 - `BACKSTAGE_URL` = `https://idp.amirasyraf.dev` (platform repo variable).
-- `BACKSTAGE_TOKEN` (platform repo secret) is a Backstage static external-access token restricted to the catalog plugin.
+- `BACKSTAGE_TOKEN` (platform repo secret) is a Backstage static external-access token restricted to
+  `catalog` and `demo-mode`. Its subject is `compute-factory-workflows`. Demo mode accepts it only on
+  the read-only cleanup eligibility check; it cannot toggle settings, launch VMs or read user state.
 - After each inventory commit, the workflow calls (best-effort, never fails the job):
   `POST $BACKSTAGE_URL/api/catalog/refresh` with header `Authorization: Bearer $BACKSTAGE_TOKEN` and JSON
   body `{"entityRef":"resource:default/<name>"}`. On the first commit it also refreshes
@@ -226,7 +235,7 @@ spec:
 - `catalog.orphanStrategy: delete`. Catalog processing interval should be short (POC).
 - Template names (`metadata.name`): `vm-request`, `vm-destroy`, `vm-refry` (platform repo, Agent B) and
   `ssh-cert` (idp repo, Agent C).
-- Templates dispatch with `github:actions:dispatch`:
+- `vm-request` dispatches with `cf:vm:dispatch`; refry/destroy retain `github:actions:dispatch`:
   - `vm-request` first runs step `servicenow`, action `cf:servicenow:create`, named
     `Create ServiceNow request (mock)`. Inputs: `{vmName, team, platform, os, size}` from the form;
     outputs: `{number: string, httpStatus: number}`. The action obtains requester identity from
@@ -240,7 +249,11 @@ spec:
     per task ID; there is no persistent ticket store, real ServiceNow integration, approval or outcome
     update. Only the number/status appear in task logs/output, not GHA inputs or VM inventory.
     Template Editor dry-runs make the real stateless POST. Direct GHA dispatch and refry/destroy do not.
-  - `repoUrl: github.com?owner=amirasyraf&repo=compute-factory-platform`, `branchOrTagName: main`;
+   - `cf:vm:dispatch` inputs `{name, specJson}`; outputs `{workflowRunId, workflowRunHtmlUrl}`. It uses
+     initiating user credentials to call the demo-mode backend, which reserves quota and dispatches
+     `provision.yml` against the fixed platform repo/main branch. Identity/team claims are server-derived;
+     `request_id` is the task ID. No dry-run support; uncertain dispatches retain a visible reservation.
+   - Refry/destroy use `repoUrl: github.com?owner=amirasyraf&repo=compute-factory-platform`, `branchOrTagName: main`;
   - pass `requested_by: ${{ user.entity.metadata.name }}`;
   - pass `requester_teams: ${{ user.entity.spec.memberOf | join(',') }}`. `memberOf` may contain refs like
     `group:default/alpha`, so the workflow normalises by stripping everything up to the last `/` or `:`.
@@ -256,7 +269,8 @@ spec:
      are `waiting` while active and `unknown` after completion, never assumed successful or skipped.
      The IDP task page uses these persisted, task-owner-authorized events for stage cards, timings and
      expandable steps. No credentials or new privileged GitHub endpoint enter the frontend contract.
-  - The browser link to the run is the dispatch output `workflowRunHtmlUrl`. `workflowRunUrl` is the API URL.
+   - The browser link to the run is the dispatch output `workflowRunHtmlUrl`. Stock GitHub dispatch also
+     supplies `workflowRunUrl` (API URL); `cf:vm:dispatch` does not.
 - Custom scaffolder action (idp repo, Agent C):
   - `cf:ssh:sign`, input `{ publicKey: string }`, output `{ certificate, principals, validUntil }`;
   - `cf:watch-workflow`, input `{ operation: provision|refry|destroy, workflowRunId: number }`, output
@@ -264,6 +278,31 @@ spec:
     streams the complete operation until it finishes;
   - reads the CA key from Secrets Manager `compute-factory/ssh-ca` (region from `AWS_REGION`) using
     default AWS credentials, which on EC2 come from the instance role through IMDS (hop limit 2 is set by infra).
+
+### 8.1 Demo mode control
+
+- `demo-mode` backend: authenticated-user `GET /state`, admin-only `POST /settings`
+  (`{enabled: boolean, generation: string}`), user `POST /requests` (`{name, specJson, requestId}`).
+  `GET /cleanup-check/:name?generation=...&request_id=...` accepts only the workflow service subject
+  and returns `{destroy: boolean}`. Ordinary users cannot toggle mode or inspect others' control records.
+- Defaults off. Settings and request/cleanup intent are persisted in the plugin database. One backend
+  instance serializes admission and cleanup. A 15-second worker reconciles immutable Git inventory,
+  not the catalog projection. Concurrent request reservations count immediately; destroying/failed VMs
+  retain their slots until inventory is removed. Repository writers remain trusted and can bypass
+  portal admission through direct workflow dispatch; reconciliation still applies policy to their VMs.
+- Enabled: 3 VMs per original requesting account (including admins), reject a fourth portal request;
+  when enabling, destroy oldest excess requests and retain newest 3. Ready VMs expire at
+  `max(first_ready_at, enabled_at) + 5 min`; terminal failures use first failure time if never ready.
+  Refry does not extend lifetime. Disable invalidates queued cleanup generations; re-enable starts
+  fresh timers. Already-started destruction cannot be undone. Actions queues/Terraform add latency.
+- Automatic destroy checks the current generation and exact VM incarnation before guard validation
+  and again immediately before destructive work; stale or missing VMs skip. Network/auth errors fail
+  closed. Deadlines survive restarts; cleanup pauses while IDP/GitHub is unavailable. Ambiguous
+  dispatches are recovered from the newest 100 matching workflow-dispatch runs; unresolved cases
+  remain visible/reserved rather than being blindly redispatched. Operator intervention may be needed.
+- `computeFactory.demoAutomation: true` is production backend config. Default false makes local
+  development/smoke safe: settings can be exercised, but no inventory scan, launch or cleanup runs.
+  This is not a separate cloud scheduler or a hard termination-time/cost guarantee.
 
 ## 9. IDP runtime (orchestrator infra ↔ Agent C deploy)
 

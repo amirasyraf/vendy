@@ -50,7 +50,7 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
      v                                                v
  idp.amirasyraf.dev  (EC2: Caddy -> Backstage -> Postgres)        VM (EC2, golden AMI)
      |  1. Software Template form -> mock ServiceNow REST (HTTP 201)  ^
-     |  2. github:actions:dispatch  ------------------------------+  |  terraform / ansible over SSH
+     |  2. cf:vm:dispatch (quota)   ------------------------------+  |  terraform / ansible over SSH
      |  5. reads catalog (vms/*/catalog-info.yaml)                 |  |  (pipeline uses its own short cert)
      v                                                             v  |
  GitHub: compute-factory-platform                         GHA runner (OIDC -> AWS)
@@ -335,9 +335,10 @@ Steps:
    tickets or approvals. It sends VM name/team/compute and server-derived requester/task identity;
    failure prevents workflow dispatch. Caddy rewrites the public path to `/api/mock-rest/servicenow`;
    only Scaffolder service credentials are accepted. See `CONTRACTS.md` §8 for the exact interface.
-2. `github:actions:dispatch` → `provision.yml` with `name` and JSON-string `spec_json`, plus
-   `requested_by: ${{ user.entity.metadata.name }}`, `requester_teams` (see 5.1a) and
-   `returnWorkflowRunDetails: true`.
+2. `cf:vm:dispatch` → the authenticated demo-mode backend → `provision.yml` with `name` and
+   JSON-string `spec_json`, plus server-derived `requested_by`, `requester_teams` (see 5.1a) and
+   `request_id` (the Scaffolder task ID). The backend reserves a quota slot before dispatch and
+   returns workflow run details. Demo controls and cleanup semantics are defined in `CONTRACTS.md` §8.1.
 3. `cf:watch-workflow` polls the dispatched GitHub Actions run and streams every job and step into the
    Scaffolder task, including a versioned structured snapshot on each change. The task detail page
    renders actual GHA jobs as individual stage cards with status, duration and expandable steps; this
@@ -376,7 +377,8 @@ The card re-fetches the entity every ~10s while the VM isn't `ready` or `failed`
 2. Right after committing, the job calls Backstage `POST /api/catalog/refresh`:
    - for the VM entity (`resource:default/<name>`), or for `location:default/cf-vms` on the first commit,
      so the new VM is discovered;
-   - authenticated with a static external-access token restricted to the catalog plugin, stored as GHA
+   - authenticated with a static external-access token restricted to catalog and the read-only
+     demo cleanup check, stored as GHA
      secret `BACKSTAGE_TOKEN`.
 3. Backstage re-reads the file and the card picks it up on its next poll. Expect a few seconds end to end.
    The call is best-effort: if it fails, the normal catalog refresh (a few minutes) catches up.
@@ -569,7 +571,8 @@ Verified during build:
 - Terraform lock files must include `linux_amd64` hashes (`terraform providers lock -platform=linux_amd64
   -platform=darwin_arm64`). Otherwise `init` on the runner dirties the tree, and inventory commits need `--autostash`.
 - The static catalog token is a service principal, so the ownership policy doesn't apply to it. That's by
-  design: it can only trigger catalog refreshes.
+   design: it permits catalog operations and the read-only demo cleanup check, not demo settings
+   changes or VM admission.
 
 ## 12. Lifecycle: `./poc up` / `./poc down`
 
