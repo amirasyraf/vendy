@@ -65,9 +65,10 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
 
 Each VM has a folder `vms/<name>/` in `compute-factory-platform` that the workflows write:
 
-- `request.yaml`: the original request (platform, os, size, stages, owning team, requester)
-- `catalog-info.yaml`: a Backstage `Resource` entity (`spec.type: vm`, `spec.owner: group:<team>`) with
-  annotations for status, per-stage status, IP, SSH user and run id
+- `catalog-info.yaml`: the single desired-configuration source, a Backstage `Resource` entity with
+  `spec.owner`, `spec.compute`, `spec.configuration`, optional `spec.billing` and `spec.cloudTags`.
+  Annotations contain observed status, per-stage status, IP, SSH user, run ID and request provenance.
+  There is no separate `request.yaml` and no duplicate desired-input annotations.
 
 That's all. No user keys or certs are stored per VM (see 7).
 
@@ -82,9 +83,6 @@ metadata:
     cf/status: frying            # provisioning | frying | ready | failed | destroying
     cf/stages: '{"provision":"success","baseline":"success","software":"running","ad-join":"pending","access":"pending"}'
     cf/processes: '{"validate":"success","register":"success","provision":"success","fry-baseline":"success","fry-software":"running","fry-ad-join":"pending","fry-access":"pending","finalize":"pending","on-failure":"pending"}'
-    cf/platform: aws
-    cf/os: ubuntu
-    cf/size: S
     cf/public-ip: 3.25.x.x
     cf/ssh-user: ubuntu
     cf/requested-by: user:default/alice
@@ -93,7 +91,23 @@ spec:
   type: vm
   owner: group:default/team-a    # the TEAM owns the VM
   lifecycle: poc
+  compute: {platform: aws, os: ubuntu, size: S}
+  configuration: {software: [git, nginx], adJoin: false}
+  billing: {costCenter: CC-1234, projectCode: PROJ-5678}
+  cloudTags: {environment: test}
 ```
+
+The request template serializes desired spec as `spec_json`, keeping requester identity and team
+claims separate. The workflow validates/normalizes it and commits the entity before provisioning.
+Terraform reads persisted spec into a temporary `.tfvars.json`; Ansible parameters and optional job
+decisions derive from that entity too. Refry persists software/AD configuration changes before
+applying them. Observed-status writes never alter desired spec. Software refry remains additive,
+not an uninstall/reconciliation engine. Editing Git alone does not trigger an apply.
+
+Billing fields are self-reported informational AWS tags, not trusted billing authorization.
+Custom tags cannot override platform-controlled `Name`, `cf:`, `aws:` or `billing:` keys. See
+`CONTRACTS.md` §7 for types, validation and bounds. Future enterprise sections require explicit
+validation and consumers; Backstage's permissive custom-spec storage is not itself validation.
 
 Backstage registers one `Location` entity named `cf-vms` with a glob target,
 `https://github.com/amirasyraf/compute-factory-platform/blob/main/vms/*/catalog-info.yaml`,
@@ -294,7 +308,7 @@ Enforced in three places:
    - The template passes `requester_teams: ${{ user.entity.spec.memberOf | join(',') }}`. This is resolved
      server-side from the user's catalog entity, so the form can't override it.
    - `provision.yml` refuses unless `team ∈ requester_teams`.
-   - `destroy.yml` and `fry.yml` refuse unless the VM's team from `vms/<name>/request.yaml` is in `requester_teams`.
+   - `destroy.yml` and `fry.yml` refuse unless the group from persisted `spec.owner` is in `requester_teams`.
 
 Trust boundary for the POC: anyone with write access to the platform repo, or holding the integration
 token, can bypass this. That's acceptable; they're platform admins.
@@ -314,7 +328,7 @@ Form fields:
 | AD join | checkbox (mock) | baseline + access always run |
 
 Steps:
-1. `github:actions:dispatch` → `provision.yml` with `workflowInputs` (all strings), plus
+1. `github:actions:dispatch` → `provision.yml` with `name` and JSON-string `spec_json`, plus
    `requested_by: ${{ user.entity.metadata.name }}`, `requester_teams` (see 5.1a) and
    `returnWorkflowRunDetails: true`.
 2. `cf:watch-workflow` polls the dispatched GitHub Actions run and streams every job and step into the
@@ -340,7 +354,8 @@ Each VM entity page shows a custom card that reads **only the VM's catalog entit
 - `cf/status`, `cf/stages` and `cf/processes`, rendered as the complete process graph (`validate` → `register`
   → `provision` → `fry: baseline` → `fry: software` → `fry: AD join` → `fry: team access` → `finalize`,
   plus `failure handling`), with a description and status for every process;
-- overall progress, current activity, request configuration, the last catalog refresh time and the full
+- overall progress, current activity, desired configuration from structured spec (including optional
+  informational billing and cloud tags), the last catalog refresh time and the full
   GitHub Actions run link;
 - IP, SSH user, a ready-to-paste SSH command, and links to certificate, refry and destroy actions.
 
@@ -392,7 +407,7 @@ to one VM's run. The portal uses the catalog as the team-scoped projection of th
 | Job | What it does | Portal process status |
 |---|---|---|
 | `validate` | Input sanity, name unique (`vms/<name>/` absent), platform/os supported, `team ∈ requester_teams`, software picks exist in the catalog for the OS | `validate` |
-| `register` | Commit `vms/<name>/{request.yaml,catalog-info.yaml}` with `cf/status: provisioning`, `cf/run-id` | `register` |
+| `register` | Commit `vms/<name>/catalog-info.yaml` with desired spec, `cf/status: provisioning`, `cf/run-id` | `register` |
 | `provision` | OIDC → AWS; `terraform -chdir=terraform/platforms/${platform} apply` with state key `vms/<name>`; outputs IP/user | `provision` |
 | `fry-baseline` | `uses: ./.github/workflows/_fry-stage.yml` with `stage: baseline` | `fry-baseline` |
 | `fry-software` | same, `if:` any software picked | `fry-software` |

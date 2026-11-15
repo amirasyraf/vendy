@@ -98,24 +98,21 @@ All `workflow_dispatch` inputs are strings. Every dispatchable workflow sets
 | Input | Example | Notes |
 |---|---|---|
 | `name` | `demo-1` | `^[a-z][a-z0-9-]{2,20}$` |
-| `team` | `alpha` | must be in `requester_teams` |
-| `platform` | `aws` | only `aws` supported now |
-| `os` | `ubuntu` | only `ubuntu` supported now |
-| `size` | `S` | `S`/`M`/`L` → `t3.small`/`t3.medium`/`t3.large` |
-| `software` | `git,nginx` | comma-separated, may be empty |
-| `ad_join` | `true` | `"true"`/`"false"` |
+| `spec_json` | serialized Resource spec | desired configuration as defined in §7; max 32 KiB |
 | `requested_by` | `amirasyraf` | Backstage user name |
 | `requester_teams` | `alpha,bravo` | comma-separated group names, server-side from Backstage |
 
 ### 6.2 Other workflow inputs
 
 - `destroy.yml`: `name`, `requested_by`, `requester_teams`.
-- `fry.yml`: `name`, `stage` (`baseline`|`software`|`ad-join`|`access`), `software` (comma list, used when stage=software), `requested_by`, `requester_teams`.
+- `fry.yml`: `name`, `stage` (`baseline`|`software`|`ad-join`|`access`), `software` (JSON string array, default `[]`, used when stage=software), `requested_by`, `requester_teams`.
 - `_fry-stage.yml` (`workflow_call`, internal): `name`, `stage`, `host`, `ssh_user`, `os`, `vars_json`.
   The caller grants `id-token: write` and `contents: write`.
 
-Team guard: `provision` requires `team ∈ requester_teams`. `destroy` and `fry` require the VM's `team`
-(from `vms/<name>/request.yaml`) `∈ requester_teams`. A `platform-admins` member passes all guards.
+Team guard: the group from the desired `spec.owner` must belong to `requester_teams`. On provision
+the spec comes from the validated dispatch payload; destroy/refry read the persisted entity in
+`vms/<name>/catalog-info.yaml`. A `platform-admins` member passes all guards. Authorization context
+(`requested_by`, `requester_teams`) is not part of user-editable desired configuration.
 
 ### 6.3 Ansible invocation contract (Agent B calls, Agent A implements)
 
@@ -143,21 +140,7 @@ Install with `pip install -r requirements-ansible.txt`.
 
 ## 7. VM inventory (platform repo `vms/<name>/`)
 
-`request.yaml`:
-```yaml
-name: demo-1
-team: alpha
-platform: aws
-os: ubuntu
-size: S
-software: [git, nginx]
-ad_join: true
-requested_by: amirasyraf
-requested_at: "2026-11-15T12:00:00Z"
-run_id: "1234567890"
-```
-
-`catalog-info.yaml`:
+`catalog-info.yaml` is the only per-VM configuration file; `request.yaml` is removed:
 ```yaml
 apiVersion: backstage.io/v1alpha1
 kind: Resource
@@ -169,22 +152,54 @@ metadata:
     cf/status: provisioning        # provisioning | frying | ready | failed | destroying
     cf/stages: '{"provision":"pending","baseline":"pending","software":"pending","ad-join":"pending","access":"pending"}'
     cf/processes: '{"validate":"success","register":"success","provision":"running","fry-baseline":"pending","fry-software":"pending","fry-ad-join":"pending","fry-access":"pending","finalize":"pending","on-failure":"pending"}'
-    cf/platform: aws
-    cf/os: ubuntu
-    cf/size: S
-    cf/team: alpha
-    cf/software: git,nginx
     cf/public-ip: ""               # filled after provision
     cf/ssh-user: ubuntu
     cf/instance-id: ""
     cf/requested-by: amirasyraf
+    cf/requested-at: "2026-11-15T12:00:00Z"
     cf/run-id: "1234567890"
     cf/run-url: https://github.com/amirasyraf/compute-factory-platform/actions/runs/1234567890
 spec:
   type: vm
   owner: group:default/alpha
   lifecycle: poc
+  compute:
+    platform: aws
+    os: ubuntu
+    size: S
+  configuration:
+    software: [git, nginx]
+    adJoin: false
+  billing:
+    costCenter: CC-1234
+    projectCode: PROJ-5678
+  cloudTags:
+    environment: test
 ```
+
+- `spec` is desired state, annotations are observed results/provenance. No duplicated desired
+  `cf/platform`, `cf/os`, `cf/size`, `cf/team`, `cf/software` annotations are written or consumed.
+- `scripts/spec.py` is the workflow-boundary validator/normalizer. Required: `type: vm`, `owner`, and
+  `compute.{platform,os,size}`. Owner normalizes to `group:default/<team>`; other namespaces/kinds are
+  rejected. Only AWS/Ubuntu and S/M/L are supported. Optional `lifecycle` defaults to `poc` (bounded
+  nonempty string); `configuration` defaults to `{software: [], adJoin: false}`; billing/tags to `{}`.
+  Software is a unique list of software-catalog keys; AD join is a boolean, not an encoded string.
+  Unknown section fields, invalid types and control characters are rejected. Custom fields are not
+  automatically schema-validated by the stock Backstage catalog.
+- Optional billing supports only nonempty `costCenter` and `projectCode` strings up to 256 characters,
+  projected as AWS `billing:cost-center` and `billing:project-code` tags. Values are self-reported,
+  not trusted billing authorization. `cloudTags` is at most 40 string entries (keys 1–128 characters,
+  values 0–256); `Name` and prefixes `cf:`, `aws:`, `billing:` are reserved, case-insensitively.
+  Mandatory platform tags cannot be overridden. Never store secrets in catalog data or tags.
+- Terraform loads persisted spec and maps it to temporary `.tfvars.json` (`name`, `os`, `size`,
+  `team`, original `requested_by`, `cloud_tags` including billing). It deletes that file on exit.
+  The provision job derives Ansible variables/optional-job decisions from the committed entity.
+- Refry persists desired configuration before applying: software refry replaces the software list;
+  AD refry enables `adJoin`. Other spec sections and original request provenance are preserved.
+  Software installation remains additive: changing the desired list does not uninstall packages.
+- Status updates never rewrite spec. Direct Git edits do not trigger reconciliation or a Terraform
+  update. New enterprise sections require explicit validation/consumer changes. Legacy inventory is
+  not migrated; this change rolls out against an empty inventory after VM teardown.
 
 - Stage values: `pending | running | success | failed | skipped`.
 - Stage keys are always these five, in this order: `provision`, `baseline`, `software`, `ad-join`, `access`.

@@ -2,6 +2,11 @@
 
 An IDP (Backstage) and a compute platform (Packer + Terraform + Ansible on GitHub Actions) for self-service VMs.
 
+Each VM's `catalog-info.yaml` is its single desired-configuration source: structured `spec.compute`,
+`spec.configuration`, optional `spec.billing` and `spec.cloudTags`. Workflows read that file for
+Terraform/Ansible; annotations hold observed status and outputs. There is no separate `request.yaml`
+and no automatic reconciliation on Git edits. See `CONTRACTS.md` §7 for the validated schema.
+
 - [DESIGN.md](DESIGN.md): architecture and decisions
 - [CONTRACTS.md](CONTRACTS.md): exact cross-repo names and interfaces
 - [AGENTS.md](AGENTS.md): project rule that documentation stays synchronized with behavior
