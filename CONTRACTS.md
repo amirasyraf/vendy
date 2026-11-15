@@ -219,7 +219,14 @@ spec:
   - The team picker is the stock `MyGroupsPicker` (Groups with `relations.hasMember` = the current user). It
     returns an entity ref, which the workflow normalises to the bare name.
   - Every GHA-backed template follows dispatch with `cf:watch-workflow`. That custom action polls the
-    workflow's jobs and steps and streams the operation status into the Scaffolder task until it finishes.
+     workflow's jobs and steps and streams the operation status into the Scaffolder task until it finishes.
+     The watcher step ID remains `monitor`. Alongside human-readable logs it emits one-line messages
+     prefixed `CF_WORKFLOW_PROGRESS_V1 ` followed by JSON: `{ version: 1, operation, status, conclusion,
+     jobs: [{ name, status, startedAt, completedAt, steps: [{ name, status, startedAt, completedAt }] }] }`.
+     Times are GitHub timestamps or null; completed statuses use the job/step conclusion. Missing jobs
+     are `waiting` while active and `unknown` after completion, never assumed successful or skipped.
+     The IDP task page uses these persisted, task-owner-authorized events for stage cards, timings and
+     expandable steps. No credentials or new privileged GitHub endpoint enter the frontend contract.
   - The browser link to the run is the dispatch output `workflowRunHtmlUrl`. `workflowRunUrl` is the API URL.
 - Custom scaffolder action (idp repo, Agent C):
   - `cf:ssh:sign`, input `{ publicKey: string }`, output `{ certificate, principals, validUntil }`;

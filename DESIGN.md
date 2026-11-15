@@ -312,9 +312,14 @@ Steps:
    `requested_by: ${{ user.entity.metadata.name }}`, `requester_teams` (see 5.1a) and
    `returnWorkflowRunDetails: true`.
 2. `cf:watch-workflow` polls the dispatched GitHub Actions run and streams every job and step into the
-   Scaffolder task. The same watcher is used for VM request, fry refry and destroy, so the user sees the
-   operation's current job, current step, progress, skipped jobs and final result even when the VM entity
-   is removed by destroy.
+   Scaffolder task, including a versioned structured snapshot on each change. The task detail page
+   renders actual GHA jobs as individual stage cards with status, duration and expandable steps; this
+   is separate from the two Backstage template steps (dispatch and monitor). The same view covers
+   VM request, fry refry and destroy, even when destroy removes the VM entity. It uses the existing
+   task-owner-authorized event stream and replays on reload, without exposing a GitHub token or adding
+   an arbitrary-run API. The stock logs, controls and output links remain below the stage view.
+   Polls run about every 10 seconds. Old tasks without snapshots retain text logs; monitoring failures
+   or cancellation show the last observed state, not a claim that the GHA run stopped.
 3. Output links: "Open VM in catalog" (`resource:default/<name>`) and the full GitHub Actions run. The VM
    entity appears within seconds (see 5.3a).
 
@@ -370,8 +375,9 @@ to one VM's run. The portal uses the catalog as the team-scoped projection of th
   - Access: there's no per-VM action. Any member of the owning team connects with their personal SSH
     certificate (see 7).
   - **Re-run a fry stage**: pick a VM and a stage, which dispatches `fry.yml` (reuses `_fry-stage.yml`).
-  - Every action that dispatches GHA has a following `cf:watch-workflow` step. Its task log is the
-    user-facing operation monitor, including the current job, current step, progress and final result.
+- Every action that dispatches GHA has a following `cf:watch-workflow` step. Its task log is the
+  persisted source for both the graphical stage monitor and text logs, including the current job,
+  current step, progress and final result.
 
 ## 6. Pipelines
 
