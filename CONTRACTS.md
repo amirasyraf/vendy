@@ -72,9 +72,9 @@ Tooling versions (pin these):
 
 ## 4. Teams and users (Backstage `org.yaml`, idp repo)
 
-- Groups (`kind: Group`, `spec.type: team`): `alpha`, `bravo`, `platform-admins`.
-- User `amirasyraf` is in `memberOf: [alpha]`. More users are added later by the orchestrator; usernames
-  must match the password entries managed by `./poc set-password`.
+- `compute-factory-idp/catalog/org.yaml` is the sole roster of users, teams and memberships.
+- Teams are `Group` entities with `spec.type: team`; users declare membership in `spec.memberOf`.
+- Usernames must match the password entries managed by `./poc set-password`.
 - Group names are bare (`alpha`). The owner ref is `group:default/alpha`, and the principal is `team-alpha`.
 
 ## 5. Software catalog (platform repo `ansible/software-catalog.yml`)

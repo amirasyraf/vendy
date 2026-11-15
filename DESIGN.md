@@ -268,7 +268,7 @@ The `/catalog` list defaults to **Resource**. Normal users see only that kind; n
 filter links are normalized to Resource. Platform admins retain every kind in the picker and explicit
 kind filter links. This is a frontend navigation restriction, not a new backend permission boundary;
 User/Group data remains available for sign-in, ownership and template team pickers, and direct entity
-pages retain existing authorization. `amirasyraf` is a normal user in `alpha`, not a platform admin.
+pages retain existing authorization; team membership and admin access come from `catalog/org.yaml`.
 
 ### 5.1 Login, users and teams
 
@@ -279,8 +279,9 @@ pages retain existing authorization. `amirasyraf` is a normal user in `alpha`, n
   `./poc set-password <user>` adds or changes one.
 - `catalog/org.yaml` in the idp repo holds `User` and `Group` entities (teams, `spec.type: team`).
   Membership is `User.spec.memberOf: [team-a, team-b]`, and a user can belong to any number of teams.
-  A user needs both an org.yaml entry and a password to log in. Test users: `amirasyraf` (alpha),
-  `bob` (bravo).
+  A user needs both an org.yaml entry and a password to log in. `catalog/org.yaml` is the
+  source of truth for users, teams and memberships; do not duplicate its roster in documentation.
+  Internal team IDs stay lowercase for owner refs and SSH principals.
 - One extra group, `platform-admins`, can see and manage everything.
 - On login, the token's ownership claims are the user plus their direct groups, e.g.
   `[user:default/alice, group:default/team-a, group:default/team-b]`. That's Backstage's default
