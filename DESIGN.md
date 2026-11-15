@@ -311,9 +311,10 @@ Steps:
 1. `github:actions:dispatch` → `provision.yml` with `workflowInputs` (all strings), plus
    `requested_by: ${{ user.entity.metadata.name }}`, `requester_teams` (see 5.1a) and
    `returnWorkflowRunDetails: true`.
-2. `cf:watch-vm` polls the initiating user's catalog view and streams all nine workflow processes into the
-   Scaffolder task: validate, register, provision, each fry job, finalize and failure handling. It waits
-   until the VM is ready or failed, so the request screen does not hide the work behind a single dispatch log.
+2. `cf:watch-workflow` polls the dispatched GitHub Actions run and streams every job and step into the
+   Scaffolder task. The same watcher is used for VM request, fry refry and destroy, so the user sees the
+   operation's current job, current step, progress, skipped jobs and final result even when the VM entity
+   is removed by destroy.
 3. Output links: "Open VM in catalog" (`resource:default/<name>`) and the full GitHub Actions run. The VM
    entity appears within seconds (see 5.3a).
 
@@ -354,7 +355,8 @@ bypasses team permissions, so any user could read any team's run. With everythin
 team permission rules (5.1a) cover status too, with no extra backend code.
 Why custom at all: the community GitHub Actions plugin lists every run in a repo and has no way to filter
 to one VM's run. The portal uses the catalog as the team-scoped projection of the workflow: the frontend
-card renders it, and `cf:watch-vm` streams it into the request task without exposing a shared GitHub token.
+  card renders it, and `cf:watch-workflow` streams operation status into the request, refry and destroy
+  tasks without exposing a shared GitHub token.
 
 ### 5.4 Manage / destroy
 
@@ -368,6 +370,8 @@ card renders it, and `cf:watch-vm` streams it into the request task without expo
   - Access: there's no per-VM action. Any member of the owning team connects with their personal SSH
     certificate (see 7).
   - **Re-run a fry stage**: pick a VM and a stage, which dispatches `fry.yml` (reuses `_fry-stage.yml`).
+  - Every action that dispatches GHA has a following `cf:watch-workflow` step. Its task log is the
+    user-facing operation monitor, including the current job, current step, progress and final result.
 
 ## 6. Pipelines
 

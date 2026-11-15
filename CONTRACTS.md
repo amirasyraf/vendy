@@ -218,13 +218,14 @@ spec:
   - VM pickers use `EntityPicker` with `catalogFilter: { kind: Resource, spec.type: vm }`.
   - The team picker is the stock `MyGroupsPicker` (Groups with `relations.hasMember` = the current user). It
     returns an entity ref, which the workflow normalises to the bare name.
-  - `vm-request` follows dispatch with `cf:watch-vm`. That custom action polls the initiating user's catalog
-    view and streams all nine process statuses into the Scaffolder task until the VM is ready or failed.
+  - Every GHA-backed template follows dispatch with `cf:watch-workflow`. That custom action polls the
+    workflow's jobs and steps and streams the operation status into the Scaffolder task until it finishes.
   - The browser link to the run is the dispatch output `workflowRunHtmlUrl`. `workflowRunUrl` is the API URL.
 - Custom scaffolder action (idp repo, Agent C):
   - `cf:ssh:sign`, input `{ publicKey: string }`, output `{ certificate, principals, validUntil }`;
-  - `cf:watch-vm`, input `{ name: string }`, output `{ status: string }`; reads the initiating user's VM
-    entity and streams the complete process graph until `ready` or `failed`;
+  - `cf:watch-workflow`, input `{ operation: provision|refry|destroy, workflowRunId: number }`, output
+    `{ status: string }`; reads GitHub Actions job/step status with the server-side integration token and
+    streams the complete operation until it finishes;
   - reads the CA key from Secrets Manager `compute-factory/ssh-ca` (region from `AWS_REGION`) using
     default AWS credentials, which on EC2 come from the instance role through IMDS (hop limit 2 is set by infra).
 
