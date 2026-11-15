@@ -133,6 +133,19 @@ run_bake() {
     --query 'sort_by(Images,&CreationDate)[-1].[ImageId,Name]' --output text
 }
 
+# The catalog keeps entities in Postgres across redeploys; re-read every location now so changes to
+# org.yaml (new users/teams) take effect immediately instead of on the next processing cycle.
+refresh_catalog_locations() {
+  local token n
+  token="$(tf_infra output -raw backstage_token)"
+  for n in $(curl -s -H "Authorization: Bearer $token" "https://$DOMAIN/api/catalog/entities?filter=kind=location" \
+               | jq -r '.[].metadata.name' 2>/dev/null); do
+    curl -s -o /dev/null -X POST -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+      -d "{\"entityRef\":\"location:default/$n\"}" "https://$DOMAIN/api/catalog/refresh" || true
+  done
+  echo "catalog locations refreshed"
+}
+
 deploy_idp() {
   local ip="$1"
   wait_for_ssh_ready "$ip"
@@ -146,6 +159,7 @@ deploy_idp() {
   for _ in $(seq 1 60); do
     if [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$HEALTH_URL" || true)" == "200" ]]; then
       echo "IDP healthy"
+      refresh_catalog_locations
       return 0
     fi
     sleep 10
