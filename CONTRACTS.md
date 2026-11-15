@@ -218,8 +218,9 @@ spec:
   body `{"entityRef":"resource:default/<name>"}`. On the first commit it also refreshes
   `location:default/cf-vms`.
 - Catalog locations (idp `app-config.production.yaml`, or `catalog/locations.yaml`):
-  - Location entity **named `cf-vms`**, type `url`, target
-    `https://github.com/amirasyraf/compute-factory-platform/blob/main/vms/*/catalog-info.yaml`;
+  - Location entity **named `cf-vms`**, type `url`, `presence: optional`, target
+    `https://github.com/amirasyraf/compute-factory-platform/blob/main/vms/*/catalog-info.yaml`
+    (optional so an empty `vms/` succeeds and the last destroyed VM is deleted, not retained);
   - templates: `https://github.com/amirasyraf/compute-factory-platform/blob/main/catalog/templates/*/template.yaml`;
   - org and the ssh-cert template come from the idp repo itself.
 - `catalog.orphanStrategy: delete`. Catalog processing interval should be short (POC).
