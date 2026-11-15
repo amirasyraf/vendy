@@ -347,7 +347,7 @@ to one VM's run. This card is the only custom frontend code.
 ### 5.4 Manage / destroy
 
 - The VM entity page has links to the `vm-destroy` (and optional `vm-refry`) templates, prefilled with the
-  entity (scaffolder `?formData=` query param; to verify during build).
+  entity (scaffolder `?formData=` query param).
 - `vm-destroy`: an EntityPicker (kind Resource, type vm; it only lists the user's teams' VMs) dispatches
   `destroy.yml` with `vm`, `requested_by` and `requester_teams`.
 - Team guard: see 5.1a.
@@ -508,11 +508,17 @@ Resolved:
 
 Open: none.
 
-To verify during build:
-- `catalog:fetch` runs with the initiating user's permissions.
-- Catalog search hides other teams' VMs.
-- The scaffolder `?formData=` prefill works.
-- A Location `url` target accepts a glob.
+Verified during build:
+- `catalog:fetch` runs with the initiating user's credentials (`ctx.getInitiatorCredentials()`, Backstage
+  v1.56 source).
+- Catalog search filters by the same catalog read permission (v1.56 source). A browser check is part of E2E.
+- Scaffolder `?formData=` prefill is supported (v1.56 source). The VM card links use it.
+- A Location `url` target with a glob works at runtime (the local smoke run loaded `cf-vms` and the platform templates).
+- The team picker is the stock `MyGroupsPicker`; no custom field is needed.
+- Terraform lock files must include `linux_amd64` hashes (`terraform providers lock -platform=linux_amd64
+  -platform=darwin_arm64`). Otherwise `init` on the runner dirties the tree, and inventory commits need `--autostash`.
+- The static catalog token is a service principal, so the ownership policy doesn't apply to it. That's by
+  design: it can only trigger catalog refreshes.
 
 ## 12. Lifecycle: `./poc up` / `./poc down`
 
