@@ -54,4 +54,7 @@ tear down or recreate infrastructure just to deploy an application change.
   why the task page long-polls `/events` instead of SSE `/eventstream`
   (`compute-factory-idp/packages/app/src/taskEventPolling.ts`; revert steps are in that file and the IDP
   README). Prefer short, completing HTTP requests over SSE/WebSockets for user-facing live updates.
+- After a frontend deploy, already-open tabs keep running the old bundle until reloaded. Before
+  debugging "fix didn't work", check the backend log for that browser fetching the current
+  `/static/main.<hash>.js` (ls `packages/app/dist/static` in the container) since the deploy.
 - The static `BACKSTAGE_TOKEN` is restricted to `catalog` and `demo-mode`; it cannot read scaffolder tasks.
