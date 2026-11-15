@@ -16,3 +16,10 @@ Documentation is living, breathing project material and must be kept current at 
 
 The cross-repository contract is defined in `CONTRACTS.md`; update it when a shared annotation,
 workflow input/output, environment variable, or file contract changes.
+
+## Delivery
+
+Implementation is not complete when code is merely committed. After an implementation change is
+verified and pushed, deploy the affected live environment and verify the deployed behavior before
+reporting completion. For IDP changes, use `./poc deploy-idp` against the existing POC host; do not
+tear down or recreate infrastructure just to deploy an application change.
