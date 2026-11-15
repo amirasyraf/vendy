@@ -237,7 +237,7 @@ deploy/                        # (the IDP EC2 itself is created by the compute-f
   docker-compose.yml           # caddy, backstage, postgres
   Caddyfile
   deploy.sh                    # local: build image (linux/arm64) -> docker save | ssh docker load -> compose up -d
-  .env.example                 # GitHub OAuth app id/secret, integration token, backend secret, PG password,
+  .env.example                 # IDP_USERS_B64 (password hashes), integration token, PG password,
                                # static token for the GHA -> catalog refresh call
                                # (no CA key here; it's read from Secrets Manager via the instance role)
 ```
@@ -251,12 +251,15 @@ deploy/                        # (the IDP EC2 itself is created by the compute-f
 
 ### 5.1 Login, users and teams
 
-- GitHub OAuth App provider.
-- Sign-in resolver `usernameMatchingUserEntityName`, **without** `dangerouslyAllowSignInWithoutUserInCatalog`.
-- `catalog/org.yaml` in the idp repo holds `User` entities (named after GitHub usernames) and `Group`
-  entities (teams, `spec.type: team`). Membership is `User.spec.memberOf: [team-a, team-b]`, and a user
-  can belong to any number of teams. This file is also the login allowlist; without it, anyone with a
-  GitHub account could log in.
+- Username/password login (replaced GitHub OAuth). A small custom auth provider in the idp repo checks the
+  password against scrypt hashes from env var `IDP_USERS_B64`, then signs in as the catalog `User` whose
+  name equals the username. A signed HttpOnly cookie keeps the session for 12h.
+- Passwords live only as hashes in `compute-factory/.poc-users` (gitignored, persists across cycles);
+  `./poc set-password <user>` adds or changes one.
+- `catalog/org.yaml` in the idp repo holds `User` and `Group` entities (teams, `spec.type: team`).
+  Membership is `User.spec.memberOf: [team-a, team-b]`, and a user can belong to any number of teams.
+  A user needs both an org.yaml entry and a password to log in. Test users: `amirasyraf` (alpha),
+  `bob` (bravo).
 - One extra group, `platform-admins`, can see and manage everything.
 - On login, the token's ownership claims are the user plus their direct groups, e.g.
   `[user:default/alice, group:default/team-a, group:default/team-b]`. That's Backstage's default
@@ -476,9 +479,9 @@ Check a cert with `ssh-keygen -L -f ~/.ssh/id_ed25519-cert.pub` (shows principal
 
 ## 9. One-time manual steps (outside `./poc`)
 
-1. **You**: create a GitHub OAuth App (callback `https://idp.amirasyraf.dev/api/auth/github/handler/frame`)
-   and a fine-grained PAT for Backstage. GitHub doesn't allow creating either via the API. Both are free and
-   persist across up/down cycles. Put them in `compute-factory/.poc.env` (gitignored).
+1. **You**: create a fine-grained PAT for Backstage (GitHub doesn't allow creating it via the API) and put it
+   in `compute-factory/.poc.env` (gitignored). It persists across up/down cycles.
+   Set user passwords with `./poc set-password <user>`; they're kept in `compute-factory/.poc-users`.
 2. Create the 4 private repos and push the code (done once, during the build).
 
 Everything else is done by `./poc up` (section 12).
@@ -536,7 +539,8 @@ for the same domain). Caddy renews it itself when it's within 30 days of expiry.
 compute-factory/                 # 4th repo: the "home" of the POC
   DESIGN.md
   poc                            # bash entrypoint: up | down | status
-  .poc.env                       # gitignored: OAuth app id/secret, Backstage PAT (from 9)
+  .poc.env                       # gitignored: Backstage PAT (from 9)
+  .poc-users                     # gitignored: username:scrypt-hash lines (./poc set-password)
   infra/                         # ONE Terraform root, LOCAL state (gitignored), applied only by ./poc
     main.tf                      #   default_tags { cf:poc = "true" } on the AWS provider
     state-bucket.tf              #   S3 bucket for VM Terraform state, force_destroy = true

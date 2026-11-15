@@ -234,7 +234,7 @@ spec:
 | Key | Source |
 |---|---|
 | `IDP_DOMAIN` | `idp.amirasyraf.dev` |
-| `AUTH_GITHUB_CLIENT_ID`, `AUTH_GITHUB_CLIENT_SECRET` | user's GitHub OAuth App |
+| `IDP_USERS_B64` | base64 of `compute-factory/.poc-users` (`username:hash` lines; hash from `compute-factory-idp/deploy/hash-password.mjs`) |
 | `GITHUB_TOKEN` | user's fine-grained PAT (integration: catalog reads + workflow dispatch) |
 | `POSTGRES_PASSWORD` | random |
 | `BACKSTAGE_TOKEN` | random (static external access token) |

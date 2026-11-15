@@ -17,7 +17,8 @@ An IDP (Backstage) and a compute platform (Packer + Terraform + Ansible on GitHu
 Sibling clones live in the same parent directory as this repo (`./poc up` clones any that are missing).
 
 ```bash
-cp poc.env.example .poc.env   # once: GitHub OAuth App + Backstage PAT
+cp poc.env.example .poc.env   # once: Backstage PAT
+./poc set-password amirasyraf  # once per user: IDP login (hash kept in .poc-users)
 ./poc up                      # ~15-20 min: infra, GitHub wiring, bake, IDP deploy
 ./poc status                  # what exists right now
 ./poc deploy-idp              # rebuild + redeploy Backstage on the existing host

@@ -4,6 +4,7 @@
 #   ./poc down     destroy everything, including user VMs, then verify nothing tagged cf:poc=true remains
 #   ./poc status   read-only overview
 #   ./poc deploy-idp   rebuild and redeploy Backstage onto the existing IDP host
+#   ./poc set-password <user>   add/change an IDP login (hash stored in .poc-users)
 # See DESIGN.md section 12.
 set -euo pipefail
 
@@ -19,6 +20,7 @@ CF_DNS_DIR="$HOME/projects/cloudflare/amirasyraf.dev"
 INFRA_DIR="$ROOT/infra"
 GEN="$ROOT/.generated"
 HEALTH_URL="https://$DOMAIN/.backstage/health/v1/readiness"
+USERS_FILE="$ROOT/.poc-users" # username:scrypt-hash lines, gitignored, persists across cycles
 PARALLEL_DESTROYS="${PARALLEL_DESTROYS:-5}"
 
 export AWS_PROFILE="${AWS_PROFILE:-amirasyraf}"
@@ -104,8 +106,7 @@ write_idp_env() {
   umask 077
   cat >"$GEN/idp.env" <<EOF
 IDP_DOMAIN=$DOMAIN
-AUTH_GITHUB_CLIENT_ID=$AUTH_GITHUB_CLIENT_ID
-AUTH_GITHUB_CLIENT_SECRET=$AUTH_GITHUB_CLIENT_SECRET
+IDP_USERS_B64=$(base64 <"$USERS_FILE" | tr -d '\n')
 GITHUB_TOKEN=$GITHUB_TOKEN
 POSTGRES_PASSWORD=$(tf_infra output -raw postgres_password)
 BACKSTAGE_TOKEN=$(tf_infra output -raw backstage_token)
@@ -158,8 +159,8 @@ cmd_up() {
   require_tools docker
   [[ -f "$ROOT/.poc.env" ]] || die "missing $ROOT/.poc.env (copy poc.env.example and fill it in)"
   # shellcheck disable=SC1091
-  ( set -a; source "$ROOT/.poc.env"; : "${AUTH_GITHUB_CLIENT_ID:?}" "${AUTH_GITHUB_CLIENT_SECRET:?}" "${GITHUB_TOKEN:?}" ) \
-    || die ".poc.env must set AUTH_GITHUB_CLIENT_ID, AUTH_GITHUB_CLIENT_SECRET, GITHUB_TOKEN"
+  ( set -a; source "$ROOT/.poc.env"; : "${GITHUB_TOKEN:?}" ) || die ".poc.env must set GITHUB_TOKEN"
+  [[ -s "$USERS_FILE" ]] || die "no IDP users; run ./poc set-password <user> first"
   ensure_repos
   terraform -chdir="$INFRA_DIR" init -input=false >/dev/null
   if infra_has_state && [[ "${POC_FORCE_UP:-}" != "1" ]]; then
@@ -425,6 +426,27 @@ cmd_down() {
   verify_clean
 }
 
+# ---------------------------------------------------------------- users
+
+# ./poc set-password <user>: add or change an IDP login. The user also needs an entry in the idp repo's
+# catalog/org.yaml. Takes effect on the next deploy (./poc up or ./poc deploy-idp).
+cmd_set_password() {
+  local user="${1:-}" pw pw2 hash
+  [[ "$user" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die "usage: $0 set-password <username>"
+  [[ -f "$IDP_DIR/deploy/hash-password.mjs" ]] || die "missing $IDP_DIR/deploy/hash-password.mjs"
+  read -rsp "Password for $user: " pw; echo
+  read -rsp "Repeat: " pw2; echo
+  [[ "$pw" == "$pw2" ]] || die "passwords don't match"
+  [[ ${#pw} -ge 8 ]] || die "use at least 8 characters"
+  hash="$(printf '%s' "$pw" | (cd "$IDP_DIR" && mise exec -- node deploy/hash-password.mjs))"
+  [[ -n "$hash" && "$hash" != *$'\n'* ]] || die "hashing failed"
+  umask 077
+  touch "$USERS_FILE"
+  { grep -v "^$user:" "$USERS_FILE" || true; printf '%s:%s\n' "$user" "$hash"; } >"$USERS_FILE.tmp"
+  mv "$USERS_FILE.tmp" "$USERS_FILE"
+  info "password set for $user; deploy with ./poc deploy-idp"
+}
+
 # ---------------------------------------------------------------- status
 
 cmd_status() {
@@ -460,9 +482,11 @@ case "${1:-}" in
   up)          cmd_up ;;
   down)        cmd_down ;;
   status)      cmd_status ;;
+  set-password) shift; cmd_set_password "$@" ;;
   deploy-idp)  require_tools docker; terraform -chdir="$INFRA_DIR" init -input=false >/dev/null
                infra_has_state || die "no infra; run ./poc up"
+               [[ -s "$USERS_FILE" ]] || die "no IDP users; run ./poc set-password <user> first"
                deploy_idp "$(infra_out idp_ip)" ;;
   _destroy_vm) shift; cmd_destroy_vm "$@" ;;
-  *) echo "usage: $0 up|down|status|deploy-idp" >&2; exit 2 ;;
+  *) echo "usage: $0 up|down|status|deploy-idp|set-password <user>" >&2; exit 2 ;;
 esac
