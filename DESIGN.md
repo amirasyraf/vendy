@@ -349,7 +349,10 @@ Steps:
    an arbitrary-run API. The stock logs, controls and output links remain below the stage view.
    The browser long-polls the task `/events` endpoint instead of SSE `/eventstream`, because
    TLS-inspecting corporate proxies (e.g. Netskope) buffer SSE and leave the page blank; see the IDP
-   README for behavior and how to revert. GitHub is polled about every 10 seconds. Old tasks without snapshots retain text logs; monitoring failures
+   README for behavior and how to revert. GitHub is polled about every 10 seconds.
+   Open tabs check for a newer deployed frontend and show a reload banner. Browser-side failures are
+   reported to the backend log (`client-log` plugin), and Caddy keeps a JSON access log; see the IDP
+   README "Logging and troubleshooting" and `./poc logs` / `./poc task`. Old tasks without snapshots retain text logs; monitoring failures
    or cancellation show the last observed state, not a claim that the GHA run stopped.
 4. Output links: "Open VM in catalog" (`resource:default/<name>`) and the full GitHub Actions run. The VM
    entity appears within seconds (see 5.3a).

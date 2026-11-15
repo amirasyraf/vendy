@@ -29,6 +29,8 @@ cp poc.env.example .poc.env   # once: Backstage PAT
 ./poc status                  # what exists right now
 ./poc watch-bake <run-id>      # monitor an existing bake; never dispatches another
 ./poc deploy-idp              # rebuild + redeploy Backstage on the existing host
+./poc logs [backstage|caddy|postgres|all] [since]   # IDP container logs (default backstage, 30m)
+./poc task <task-id>          # Scaffolder task status + stored events from Postgres
 ./poc down                    # ~5-10 min: cancels runs, destroys all VMs, sweeps, destroys infra, verifies CLEAN
 ```
 

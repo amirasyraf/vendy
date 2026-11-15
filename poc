@@ -6,6 +6,8 @@
 #   ./poc deploy-idp   rebuild and redeploy Backstage onto the existing IDP host
 #   ./poc watch-bake <run-id>   monitor an existing bake without dispatching another
 #   ./poc set-password <user>   add/change an IDP login (hash stored in .poc-users)
+#   ./poc logs [backstage|caddy|postgres|all] [since]   IDP container logs (default: backstage, 30m)
+#   ./poc task <task-id>        Scaffolder task status and stored events, straight from Postgres
 # See DESIGN.md section 12.
 set -euo pipefail
 
@@ -548,8 +550,37 @@ cmd_status() {
   done
 }
 
+idp_host() {
+  local ip
+  ip="$(infra_out idp_ip)"
+  [[ -n "$ip" ]] || die "no IDP host (run ./poc up)"
+  echo "ubuntu@$ip"
+}
+
+# Read-only. Pipe to grep/jq locally, e.g. ./poc logs caddy 10m | grep /events
+cmd_logs() {
+  local service="${1:-backstage}" since="${2:-30m}"
+  [[ "$service" =~ ^(backstage|caddy|postgres|all)$ ]] || die "service must be backstage, caddy, postgres or all"
+  [[ "$since" =~ ^[0-9]+[smh]$ ]] || die "since must look like 30m, 2h or 90s"
+  [[ "$service" == all ]] && service=""
+  local host; host="$(idp_host)"
+  ssh "${SSH_OPTS[@]}" "$host" "cd /opt/idp && docker compose logs --no-color --no-log-prefix --since $since $service" </dev/null
+}
+
+# Read-only. If the task page is blank but events exist here, the problem is delivery to the browser.
+cmd_task() {
+  local id="${1:-}"
+  [[ "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || die "usage: $0 task <task-uuid>"
+  local host; host="$(idp_host)"
+  ssh "${SSH_OPTS[@]}" "$host" "cd /opt/idp && docker compose exec -T postgres psql -U backstage -d backstage_plugin_scaffolder \
+    -c \"select status, created_at, last_heartbeat_at, created_by from tasks where id = '$id'\" \
+    -c \"select id, event_type, created_at, left(body::text, 300) as body from task_events where task_id = '$id' order by id\"" </dev/null
+}
+
 case "${1:-}" in
   up)          cmd_up ;;
+  logs)        shift; cmd_logs "$@" ;;
+  task)        shift; cmd_task "$@" ;;
   down)        cmd_down ;;
   status)      cmd_status ;;
   watch-bake)  command -v gh >/dev/null || die "missing tool: gh"
@@ -561,5 +592,5 @@ case "${1:-}" in
                [[ -s "$USERS_FILE" ]] || die "no IDP users; run ./poc set-password <user> first"
                deploy_idp "$(infra_out idp_ip)" ;;
   _destroy_vm) shift; cmd_destroy_vm "$@" ;;
-  *) echo "usage: $0 up|down|status|deploy-idp|set-password <user>|watch-bake <run-id>" >&2; exit 2 ;;
+  *) echo "usage: $0 up|down|status|deploy-idp|set-password <user>|watch-bake <run-id>|logs [service] [since]|task <task-id>" >&2; exit 2 ;;
 esac
