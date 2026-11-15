@@ -310,8 +310,9 @@ Steps:
 2. Output link: "Open VM in catalog" (`resource:default/<name>`). It appears within seconds (see 5.3a).
 
 Backstage uses a **backend integration token** (a fine-grained PAT you create, scoped to
-`compute-factory-platform`: Actions read/write, Contents read) to dispatch workflows and read run
-status. Users therefore **don't need access to the private repo**.
+`compute-factory-platform`: Actions read/write, Contents read, **Commit statuses read**, which Backstage's
+GitHub URL reader needs to resolve the commit SHA; without it, url Locations fail with 403). It
+dispatches workflows and reads catalog files. Users therefore **don't need access to the private repo**.
 
 ### 5.3 Status and stages: the `vm-status` card
 
