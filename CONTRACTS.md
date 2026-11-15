@@ -73,7 +73,8 @@ Tooling versions (pin these):
 ## 4. Teams and users (Backstage `org.yaml`, idp repo)
 
 - Groups (`kind: Group`, `spec.type: team`): `alpha`, `bravo`, `platform-admins`.
-- User `amirasyraf` (GitHub username) is in `memberOf: [alpha]`. More users are added later by the orchestrator.
+- User `amirasyraf` is in `memberOf: [alpha]`. More users are added later by the orchestrator; usernames
+  must match the password entries managed by `./poc set-password`.
 - Group names are bare (`alpha`). The owner ref is `group:default/alpha`, and the principal is `team-alpha`.
 
 ## 5. Software catalog (platform repo `ansible/software-catalog.yml`)
@@ -166,7 +167,8 @@ metadata:
   description: ubuntu VM on aws (S) for team alpha
   annotations:
     cf/status: provisioning        # provisioning | frying | ready | failed | destroying
-    cf/stages: '{"provision":"running","baseline":"pending","software":"pending","ad-join":"pending","access":"pending"}'
+    cf/stages: '{"provision":"pending","baseline":"pending","software":"pending","ad-join":"pending","access":"pending"}'
+    cf/processes: '{"validate":"success","register":"success","provision":"running","fry-baseline":"pending","fry-software":"pending","fry-ad-join":"pending","fry-access":"pending","finalize":"pending","on-failure":"pending"}'
     cf/platform: aws
     cf/os: ubuntu
     cf/size: S
@@ -186,6 +188,10 @@ spec:
 
 - Stage values: `pending | running | success | failed | skipped`.
 - Stage keys are always these five, in this order: `provision`, `baseline`, `software`, `ad-join`, `access`.
+- `cf/processes` is the complete workflow-job view, with the same status values and these keys in order:
+  `validate`, `register`, `provision`, `fry-baseline`, `fry-software`, `fry-ad-join`, `fry-access`,
+  `finalize`, `on-failure`. Optional software and AD jobs are `skipped`; `on-failure` is `skipped` on a
+  successful run and `success` when it records a failed run.
 - `vms/.gitkeep` always exists.
 
 ## 8. Backstage ↔ platform integration
@@ -212,9 +218,13 @@ spec:
   - VM pickers use `EntityPicker` with `catalogFilter: { kind: Resource, spec.type: vm }`.
   - The team picker is the stock `MyGroupsPicker` (Groups with `relations.hasMember` = the current user). It
     returns an entity ref, which the workflow normalises to the bare name.
+  - `vm-request` follows dispatch with `cf:watch-vm`. That custom action polls the initiating user's catalog
+    view and streams all nine process statuses into the Scaffolder task until the VM is ready or failed.
   - The browser link to the run is the dispatch output `workflowRunHtmlUrl`. `workflowRunUrl` is the API URL.
 - Custom scaffolder action (idp repo, Agent C):
   - `cf:ssh:sign`, input `{ publicKey: string }`, output `{ certificate, principals, validUntil }`;
+  - `cf:watch-vm`, input `{ name: string }`, output `{ status: string }`; reads the initiating user's VM
+    entity and streams the complete process graph until `ready` or `failed`;
   - reads the CA key from Secrets Manager `compute-factory/ssh-ca` (region from `AWS_REGION`) using
     default AWS credentials, which on EC2 come from the instance role through IMDS (hop limit 2 is set by infra).
 

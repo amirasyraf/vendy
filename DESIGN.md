@@ -81,6 +81,7 @@ metadata:
   annotations:
     cf/status: frying            # provisioning | frying | ready | failed | destroying
     cf/stages: '{"provision":"success","baseline":"success","software":"running","ad-join":"pending","access":"pending"}'
+    cf/processes: '{"validate":"success","register":"success","provision":"success","fry-baseline":"success","fry-software":"running","fry-ad-join":"pending","fry-access":"pending","finalize":"pending","on-failure":"pending"}'
     cf/platform: aws
     cf/os: ubuntu
     cf/size: S
@@ -227,8 +228,8 @@ docker: { linux: docker.io, windows: null }
 ```
 backstage/                     # npx @backstage/create-app@latest
   app-config.yaml              # base
-  app-config.production.yaml   # prod: domain, postgres, github auth, integration, catalog locations
-  plugins/vm-status/           # small custom frontend plugin: VM status card (see 5.3)
+  app-config.production.yaml   # prod: domain, postgres, password auth, integration, catalog locations
+  plugins/vm-status/           # custom frontend plugin: full VM pipeline/status card (see 5.3)
   plugins/cf-backend/          # backend module: permission policy (5.1a) + `cf:ssh:sign` scaffolder action (7)
   catalog/org.yaml             # User + Group (team) entities = who may log in and their teams
   catalog/locations.yaml       # Location `cf-vms` (glob over the platform repo's vms/*/catalog-info.yaml)
@@ -310,7 +311,11 @@ Steps:
 1. `github:actions:dispatch` → `provision.yml` with `workflowInputs` (all strings), plus
    `requested_by: ${{ user.entity.metadata.name }}`, `requester_teams` (see 5.1a) and
    `returnWorkflowRunDetails: true`.
-2. Output link: "Open VM in catalog" (`resource:default/<name>`). It appears within seconds (see 5.3a).
+2. `cf:watch-vm` polls the initiating user's catalog view and streams all nine workflow processes into the
+   Scaffolder task: validate, register, provision, each fry job, finalize and failure handling. It waits
+   until the VM is ready or failed, so the request screen does not hide the work behind a single dispatch log.
+3. Output links: "Open VM in catalog" (`resource:default/<name>`) and the full GitHub Actions run. The VM
+   entity appears within seconds (see 5.3a).
 
 Backstage uses a **backend integration token** (a fine-grained PAT you create, scoped to
 `compute-factory-platform`: Actions read/write, Contents read, **Commit statuses read**, which Backstage's
@@ -319,11 +324,13 @@ dispatches workflows and reads catalog files. Users therefore **don't need acces
 
 ### 5.3 Status and stages: the `vm-status` card
 
-Each VM entity page shows a small custom card (about 100–150 lines, frontend only). It reads **only the
-VM's catalog entity**:
-- `cf/status` and `cf/stages`, rendered as a stage list (Provision → Fry: baseline → Fry: software →
-  Fry: ad-join → Fry: access → Ready), each with a status icon;
-- IP, SSH user, a ready-to-paste SSH command, and a link to "Get SSH certificate" if the user doesn't have one.
+Each VM entity page shows a custom card that reads **only the VM's catalog entity**:
+- `cf/status`, `cf/stages` and `cf/processes`, rendered as the complete process graph (`validate` → `register`
+  → `provision` → `fry: baseline` → `fry: software` → `fry: AD join` → `fry: team access` → `finalize`,
+  plus `failure handling`), with a description and status for every process;
+- overall progress, current activity, request configuration, the last catalog refresh time and the full
+  GitHub Actions run link;
+- IP, SSH user, a ready-to-paste SSH command, and links to certificate, refry and destroy actions.
 
 The card re-fetches the entity every ~10s while the VM isn't `ready` or `failed`.
 
@@ -346,7 +353,8 @@ Why this way rather than calling the GitHub API live: a live call would go throu
 bypasses team permissions, so any user could read any team's run. With everything in the catalog, the
 team permission rules (5.1a) cover status too, with no extra backend code.
 Why custom at all: the community GitHub Actions plugin lists every run in a repo and has no way to filter
-to one VM's run. This card is the only custom frontend code.
+to one VM's run. The portal uses the catalog as the team-scoped projection of the workflow: the frontend
+card renders it, and `cf:watch-vm` streams it into the request task without exposing a shared GitHub token.
 
 ### 5.4 Manage / destroy
 
@@ -363,22 +371,22 @@ to one VM's run. This card is the only custom frontend code.
 
 ## 6. Pipelines
 
-### 6.1 `provision.yml` (jobs = stages shown in the IDP)
+### 6.1 `provision.yml` (jobs = processes shown in the IDP)
 
-| Job | What it does |
-|---|---|
-| `validate` | Input sanity, name unique (`vms/<name>/` absent), platform/os supported, `team ∈ requester_teams`, software picks exist in the catalog for the OS |
-| `register` | Commit `vms/<name>/{request.yaml,catalog-info.yaml}` with `cf/status: provisioning`, `cf/run-id` |
-| `provision` | OIDC → AWS; `terraform -chdir=terraform/platforms/${platform} apply` with state key `vms/<name>`; outputs IP/user |
-| `fry-baseline` | `uses: ./.github/workflows/_fry-stage.yml` with `stage: baseline` |
-| `fry-software` | same, `if:` any software picked |
-| `fry-ad-join` | same, `if:` selected (mock) |
-| `fry-access` | same, `stage: access` (writes principal `team-<owning team>` to the VM) |
-| `finalize` | Commit `cf/status: ready` |
-| `on-failure` | `if: failure()`: set `cf/status: failed` (the VM is kept for debugging; destroy cleans up) |
+| Job | What it does | Portal process status |
+|---|---|---|
+| `validate` | Input sanity, name unique (`vms/<name>/` absent), platform/os supported, `team ∈ requester_teams`, software picks exist in the catalog for the OS | `validate` |
+| `register` | Commit `vms/<name>/{request.yaml,catalog-info.yaml}` with `cf/status: provisioning`, `cf/run-id` | `register` |
+| `provision` | OIDC → AWS; `terraform -chdir=terraform/platforms/${platform} apply` with state key `vms/<name>`; outputs IP/user | `provision` |
+| `fry-baseline` | `uses: ./.github/workflows/_fry-stage.yml` with `stage: baseline` | `fry-baseline` |
+| `fry-software` | same, `if:` any software picked | `fry-software` |
+| `fry-ad-join` | same, `if:` selected (mock) | `fry-ad-join` |
+| `fry-access` | same, `stage: access` (writes principal `team-<owning team>` to the VM) | `fry-access` |
+| `finalize` | Commit `cf/status: ready` | `finalize` |
+| `on-failure` | `if: failure()`: set `cf/status: failed` (the VM is kept for debugging; destroy cleans up) | `on-failure` |
 
-Every job updates `cf/stages` and `cf/status` and pings Backstage (one small shared script, see 5.3a).
-That's what the IDP status card shows.
+Every inventory-writing job updates `cf/stages`, `cf/processes` and `cf/status` and pings Backstage (one
+shared script, see 5.3a). The request task and the VM card both show this same catalog-backed state.
 
 The stages run in sequence via `needs:`. Each fry stage is its own job and its own runner, with no shared
 state beyond inputs (VM IP, OS, stage vars). That's what keeps them independent and isolated, and why any
@@ -573,7 +581,8 @@ compute-factory/                 # 4th repo: the "home" of the POC
      - DNS: targeted apply of the `idp` record in `~/projects/cloudflare/amirasyraf.dev`, with the EIP passed in;
      - write `.env` from Terraform outputs and `.poc.env`;
      - run `compute-factory-idp/deploy/deploy.sh`: build the image locally, ship it, `docker compose up -d`;
-     - wait for `https://idp.amirasyraf.dev/healthcheck` to return 200, which also proves the TLS cert was issued.
+      - wait for `https://idp.amirasyraf.dev/.backstage/health/v1/readiness` to return 200, which proves
+        the Backstage runtime and Caddy/TLS path are healthy.
 5. **Done**: print the URL and a summary of what was created.
 
 ### 12.3 `./poc down` (about 5–10 min)

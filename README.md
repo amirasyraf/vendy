@@ -4,6 +4,7 @@ An IDP (Backstage) and a compute platform (Packer + Terraform + Ansible on GitHu
 
 - [DESIGN.md](DESIGN.md): architecture and decisions
 - [CONTRACTS.md](CONTRACTS.md): exact cross-repo names and interfaces
+- [AGENTS.md](AGENTS.md): project rule that documentation stays synchronized with behavior
 
 | Repo | Purpose |
 |---|---|
@@ -24,6 +25,10 @@ cp poc.env.example .poc.env   # once: Backstage PAT
 ./poc deploy-idp              # rebuild + redeploy Backstage on the existing host
 ./poc down                    # ~5-10 min: cancels runs, destroys all VMs, sweeps, destroys infra, verifies CLEAN
 ```
+
+After a VM request, the Scaffolder task streams the complete workflow process graph. The VM's catalog page
+shows the same live, team-scoped view: validation, inventory registration, Terraform provisioning, every fry
+job, finalization and failure handling, plus request details, refresh time and the full Actions run link.
 
 Requirements: `terraform`, `gh` (authenticated), `aws` (profile `amirasyraf`), `docker` (buildx, for the arm64 IDP image), `jq`, `ssh` with `~/.ssh/id_ed25519`.
 
