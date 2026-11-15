@@ -3,6 +3,7 @@
 #   ./poc up       create everything (assumes a clean slate)
 #   ./poc down     destroy everything, including user VMs, then verify nothing tagged cf:poc=true remains
 #   ./poc status   read-only overview
+#   ./poc deploy-idp   rebuild and redeploy Backstage onto the existing IDP host
 # See DESIGN.md section 12.
 set -euo pipefail
 
@@ -235,7 +236,10 @@ save_caddy_data() {
 
 restore_caddy_data() {
   local ip="$1"
-  [[ -f "$CADDY_BACKUP" ]] || { echo "no saved TLS cert; Caddy will request one"; return 0; }
+  if ! tar tzf "$CADDY_BACKUP" 2>/dev/null | grep -q '\.crt$'; then
+    echo "no valid saved TLS cert; Caddy will request one"
+    return 0
+  fi
   ssh "${SSH_OPTS[@]}" "ubuntu@$ip" "docker volume create \
       --label com.docker.compose.project=idp --label com.docker.compose.volume=caddy_data $CADDY_VOLUME >/dev/null \
     && docker run --rm -i -v $CADDY_VOLUME:/data alpine tar xz -C /data" <"$CADDY_BACKUP"
@@ -456,6 +460,9 @@ case "${1:-}" in
   up)          cmd_up ;;
   down)        cmd_down ;;
   status)      cmd_status ;;
+  deploy-idp)  require_tools docker; terraform -chdir="$INFRA_DIR" init -input=false >/dev/null
+               infra_has_state || die "no infra; run ./poc up"
+               deploy_idp "$(infra_out idp_ip)" ;;
   _destroy_vm) shift; cmd_destroy_vm "$@" ;;
-  *) echo "usage: $0 up|down|status" >&2; exit 2 ;;
+  *) echo "usage: $0 up|down|status|deploy-idp" >&2; exit 2 ;;
 esac

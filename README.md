@@ -20,6 +20,7 @@ Sibling clones live in the same parent directory as this repo (`./poc up` clones
 cp poc.env.example .poc.env   # once: GitHub OAuth App + Backstage PAT
 ./poc up                      # ~15-20 min: infra, GitHub wiring, bake, IDP deploy
 ./poc status                  # what exists right now
+./poc deploy-idp              # rebuild + redeploy Backstage on the existing host
 ./poc down                    # ~5-10 min: cancels runs, destroys all VMs, sweeps, destroys infra, verifies CLEAN
 ```
 
