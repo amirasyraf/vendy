@@ -410,6 +410,9 @@ to one VM's run. The portal uses the catalog as the team-scoped projection of th
 
 ### 5.4 Manage / destroy
 
+- The Create page lists only `vm-request` (`sub-page:scaffolder/templates` `templateFilter` in the IDP
+  `app-config.yaml`). Destroy, refry and SSH certificate are reached from the VM page and Home; their
+  direct template URLs still work, and the listing filter is not an authorization boundary.
 - The VM entity page has links to the `vm-destroy` (and optional `vm-refry`) templates, prefilled with the
   entity (scaffolder `?formData=` query param).
 - `vm-destroy`: an EntityPicker (kind Resource, type vm; it only lists the user's teams' VMs) dispatches
