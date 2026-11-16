@@ -6,7 +6,7 @@ variant, because other repos depend on these values.
 
 ## 0. Repos and local paths
 
-| Repo (GitHub, private) | Local path | Owner |
+| Repo (GitHub; private except `compute-factory-platform`, public for free Actions minutes) | Local path | Owner |
 |---|---|---|
 | `amirasyraf/compute-factory` | `~/projects/compute-factory` | orchestrator: `infra/`, `poc`, docs |
 | `amirasyraf/compute-factory-builder` | `~/projects/compute-factory-builder` | Agent A |

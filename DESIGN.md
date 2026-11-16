@@ -30,7 +30,7 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
 | AWS account | `amirasyraf` profile, `134584031874` (single account for everything) |
 | Region | `ap-southeast-2` (Sydney) |
 | GHA -> AWS | Existing OIDC role `arn:aws:iam::134584031874:role/github-aws-role` (trusts `repo:amirasyraf/*`). No static keys. |
-| Repos (private, user `amirasyraf`) | `compute-factory` (this doc, `./poc`, shared AWS infra), `compute-factory-idp`, `compute-factory-builder`, `compute-factory-platform` |
+| Repos (user `amirasyraf`; private except `compute-factory-platform`, public for free Actions minutes and checked for committed secrets first) | `compute-factory` (this doc, `./poc`, shared AWS infra), `compute-factory-idp`, `compute-factory-builder`, `compute-factory-platform` |
 | Lifecycle | `./poc up` creates everything; `./poc down` removes everything, including user VMs (section 12) |
 | Tagging | Every AWS resource, from Terraform, Packer or anywhere else, gets the tag `cf:poc=true`; `down` checks that none remain |
 | IDP | Backstage (latest, v1.56.x at time of writing) on a single EC2, Docker Compose, Caddy TLS, `idp.amirasyraf.dev` |
@@ -367,7 +367,7 @@ Steps:
 Backstage uses a **backend integration token** (a fine-grained PAT you create, scoped to
 `compute-factory-platform`: Actions read/write, Contents read, **Commit statuses read**, which Backstage's
 GitHub URL reader needs to resolve the commit SHA; without it, url Locations fail with 403). It
-dispatches workflows and reads catalog files. Users therefore **don't need access to the private repo**.
+dispatches workflows and reads catalog files. Users therefore **don't need any access to the platform repo**.
 
 ### 5.3 Status and stages: the `vm-status` card
 
