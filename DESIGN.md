@@ -104,8 +104,10 @@ decisions derive from that entity too. Refry persists software/AD configuration 
 applying them. Observed-status writes never alter desired spec. Software refry remains additive,
 not an uninstall/reconciliation engine. Editing Git alone does not trigger an apply.
 
-Billing fields are self-reported informational AWS tags, not trusted billing authorization.
-Custom tags cannot override platform-controlled `Name`, `cf:`, `aws:` or `billing:` keys. See
+The request form has one **Tags** table: `cost_center` and `project_code` (fixed keys, required
+values, stored as `spec.billing`) plus optional extra tags (`spec.cloudTags`). They are self-reported
+informational AWS tags, not trusted billing authorization. Custom tags cannot override
+platform-controlled `Name`, `cost_center`, `project_code`, `cf:`, `aws:` or `billing:` keys. See
 `CONTRACTS.md` §7 for types, validation and bounds. Future enterprise sections require explicit
 validation and consumers; Backstage's permissive custom-spec storage is not itself validation.
 

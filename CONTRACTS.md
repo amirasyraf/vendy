@@ -195,10 +195,14 @@ spec:
   Software is a unique list of software-catalog keys; AD join is a boolean, not an encoded string.
   Unknown section fields, invalid types and control characters are rejected. Custom fields are not
   automatically schema-validated by the stock Backstage catalog.
-- Optional billing supports only nonempty `costCenter` and `projectCode` strings up to 256 characters,
-  projected as AWS `billing:cost-center` and `billing:project-code` tags. Values are self-reported,
-  not trusted billing authorization. `cloudTags` is at most 40 string entries (keys 1–128 characters,
-  values 0–256); `Name` and prefixes `cf:`, `aws:`, `billing:` are reserved, case-insensitively.
+- Billing supports only nonempty `costCenter` and `projectCode` strings up to 256 characters,
+  projected as AWS `cost_center` and `project_code` tags (VMs launched before this change carry
+  `billing:cost-center`/`billing:project-code`). The vm-request form (`tags` parameter, `ui:field:
+  VmTagsEditor`: one table with fixed `cost_center`/`project_code` rows plus optional tags) and the IDP
+  dispatch endpoint require both for new requests; `spec.py` keeps them optional so older specs still
+  load. Values are self-reported, not trusted billing authorization. `cloudTags` is at most 40 string
+  entries (keys 1–128 characters, values 0–256); `Name`, `cost_center`, `project_code` and prefixes
+  `cf:`, `aws:`, `billing:` are reserved, case-insensitively.
   Mandatory platform tags cannot be overridden. Never store secrets in catalog data or tags.
 - Terraform loads persisted spec and maps it to temporary `.tfvars.json` (`name`, `os`, `size`,
   `team`, original `requested_by`, `cloud_tags` including billing). It deletes that file on exit.
