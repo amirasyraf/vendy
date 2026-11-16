@@ -207,9 +207,10 @@ spec:
 - Terraform loads persisted spec and maps it to temporary `.tfvars.json` (`name`, `os`, `size`,
   `team`, original `requested_by`, `cloud_tags` including billing). It deletes that file on exit.
   The provision job derives Ansible variables/optional-job decisions from the committed entity.
-- Refry persists desired configuration before applying: software refry replaces the software list;
-  AD refry enables `adJoin`. Other spec sections and original request provenance are preserved.
-  Software installation remains additive: changing the desired list does not uninstall packages.
+- Refry persists desired configuration before applying: software refry adds the selected packages
+  to the software list (union; an empty selection keeps it); AD refry enables `adJoin`. Other spec
+  sections and original request provenance are preserved. Software installation remains additive:
+  nothing is uninstalled, so the recorded list only grows.
 - Status updates never rewrite spec. Direct Git edits do not trigger reconciliation or a Terraform
   update. New enterprise sections require explicit validation/consumer changes. Legacy inventory is
   not migrated; this change rolls out against an empty inventory after VM teardown.
@@ -273,6 +274,11 @@ spec:
      jobs: [{ name, status, startedAt, completedAt, steps: [{ name, status, startedAt, completedAt }] }] }`.
      Times are GitHub timestamps or null; completed statuses use the job/step conclusion. Missing jobs
      are `waiting` while active and `unknown` after completion, never assumed successful or skipped.
+     A skipped reusable-workflow job, which GitHub names by its caller ID (`fry-software`), is reported
+     under the expected name (`fry-software / fry`). Monitoring failures never fail the task early:
+     rate limits (403/429), GitHub 5xx, timeouts and network errors are retried with backoff until the
+     30-minute deadline; a 404 is retried for 2 minutes (a just-dispatched run); other 4xx fail at once.
+     GitHub reads use conditional requests (ETag), whose 304 replies do not consume the rate limit.
      The IDP task page uses these persisted, task-owner-authorized events for stage cards, timings and
      expandable steps. No credentials or new privileged GitHub endpoint enter the frontend contract.
    - The browser link to the run is the dispatch output `workflowRunHtmlUrl`. Stock GitHub dispatch also
@@ -305,7 +311,10 @@ spec:
   and again immediately before destructive work; stale or missing VMs skip. Network/auth errors fail
   closed. Deadlines survive restarts; cleanup pauses while IDP/GitHub is unavailable. Ambiguous
   dispatches are recovered from the newest 100 matching workflow-dispatch runs; unresolved cases
-  remain visible/reserved rather than being blindly redispatched. Operator intervention may be needed.
+  remain visible/reserved rather than being blindly redispatched. Failed or rejected cleanup is
+  retried at most 3 times per VM per generation, then shown as "Cleanup stopped" for an operator.
+  A failed inventory scan blocks portal requests only while demo mode is enabled (quota fails closed).
+  Operator intervention may be needed.
 - `computeFactory.demoAutomation: true` is production backend config. Default false makes local
   development/smoke safe: settings can be exercised, but no inventory scan, launch or cleanup runs.
   This is not a separate cloud scheduler or a hard termination-time/cost guarantee.
