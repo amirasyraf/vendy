@@ -174,7 +174,7 @@ spec:
   compute:
     platform: aws
     os: ubuntu
-    size: S
+    size: S                # or, instead of size: instanceType: m7i.large (IDP Advanced picker)
   configuration:
     software: [git, nginx]
     adJoin: false
@@ -188,8 +188,9 @@ spec:
 - `spec` is desired state, annotations are observed results/provenance. No duplicated desired
   `cf/platform`, `cf/os`, `cf/size`, `cf/team`, `cf/software` annotations are written or consumed.
 - `scripts/spec.py` is the workflow-boundary validator/normalizer. Required: `type: vm`, `owner`, and
-  `compute.{platform,os,size}`. Owner normalizes to `group:default/<team>`; other namespaces/kinds are
-  rejected. Only AWS/Ubuntu and S/M/L are supported. Optional `lifecycle` defaults to `poc` (bounded
+  `compute.{platform,os}` plus exactly one of `compute.size` (a `sizes.json` key: XS/S/M/L) or
+  `compute.instanceType` (EC2 type such as `m7i.large`; `mac*` rejected). Owner normalizes to
+  `group:default/<team>`; other namespaces/kinds are rejected. Only AWS/Ubuntu are supported. Optional `lifecycle` defaults to `poc` (bounded
   nonempty string); `configuration` defaults to `{software: [], adJoin: false}`; billing/tags to `{}`.
   Software is a unique list of software-catalog keys; AD join is a boolean, not an encoded string.
   Unknown section fields, invalid types and control characters are rejected. Custom fields are not
@@ -339,14 +340,20 @@ spec:
 
 - Backend: `backend "s3" {}` with partial config passed at init:
   `-backend-config=bucket=$TF_STATE_BUCKET -backend-config=key=vms/aws/<name>/terraform.tfstate -backend-config=region=ap-southeast-2 -backend-config=use_lockfile=true`.
-- Variables: `name` (required), `os` (default `ubuntu`), `size` (default `S`), `team` (default `""`),
+- Variables: `name` (required), `os` (default `ubuntu`), `size` (default `S`), `instance_type` (default
+  `""`; overrides `size`), `team` (default `""`),
   `requested_by` (default `""`). **`terraform destroy -var name=<name>` must work with nothing else**,
   because `./poc down` uses that.
 - Outputs: `public_ip`, `ssh_user`, `instance_id`, `instance_type`.
 - Size map: `terraform/platforms/aws/sizes.json` in the platform repo, a JSON object of size
-  (`S`/`M`/`L`) to EC2 instance type. Terraform reads it; the IDP `vm-sizes` backend reads the same file
-  from `main` via the GitHub API to label sizes in the request form (`ui:field: VmSizePicker`) and adds
-  live specs from `ec2:DescribeInstanceTypes` (IDP host role, read-only).
+  (`XS`/`S`/`M`/`L` = `t3.micro`/`small`/`medium`/`large`) to EC2 instance type. `spec.py` and Terraform
+  read it; the IDP `vm-sizes` backend reads the same file from `main` via the GitHub API for the request
+  form's size cards (`ui:field: VmComputePicker` on `compute`) and adds live specs from
+  `ec2:DescribeInstanceTypes`. Its Advanced picker lists every x86_64, EBS-backed type offered in the
+  region (`ec2:DescribeInstanceTypeOfferings`; IDP host role, read-only). Terraform rejects types that
+  cannot boot x86_64 and launches into a default subnet whose AZ offers the type.
+- Demo mode: while on, the IDP accepts `compute.instanceType` only from `t3.micro`, `t3.small`,
+  `t3.medium`, `t3.large` (`demo-mode` `/state` returns them as `instanceTypes`); sizes are allowed.
 - Resources are tagged `cf:poc=true`, `cf:vm=<name>`, `cf:team=<team>`. No key pair (the CA is used).
 - `./poc down` runs, for each key under `vms/aws/*/terraform.tfstate`:
   `terraform -chdir=~/projects/compute-factory-platform/terraform/platforms/aws init -reconfigure <backend-config…> && terraform … destroy -auto-approve -var name=<name>`.

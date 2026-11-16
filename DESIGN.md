@@ -229,12 +229,16 @@ docker: { linux: docker.io, windows: null }
 
 | Inputs | Outputs |
 |---|---|
-| `name`, `os`, `size` (S/M/L), `owner`, `tags` | `public_ip`, `ssh_user`, `instance_id`, `instance_type` |
+| `name`, `os`, `size` (XS/S/M/L) or `instance_type`, `owner`, `tags` | `public_ip`, `ssh_user`, `instance_id`, `instance_type` |
 
-- Each platform maps sizes in one data file. AWS: `sizes.json` (S=`t3.small`, M=`t3.medium`,
-  L=`t3.large`; all 2 vCPU, 2/4/8 GiB), read by `sizes.tf`. The IDP reads the same file and shows each
-  size's instance type with live AWS specs in the request form; VM pages show the launched type
-  (`cf/instance-type`).
+- Each platform maps sizes in one data file. AWS: `sizes.json` (XS=`t3.micro`, S=`t3.small`,
+  M=`t3.medium`, L=`t3.large`; all 2 vCPU, 1/2/4/8 GiB), read by `sizes.tf`. Regular users pick a size
+  card showing the instance type and live AWS specs. A collapsed **Advanced** picker lists every x86_64
+  instance type offered in the region, segmented by family type (general purpose, compute, memory,
+  storage, accelerated, HPC) and grouped by family, with search, family/vCPU/memory filters, a
+  current-generation toggle and sortable columns; the choice is stored as `compute.instanceType`.
+  Demo mode greys out everything except `t3.micro`–`t3.large` and the IDP backend enforces it.
+  VM pages show the launched type (`cf/instance-type`).
 - Image lookup uses tags: `data "aws_ami"` with `cf:os=<os>`, `cf:managed=true`, `most_recent`.
 - `ssh_user` comes from the OS: `ubuntu` for Ubuntu, `Administrator` for Windows later.
 - State: S3 bucket `cf-tfstate-134584031874-apse2`, key `vms/<platform>/<name>/terraform.tfstate`, S3 native

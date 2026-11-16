@@ -58,8 +58,9 @@ resource "aws_iam_role_policy" "idp_read_ca" {
   })
 }
 
-# The VM request form and VM pages show instance-type specs (vCPU, memory, arch) live from AWS.
-# Read-only; DescribeInstanceTypes does not support resource-level scoping.
+# The VM request form (size cards and the Advanced instance-type picker) and VM pages show
+# instance types offered in the region with live specs. Read-only; neither action supports
+# resource-level scoping.
 resource "aws_iam_role_policy" "idp_describe_instance_types" {
   name = "describe-instance-types"
   role = aws_iam_role.idp.id
@@ -67,7 +68,7 @@ resource "aws_iam_role_policy" "idp_describe_instance_types" {
     Version = "2012-10-17"
     Statement = [{
       Effect   = "Allow"
-      Action   = "ec2:DescribeInstanceTypes"
+      Action   = ["ec2:DescribeInstanceTypes", "ec2:DescribeInstanceTypeOfferings"]
       Resource = "*"
     }]
   })
