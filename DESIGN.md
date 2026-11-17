@@ -49,9 +49,9 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
      |  0. "Get SSH certificate" -> cert (instant)    |  ssh ubuntu@<ip>   (key + user cert)
      v                                                v
  idp.amirasyraf.dev  (EC2: Caddy -> Backstage -> Postgres)        VM (EC2, golden AMI)
-     |  1. Software Template form -> mock ServiceNow REST (HTTP 201)  ^
-     |  2. cf:vm:dispatch (quota) -> provision run in the `vms`      ^
-     |     orchestrator, which dispatches one stage at a time ---+  |  terraform / ansible over SSH
+     |  1. Software Template form -> cf:vm:dispatch (quota)          ^
+     |  2. provision run in the `vms` orchestrator: ServiceNow mock  |
+     |     (in the IDP), then one stage.yml dispatch at a time --+  |  terraform / ansible over SSH
      |     (retries, retry/skip, run state in its DB)            |  |  (pipeline uses its own short cert)
      |  5. reads catalog (vms/*/catalog-info.yaml)               |  |
      v                                                           v  |
@@ -342,18 +342,15 @@ Form fields:
 | AD join | checkbox (mock) | baseline + access always run |
 
 Steps:
-1. `cf:servicenow:create` → a real HTTP POST to `https://idp.amirasyraf.dev/mock-rest/servicenow`.
-   A small authenticated backend receiver returns HTTP 201 and a fake `RITM…` number, shown in task
-   logs/output. This stateless mock demonstrates pre-GHA REST integration without ServiceNow, stored
-   tickets or approvals. It sends VM name/team/compute and server-derived requester/task identity;
-   failure prevents workflow dispatch. Caddy rewrites the public path to `/api/mock-rest/servicenow`;
-   only Scaffolder service credentials are accepted. See `CONTRACTS.md` §8 for the exact interface.
+1. The form has one step, `cf:vm:dispatch` (below). The mock ServiceNow request is no longer a
+   Scaffolder step: it is the first stage of the provision run (6.1), executed by the IDP itself, so
+   the whole pipeline (business steps and VM steps) is one run on one page with one failure model.
 2. `cf:vm:dispatch` → the authenticated `vms` backend (`POST /api/vms/requests`), which reserves a
    demo quota slot and creates a provision run in the orchestrator (6). `request_id` is the Scaffolder
    task ID, so a task retry or recovery returns the same run. Identity and teams are server-derived
    (see 5.1a). Demo controls and cleanup semantics are defined in `CONTRACTS.md` §8.1.
-3. The task then finishes. Its output links to the run page (`/vms/runs/<id>`), the live view of the
-   run: every stage with status, attempt, retry countdown, errors, the GitHub run and its steps, and
+3. The task then finishes and the IDP takes the browser to the run page (`/vms/runs/<id>`), the live
+   view of the run: every stage with status, attempt, retry countdown, errors, the GitHub run and its steps, and
    Retry/Skip when a stage has failed for good. It does not depend on the VM's catalog entity, which
    appears a few seconds after `register` (see 5.3a). Scaffolder task recovery is on, so a backend
    restart mid-task resumes the task instead of failing it.
@@ -425,11 +422,13 @@ run and its stages in its database. Stage lists are code:
 
 | Run | Stages (in order) |
 |---|---|
-| provision | `register` (validate + commit inventory) → `provision` (Terraform) → `baseline` → `software` (if picked) → `ad-join` (if picked, mock) → `access` → `finalize` (`cf/status: ready`) |
+| provision | `servicenow` (mock ServiceNow request, runs in the IDP) → `register` (validate + commit inventory) → `provision` (Terraform) → `baseline` → `software` (if picked) → `ad-join` (if picked, mock) → `access` → `finalize` (`cf/status: ready`) |
 | refry | `configure` (persist the software/AD change; software and AD refry only) → the chosen fry stage → `finalize` |
 | destroy | `destroy` (guards, `cf/status: destroying`, `terraform destroy`, delete state and inventory) → `finalize` (failure path only) |
 
-A 10-second worker dispatches `stage.yml` for the next due stage, polls its GitHub run and job steps
+Each stage runs either inside the IDP (non-VM business steps such as the mock ServiceNow request;
+future approvals or CMDB updates would go here) or as a `stage.yml` dispatch (everything that
+touches cloud or VM). A 10-second worker runs or dispatches the next due stage, polls its GitHub run and job steps
 (ETag requests), and advances the run. Each stage reads everything it needs from the committed
 inventory (host, spec, provenance), so stages share no runner state and any one can run again alone.
 

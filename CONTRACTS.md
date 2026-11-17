@@ -267,23 +267,12 @@ spec:
   - org and the ssh-cert template come from the idp repo itself.
 - `catalog.orphanStrategy: delete`. Catalog processing interval should be short (POC).
 - Template names (`metadata.name`): `vm-request`, `vm-destroy`, `vm-refry` (platform repo) and
-  `ssh-cert` (idp repo). VM templates only **create an orchestrator run** and then finish; live progress,
-  retry and skip are on the IDP run page (`/vms/runs/<id>`) and the VM entity page, not the task page.
-  - `vm-request` first runs step `servicenow`, action `cf:servicenow:create`, named
-    `Create ServiceNow request (mock)`. Inputs: `{vmName, team, platform, os, size}` from the form;
-    outputs: `{number: string, httpStatus: number}`. The action obtains requester identity from
-    initiating credentials, POSTs those details plus `requestId` (task ID) and `requestedBy` (user entity
-    ref) to `computeFactory.mockServiceNowUrl`, and requires a valid HTTP 201 response before dispatch.
-    Production URL: `https://idp.amirasyraf.dev/mock-rest/servicenow`; local default:
-    `http://localhost:7007/api/mock-rest/servicenow`. The URL is backend-only config, same IDP origin,
-    exact mock path, no redirects, ten-second timeout and task-cancellation support.
-    The `mock-rest` plugin accepts only `plugin:scaffolder` service credentials and returns
-    `{number: "RITM" + ten digits, status: "created", mock: true, requestId}`. Numbers are deterministic
-    per task ID; there is no persistent ticket store, real ServiceNow integration, approval or outcome
-    update. Only the number/status appear in task logs/output, not GHA inputs or VM inventory.
-    Template Editor dry-runs make the real stateless POST. Refry/destroy do not.
-  - `vm-request` step `dispatch`, action `cf:vm:dispatch`, inputs `{name, specJson}` (unchanged spec
-    JSON construction); outputs `{runId: number, runUrl: string}`. It calls `POST /api/vms/requests`
+  `ssh-cert` (idp repo). VM templates only **create an orchestrator run** and then finish. The whole
+  pipeline, including non-VM steps such as the mock ServiceNow request, is an orchestrator run (§8.2):
+  live progress, retry and skip are on the IDP run page (`/vms/runs/<id>`) and the VM entity page. When
+  a VM task completes with a run, the IDP task page takes the browser to that run page.
+  - `vm-request` has one step, `dispatch`, action `cf:vm:dispatch`, inputs `{name, specJson}` (unchanged
+    spec JSON construction); outputs `{runId: number, runUrl: string}`. It calls `POST /api/vms/requests`
     with the initiating user's credentials; admission reserves demo quota and creates the provision run.
     `request_id` is the task ID, so a Scaffolder retry or recovery returns the same run.
     Template output links: `Follow provisioning` → `${{ steps.dispatch.output.runUrl }}`, and
@@ -298,10 +287,20 @@ spec:
     returns an entity ref, which the backend normalises to the bare name.
   - `github:actions:dispatch` and `cf:watch-workflow` are no longer used; the `CF_WORKFLOW_PROGRESS_V1`
     task-event format is removed.
-- Custom scaffolder actions (idp repo): `cf:servicenow:create`, `cf:vm:dispatch`, `cf:vm:run`, and
+- Custom scaffolder actions (idp repo): `cf:vm:dispatch`, `cf:vm:run`, and
   `cf:ssh:sign` (input `{ publicKey: string }`, output `{ certificate, principals, validUntil }`; reads the
   CA key from Secrets Manager `compute-factory/ssh-ca` (region from `AWS_REGION`) using default AWS
   credentials, which on EC2 come from the instance role through IMDS (hop limit 2 is set by infra)).
+- Mock ServiceNow: the orchestrator's `servicenow` stage (§8.2) POSTs `{requestId, vmName, team,
+  requestedBy, platform, os, size}` (`requestId` = the run's request ID, `requestedBy` = the requesting
+  user's entity ref) to `computeFactory.mockServiceNowUrl` and requires a valid HTTP 201 response.
+  Production URL: `https://idp.amirasyraf.dev/mock-rest/servicenow`; local default:
+  `http://localhost:7007/api/mock-rest/servicenow`. The URL is backend-only config, same IDP origin,
+  exact mock path, no redirects, ten-second timeout. The `mock-rest` plugin accepts only `plugin:vms`
+  service credentials and returns `{number: "RITM" + ten digits, status: "created", mock: true,
+  requestId}`. Numbers are deterministic per request ID; there is no persistent ticket store, real
+  ServiceNow integration, approval or outcome update. The number appears in the stage `summary`, not in
+  GHA inputs or VM inventory. Refry/destroy do not call it.
 
 ### 8.1 Demo mode control
 
@@ -346,10 +345,15 @@ must be retried, skipped or destroyed first.
 
 | Run kind | Stages, in order |
 |---|---|
-| `provision` | `register`, `provision`, `baseline`, `software`, `ad-join`, `access`, `finalize` |
+| `provision` | `servicenow`, `register`, `provision`, `baseline`, `software`, `ad-join`, `access`, `finalize` |
 | `refry` | `configure`, `<stage>`, `finalize` (`configure` applies only to software and ad-join) |
 | `destroy` | `destroy`, `finalize` (`finalize` runs only on the failure path) |
 
+- Stages run in one of two places. `servicenow` runs inside the IDP (an in-process handler); every
+  other stage is a `stage.yml` dispatch (§6). In-process stages have no GitHub run (`runUrl: null`,
+  empty `steps`); an HTTP 5xx, 429, timeout or network error is transient, any other unexpected
+  response is permanent. An in-process attempt interrupted by a restart is simply run again (handlers
+  are idempotent per request ID).
 - Not-applicable stages (no software selected, no AD join, refry `configure` for baseline/access,
   destroy `finalize` on success) are `skipped` with `skippedBy: null`.
 - Stage statuses: `pending | running | retrying | success | failed | skipped | cancelled`.
@@ -414,6 +418,7 @@ type StageView = {
   skippedBy: string | null;
   retriedBy: string | null;     // last user who manually retried this stage
   outcome: 'ready' | 'failed' | null;          // finalize only
+  summary: string | null;       // one-line result, e.g. 'RITM0123456789 created (mock ServiceNow)'
   runUrl: string | null;        // GitHub run of the current or last attempt
   steps: { name: string; status: string }[];   // that run's job steps
   attempts: {                   // earlier attempts, oldest first
