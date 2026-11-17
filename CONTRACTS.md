@@ -61,6 +61,11 @@ Tooling versions (pin these):
 | `team-<group>` | a member of Backstage group `<group>`, e.g. `team-alpha` |
 | `team-platform-admins` | admins; baked into every VM |
 
+- Browser terminal (§8.4) certs: a fresh per-session ed25519 key generated on the IDP host, key ID
+  `idp-terminal:<username>`, one principal (`team-<VM's team>` if the user is in it, else
+  `team-platform-admins`), validity 5 minutes (only the SSH handshake needs it). The private key never
+  leaves the IDP and is deleted when the session ends.
+
 - OS login user on Ubuntu: `ubuntu`.
 - The fry stage `access` writes the **whole** `/etc/ssh/auth_principals/ubuntu` file with exactly three
   lines: `cf-automation`, `team-platform-admins` and `team-<owning team>`. Then it runs `sshd -t` and reloads.
@@ -407,6 +412,10 @@ one of their groups.
 | `GET /summary` | `{ observedAt, observedError, vms: [{ name, latest: RunView, observed: ObservedVm \| null }] }`: the newest run per VM name visible to the caller, with the health check of that VM incarnation (§8.3) |
 | `POST /runs` | `{operation, vm, requestKey, compute?, software?, adJoin?}` → `{runId, runUrl}`. 400 invalid or (Modify) nothing to change, 403 other team or demo-disallowed instance type, 404 unknown VM, 409 conflict, 503 automation off |
 | `GET /observed/:name` | `{ enabled, checkedAt, error, vm: ObservedVm \| null }` (§8.3) |
+| `POST /terminal` | `{vm, cols, rows}` → `{id, host, user}` (§8.4); 409 not running / no IP, 429 two sessions already open, 503 automation off |
+| `GET /terminal/:id/output?after=<seq>` | `{seq, data, closed: string \| null}`; waits up to 25 s for output after `seq` |
+| `POST /terminal/:id/input` | `{data}` (≤ 16 KiB keystrokes) or `{cols, rows}` (resize) → `{}` |
+| `DELETE /terminal/:id` | Close the session → `{}` |
 | `POST /runs/:id/retry` | `RunView`; 409 when not retryable, 403 when not allowed |
 | `POST /runs/:id/skip` | `RunView`; 409 when the failed stage is not skippable or the run is not failed |
 
@@ -494,6 +503,24 @@ type ObservedVm = {
   AWS"; a stopped one as "Stopped". A console stop or start is picked up within 30 seconds; the
   inventory `cf/public-ip` is then stale until the next start/stop run, so the UI prefers the observed
   address.
+### 8.4 Browser terminal (`vms` backend plugin)
+
+- "Open terminal" on the VM page opens an SSH session from the IDP host to the VM: the backend checks
+  access exactly like `POST /runs` (team or admin; entity read with the user's credentials), refuses a VM
+  the fresh health check does not show running, and connects to the observed public IP (else
+  `cf/public-ip`). It signs a per-session key (§3) and runs the system `ssh -tt ubuntu@<ip>` in a PTY
+  (`node-pty`); host keys are not pinned (POC, same as the fry stages).
+- Transport is plain HTTP, not WebSocket (TLS-inspecting proxies hold back long-lived streams): the
+  browser (xterm.js) posts keystrokes in order and long-polls output (25 s). Sessions belong to the user
+  who opened them; other users get 404.
+- Limits: 2 open sessions per user; closed after 15 minutes without input, 90 s without an output poll
+  (tab closed), or when `ssh` exits. Output kept per session: the last 256 KiB. Sessions live in memory,
+  so a backend restart ends them.
+- Audit: backend log lines `Terminal <id> opened: <user> → <vm> (<ip>) as <principal>` and
+  `Terminal <id> closed: … after <n>s: <reason>`; the VM's auth log shows the cert key ID. Keystrokes and
+  output are not recorded.
+- Only where `computeFactory.demoAutomation` is on (production); otherwise 503.
+
 ## 9. IDP runtime (orchestrator infra ↔ Agent C deploy)
 
 - EC2: Ubuntu 26.04 **arm64** (t4g.medium). Cloud-init installs Docker Engine + compose plugin, puts

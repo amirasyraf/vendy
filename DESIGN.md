@@ -417,8 +417,12 @@ to one VM's run, and would expose runs through a shared token regardless of team
     access again) in the ⋯ menu, with a confirm dialog.
   - **Destroy** in the ⋯ menu; the dialog asks for the VM name. It supersedes any other active run.
   - **Retry / Skip** on a failed run, from the run page or the VM page (6.2).
-  - Access: there's no per-VM action. Any member of the owning team connects with their personal SSH
-    certificate (see 7).
+  - Access: any member of the owning team connects with their personal SSH certificate (see 7), or
+    with **Open terminal** in the VM page's Connect card: a browser terminal (xterm.js) whose SSH
+    session runs on the IDP host with a 5-minute per-session cert for the VM's team. Keystrokes and
+    output travel over short HTTP requests (long-polled output), not WebSockets, for the same proxy
+    reason as the task page. Two sessions per user, 15-minute idle timeout, open/close logged.
+    `CONTRACTS.md` §8.4.
 - Rules: a running run blocks every action except Destroy; a failed (incomplete) provision must be
   retried, skipped or destroyed first; any new action supersedes a failed day-2 run. Modify, Reboot,
   OS updates and Re-apply need a running VM; the backend refuses them (and a redundant start/stop) when
