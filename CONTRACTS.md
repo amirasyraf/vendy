@@ -101,7 +101,7 @@ All inputs are strings and required unless noted.
 
 | Input | Example | Notes |
 |---|---|---|
-| `stage` | `provision` | `register` \| `provision` \| `baseline` \| `software` \| `ad-join` \| `access` \| `configure` \| `destroy` \| `finalize` |
+| `stage` | `provision` | `register` \| `provision` \| `baseline` \| `software` \| `ad-join` \| `access` \| `configure` \| `start` \| `stop` \| `reboot` \| `os-update` \| `destroy` \| `finalize` |
 | `name` | `demo-1` | `^[a-z][a-z0-9-]{2,20}$` |
 | `request_id` | Scaffolder task ID | VM incarnation, `^[a-zA-Z0-9_-]{1,100}$`; written once by `register`, checked by every other stage |
 | `run_key` | `42.provision.2` | `<orchestrator run id>.<stage>.<attempt>`; unique per dispatch |
@@ -119,7 +119,9 @@ All inputs are strings and required unless noted.
   see that stage's inventory commits. Inventory commits keep the `pull --rebase` retry loop.
 - `params_json` per stage:
   - `register`: `{"spec": <Resource spec, §7>}`;
-  - `configure`: exactly one of `{"software": ["git", ...]}` (union into the recorded list) or `{"adJoin": true}`;
+  - `configure`: `{"compute": {platform, os, size | instanceType}, "configuration": {"software": [...], "adJoin": bool}}`
+    (Modify: the complete new desired compute and configuration; platform and OS must not change);
+  - `software`: `{}` or `{"remove": ["nginx", ...]}` (catalog packages deselected by Modify, at most 20);
   - `destroy`: `{"demoGeneration": "<uuid>"}` for automatic demo cleanup, `{}` for a user destroy;
   - `finalize`: `{"outcome": "ready"}` or `{"outcome": "failed"}`;
   - every other stage: `{}`.
@@ -139,9 +141,13 @@ first checks that `vms/<name>/catalog-info.yaml` exists with `cf/request-id == r
 | Stage | Behaviour |
 |---|---|
 | `register` | Validate `params_json.spec` with `scripts/spec.py`; team guard on the desired owner. Inventory with the same `cf/request-id` → success, no change. Inventory with a different request ID → permanent failure. Otherwise create the entity (§7) with `cf/status: provisioning`. |
-| `provision` | `cf/status: provisioning`; `terraform apply`; record outputs; `cf/status: frying`. Never a second instance for the same incarnation: the AMI is ignored after creation, an untracked instance tagged `cf:vm=<name>` and `cf:request-id=<request_id>` is adopted into state, and a stale state lock cannot block retries indefinitely. |
-| `baseline`, `software`, `ad-join`, `access` | `cf/status: frying`; read host and SSH user from inventory; run the stage playbook (§6.3) with variables derived from the persisted spec. |
-| `configure` | Persist the desired configuration change from `params_json` (software union, or `adJoin: true`) through `spec.py`. No VM contact. |
+| `provision` | `cf/status: provisioning`; `terraform apply`; record outputs; `cf/status: frying`. In a Modify run it applies a size change in place (EC2 stops and starts the instance; the public IP changes). Never a second instance for the same incarnation: the AMI is ignored after creation, an untracked instance tagged `cf:vm=<name>` and `cf:request-id=<request_id>` is adopted into state, and a stale state lock cannot block retries indefinitely. |
+| `baseline`, `software`, `ad-join`, `access` | `cf/status: frying`; read host and SSH user from inventory (an empty `cf/public-ip`, i.e. a stopped VM, fails validation); run the stage playbook (§6.3) with variables derived from the persisted spec. |
+| `configure` | Replace `spec.compute` and `spec.configuration` with `params_json` (platform/OS unchanged) through `spec.py`; other spec sections and provenance are kept. No VM contact. |
+| `software` (removal) | Besides installing `cf_software`, removes `params_json.remove` minus anything still desired (`apt` `state: absent`; data and configuration files are kept). |
+| `ad-join` (leave) | With `adJoin: false` in the persisted spec (Modify turned it off) the mock join record and banner line are removed. |
+| `start`, `stop`, `reboot` | Instance from `cf/instance-id`; it must carry `cf:vm=<name>`, `cf:request-id=<request_id>`, `cf:poc=true`. `stop`: stop and wait, then `cf/public-ip: ""`. `start`: start and wait, record the new `cf/public-ip`, wait for SSH. `reboot`: requires `running`; EC2 reboot, then wait until the guest's boot ID changes (10 min). Already in the target state → success. `cf/status` is not changed. |
+| `os-update` | Requires a public IP. Runs `ansible/maintain/os-update.yml` (full `apt` upgrade; reboot only if `/var/run/reboot-required`). `cf/status` is not changed. |
 | `destroy` | Inventory missing → success (already destroyed). With `demoGeneration`: the existing fail-closed cleanup check (`GET $BACKSTAGE_URL/api/vms/cleanup-check/<name>?generation=…&request_id=…`); ineligible → success without changes. Otherwise identity check, `cf/status: destroying`, `terraform destroy`, delete the state object, delete the inventory directory. A retry after partial completion converges. |
 | `finalize` | Inventory missing or a different request ID → success without changes. `ready` → `cf/status: ready`, `cf/ready-at` (first time only). `failed` → `cf/status: failed`, `cf/failed-at` (first time only). |
 
@@ -166,9 +172,12 @@ Run from the platform repo root. `vars.json` keys (all always present):
 | `cf_platform` | string | `aws` |
 | `cf_os` | string | `ubuntu` |
 | `cf_software` | list | `["git","nginx"]` |
+| `cf_software_remove` | list | `["docker"]` (empty except in a Modify `software` stage) |
+| `cf_ad_join` | bool | `true` (desired mock AD membership) |
 | `cf_ad_domain` | string | `corp.example.local` |
 
-Stage playbooks: `ansible/fry/baseline.yml`, `software.yml`, `ad-join.yml`, `access.yml`.
+Stage playbooks: `ansible/fry/baseline.yml`, `software.yml`, `ad-join.yml`, `access.yml`; the
+maintenance playbook `ansible/maintain/os-update.yml` (stage `os-update`) takes the same variables.
 Install with `pip install -r requirements-ansible.txt`.
 
 ## 7. VM inventory (platform repo `vms/<name>/`)
@@ -183,7 +192,7 @@ metadata:
   description: ubuntu VM on aws (S) for team alpha
   annotations:
     cf/status: provisioning        # provisioning | frying | ready | failed | destroying
-    cf/public-ip: ""               # filled after provision
+    cf/public-ip: ""               # filled after provision and start; "" while stopped
     cf/ssh-user: ubuntu
     cf/instance-id: ""
     cf/instance-type: ""   # launched EC2 type, set with cf/instance-id after apply
@@ -191,7 +200,7 @@ metadata:
     cf/requested-at: "2026-11-15T12:00:00Z"
     cf/request-id: "scaffolder-task-id" # VM incarnation; equals the stage.yml request_id input
     cf/ready-at: "2026-11-15T12:03:00Z" # first readiness only; absent until ready
-    # cf/failed-at is set on first recorded failure; neither timestamp is reset by refry
+    # cf/failed-at is set on first recorded failure; neither timestamp is reset by later runs
     cf/run-id: "1234567890"        # last stage.yml run that wrote this file
     cf/run-url: https://github.com/amirasyraf/compute-factory-platform/actions/runs/1234567890
 spec:
@@ -234,10 +243,11 @@ spec:
 - Terraform loads persisted spec and maps it to temporary `.tfvars.json` (`name`, `os`, `size`,
   `team`, original `requested_by`, `cloud_tags` including billing). It deletes that file on exit.
   Each stage derives Ansible variables and applicability from the committed entity.
-- Refry persists desired configuration before applying: software refry adds the selected packages
-  to the software list (union; an empty selection keeps it); AD refry enables `adJoin`. Other spec
-  sections and original request provenance are preserved. Software installation remains additive:
-  nothing is uninstalled, so the recorded list only grows.
+- Modify persists the new desired compute and configuration (`configure`) before applying it: the
+  software list is replaced (unchecked catalog software is uninstalled), `adJoin` can be turned on or
+  off, and size/instance type can change. Platform, OS, owner, billing, tags and original request
+  provenance are preserved. Power state is not desired state: it is observed (§8.3), never stored in
+  spec.
 - Status updates never rewrite spec. Direct Git edits do not trigger reconciliation or a Terraform
   update. New enterprise sections require explicit validation/consumer changes. Legacy inventory is
   not migrated; this change rolls out against an empty inventory after VM teardown.
@@ -266,7 +276,7 @@ spec:
   - templates: `https://github.com/amirasyraf/compute-factory-platform/blob/main/catalog/templates/*/template.yaml`;
   - org and the ssh-cert template come from the idp repo itself.
 - `catalog.orphanStrategy: delete`. Catalog processing interval should be short (POC).
-- Template names (`metadata.name`): `vm-request`, `vm-destroy`, `vm-refry` (platform repo) and
+- Template names (`metadata.name`): `vm-request`, `vm-modify` (platform repo) and
   `ssh-cert` (idp repo). VM templates only **create an orchestrator run** and then finish. The whole
   pipeline, including non-VM steps such as the mock ServiceNow request, is an orchestrator run (§8.2):
   live progress, retry and skip are on the IDP run page (`/vms/runs/<id>`) and the VM entity page. When
@@ -277,12 +287,14 @@ spec:
     `request_id` is the task ID, so a Scaffolder retry or recovery returns the same run.
     Template output links: `Follow provisioning` → `${{ steps.dispatch.output.runUrl }}`, and
     `Open VM in catalog` → `resource:default/<name>`.
-  - `vm-refry` step `run`, action `cf:vm:run`, inputs `{operation: refry, vm: <entity ref>, stage,
-    software}`; `vm-destroy` step `run`, action `cf:vm:run`, inputs `{operation: destroy, vm}`. Outputs
-    `{runId, runUrl}`; link `Follow run` → `runUrl`. The action reads the VM entity with the initiating
-    user's credentials (so the catalog permission policy authorizes it) and derives identity and teams
-    server-side. The parameter forms are unchanged (`EntityPicker` with `catalogFilter: { kind: Resource,
-    spec.type: vm }`; refry `stage` enum `[baseline, software, ad-join, access]`; `software` checkboxes).
+  - `vm-modify` step `run`, action `cf:vm:run`, inputs `{operation: modify, vm: <entity ref>, compute,
+    software, adJoin}`. Outputs `{runId, runUrl}`; link `Follow run` → `runUrl`. The VM page opens it
+    with `?formData=` holding the VM ref and its current `compute` and `configuration`; the VM field is
+    read-only (`EntityPicker`, `catalogFilter: { kind: Resource, spec.type: vm }`), `compute` uses
+    `ui:field: VmComputePicker`, software is the catalog checkboxes, AD join a boolean.
+  - `cf:vm:run` input `operation` is one of `modify | reapply | start | stop | reboot | update | destroy`.
+    It calls `POST /api/vms/runs` (§8.2) with the task ID as request key. Start, stop, reboot, OS updates,
+    re-apply and destroy are started from the VM page directly (same endpoint), not from templates.
   - The team picker is the stock `MyGroupsPicker` (Groups with `relations.hasMember` = the current user). It
     returns an entity ref, which the backend normalises to the bare name.
   - `github:actions:dispatch` and `cf:watch-workflow` are no longer used; the `CF_WORKFLOW_PROGRESS_V1`
@@ -300,7 +312,7 @@ spec:
   service credentials and returns `{number: "RITM" + ten digits, status: "created", mock: true,
   requestId}`. Numbers are deterministic per request ID; there is no persistent ticket store, real
   ServiceNow integration, approval or outcome update. The number appears in the stage `summary`, not in
-  GHA inputs or VM inventory. Refry/destroy do not call it.
+  GHA inputs or VM inventory. Day-2 runs do not call it.
 
 ### 8.1 Demo mode control
 
@@ -318,7 +330,7 @@ spec:
 - Enabled: 3 VMs per original requesting account (including admins), reject a fourth portal request;
   when enabling, destroy oldest excess requests and retain newest 3. Ready VMs expire at
   `max(first_ready_at, enabled_at) + 5 min`; terminal failures use first failure time (`cf/failed-at`,
-  written only after orchestration gives up) if never ready. Refry does not extend lifetime. Disable
+  written only after orchestration gives up) if never ready. Day-2 runs (including stop) do not extend lifetime. Disable
   invalidates queued cleanup generations; re-enable starts fresh timers. Already-started destruction
   cannot be undone. Actions queues/Terraform add latency.
 - Automatic cleanup creates an orchestrator `destroy` run (requested by `demo-mode`, `params_json`
@@ -339,23 +351,29 @@ The orchestrator owns stage order, retries, skips and run state in the plugin da
 Actions executes stages (§6). Stage lists are code, not configuration.
 
 **Runs and stages.** One active run (`running` or `failed`) per VM name. Creating a `destroy` run
-cancels any other active run for that VM; a new `refry` run cancels a failed refry run. Any other
-creation while a run is active is rejected (409): a running run, or a failed (incomplete) provision,
-must be retried, skipped or destroyed first.
+cancels any other active run for that VM; any other new run cancels a failed day-2 run (every kind
+except `provision`). Any other creation while a run is active is rejected (409): a running run, or a
+failed (incomplete) provision, must be retried, skipped or destroyed first.
 
 | Run kind | Stages, in order |
 |---|---|
 | `provision` | `servicenow`, `register`, `provision`, `baseline`, `software`, `ad-join`, `access`, `finalize` |
-| `refry` | `configure`, `<stage>`, `finalize` (`configure` applies only to software and ad-join) |
+| `modify` | `configure`, `provision` (if size changed), `software` (if the list changed), `ad-join` (if AD join changed), `finalize` |
+| `reapply` | `baseline`, `software` (if any), `ad-join` (if enabled), `access`, `finalize` |
+| `power` | one of `start`, `stop`, `reboot` (no `finalize`) |
+| `update` | `os-update` (no `finalize`) |
 | `destroy` | `destroy`, `finalize` (`finalize` runs only on the failure path) |
+
+- Runs without `finalize` (power, OS updates) never write `cf/status`; when their stage fails for good
+  the run is `failed` directly.
 
 - Stages run in one of two places. `servicenow` runs inside the IDP (an in-process handler); every
   other stage is a `stage.yml` dispatch (§6). In-process stages have no GitHub run (`runUrl: null`,
   empty `steps`); an HTTP 5xx, 429, timeout or network error is transient, any other unexpected
   response is permanent. An in-process attempt interrupted by a restart is simply run again (handlers
   are idempotent per request ID).
-- Not-applicable stages (no software selected, no AD join, refry `configure` for baseline/access,
-  destroy `finalize` on success) are `skipped` with `skippedBy: null`.
+- Not-applicable stages (no software selected, no AD join, Modify stages for unchanged parts, destroy
+  `finalize` on success) are `skipped` with `skippedBy: null`.
 - Stage statuses: `pending | running | retrying | success | failed | skipped | cancelled`.
   Run statuses: `running | failed | succeeded | cancelled`.
 - Automatic retry: at most 4 attempts per stage (1 + 3 retries), waiting 30 s, 2 min and 8 min before
@@ -365,13 +383,14 @@ must be retried, skipped or destroyed first.
 - When a stage fails for good, the orchestrator runs `finalize` with `outcome: failed` (same retry
   policy) and then sets the run to `failed`. If `finalize` itself fails, the run is `failed` without a
   further failure record. Success of every stage ends with `finalize` `outcome: ready` (provision,
-  refry) and run `succeeded`.
+  modify, reapply) and run `succeeded`.
 - Manual actions, allowed only while the run is `failed`, for `platform-admins` and members of the run's
   team:
   - **retry** resets the failed stage to a fresh attempt budget (and `finalize` to pending), then
     continues the run from that stage;
   - **skip** marks the failed stage `skipped` (`skippedBy` = user) and continues with the next stage.
-    Only `software` and `ad-join` are skippable. The desired spec is not changed by a skip.
+    Only `software` and `ad-join` of provision and reapply runs are skippable (a Modify has already
+    persisted its change, so skipping would hide it). The desired spec is not changed by a skip.
 - Dispatch recovery: the attempt is persisted (with its `run_key`) before dispatch. A lost dispatch
   response is resolved by finding the `stage.yml` run whose title ends in `[<run_key>]` among the newest
   100 runs; if none appears within 3 minutes, the attempt counts as a transient failure. Stages are
@@ -385,14 +404,26 @@ one of their groups.
 |---|---|
 | `GET /runs/:id` | `RunView` |
 | `GET /runs?name=<vm>&limit=<1-20>` | `{ runs: RunView[] }`, newest first (default limit 10) |
-| `GET /summary` | `{ vms: [{ name, latest: RunView }] }`: the newest run per VM name visible to the caller |
+| `GET /summary` | `{ observedAt, observedError, vms: [{ name, latest: RunView, observed: ObservedVm \| null }] }`: the newest run per VM name visible to the caller, with the health check of that VM incarnation (§8.3) |
+| `POST /runs` | `{operation, vm, requestKey, compute?, software?, adJoin?}` → `{runId, runUrl}`. 400 invalid or (Modify) nothing to change, 403 other team or demo-disallowed instance type, 404 unknown VM, 409 conflict, 503 automation off |
+| `GET /observed/:name` | `{ enabled, checkedAt, error, vm: ObservedVm \| null }` (§8.3) |
 | `POST /runs/:id/retry` | `RunView`; 409 when not retryable, 403 when not allowed |
 | `POST /runs/:id/skip` | `RunView`; 409 when the failed stage is not skippable or the run is not failed |
+
+`POST /runs`: `operation` maps to a run kind (`start`/`stop`/`reboot` → `power`, `update` → `update`,
+otherwise the same name). The VM entity is read with the caller's credentials; its `cf/request-id` is
+the run's request ID and its owner group the run's team. `requestKey` (`^[a-zA-Z0-9_-]{1,100}$`; a
+Scaffolder task ID or a browser UUID) makes a repeated submit return the first run. Modify sends the
+complete new `compute` (`{platform, os, size | instanceType}`, platform/OS unchanged), `software`
+(catalog keys) and `adJoin`; the backend diffs them against the entity spec to plan the run, and
+computes the packages to remove. While the health check is fresh (under 2 minutes), it refuses (409)
+what cannot work: any operation but destroy when no instance of this incarnation exists, `start` on a
+running VM, `stop` on a stopped one, and everything else unless the VM is running.
 
 ```ts
 type RunView = {
   id: number;
-  kind: 'provision' | 'refry' | 'destroy';
+  kind: 'provision' | 'modify' | 'reapply' | 'power' | 'update' | 'destroy';
   name: string;
   team: string;                 // bare group name
   requestId: string;            // VM incarnation
@@ -433,6 +464,36 @@ type StageView = {
 
 - `runUrl` from `cf:vm:dispatch`/`cf:vm:run` is `<app.baseUrl>/vms/runs/<id>`. The frontend polls
   `GET /runs/:id` (or `/summary`) about every 5 s while a run is `running`.
+
+### 8.3 VM health check (`vms` backend plugin)
+
+Power state is observed, not desired: it is never stored in spec or inventory annotations (only
+`cf/public-ip` follows start/stop). Where `computeFactory.demoAutomation` is on, the plugin scans EC2
+every 30 seconds and right after any non-provision run finishes: `ec2:DescribeInstances` (filter
+`tag:cf:poc=true`, states pending/running/stopping/stopped/shutting-down) and `ec2:DescribeInstanceStatus`
+for running instances. The IDP host role (`infra/idp.tf`, policy `observe-vms`) allows only these two
+read-only calls. The result is kept in memory, keyed by the `cf:vm` tag (the live instance wins over
+one still shutting down).
+
+```ts
+type ObservedVm = {
+  instanceId: string;
+  state: string;               // pending | running | stopping | stopped | shutting-down
+  health: 'ok' | 'impaired' | 'initializing' | 'unknown' | null; // EC2 status checks; null unless running
+  instanceType: string | null;
+  publicIp: string | null;
+  requestId: string | null;    // cf:request-id tag; consumers ignore another incarnation
+  team: string | null;         // cf:team tag; /observed/:name shows the VM only to that team and admins
+  launchedAt: string | null;
+};
+```
+
+- `checkedAt: null` means no scan has completed yet; `error` is the last scan's failure (the previous
+  result is kept). `enabled: false` (local development) means no health check runs.
+- A VM whose catalog status is `ready` but whose incarnation has no instance is shown as "Not found in
+  AWS"; a stopped one as "Stopped". A console stop or start is picked up within 30 seconds; the
+  inventory `cf/public-ip` is then stale until the next start/stop run, so the UI prefers the observed
+  address.
 ## 9. IDP runtime (orchestrator infra ↔ Agent C deploy)
 
 - EC2: Ubuntu 26.04 **arm64** (t4g.medium). Cloud-init installs Docker Engine + compose plugin, puts
@@ -478,10 +539,13 @@ type StageView = {
   read it; the IDP `vm-sizes` backend reads the same file from `main` via the GitHub API for the request
   form's size cards (`ui:field: VmComputePicker` on `compute`) and adds live specs from
   `ec2:DescribeInstanceTypes`. Its Advanced picker lists every x86_64, EBS-backed type offered in the
-  region (`ec2:DescribeInstanceTypeOfferings`; IDP host role, read-only). Terraform rejects types that
+  region (`ec2:DescribeInstanceTypeOfferings`; IDP host role, read-only). Modify uses the same field. Terraform rejects types that
   cannot boot x86_64 and launches into a default subnet whose AZ offers the type.
 - Demo mode: while on, the IDP accepts `compute.instanceType` only from `t3.micro`, `t3.small`,
-  `t3.medium`, `t3.large` (`/api/vms/demo/state` returns them as `instanceTypes`); sizes are allowed.
+  `t3.medium`, `t3.large` (`/api/vms/demo/state` returns them as `instanceTypes`), for requests and
+  Modify; sizes are allowed.
+- A changed `size`/`instance_type` is an in-place update (stop, modify, start); the provision plan still
+  refuses any delete or replacement.
 - Resources are tagged `cf:poc=true`, `cf:vm=<name>`, `cf:team=<team>`, and `cf:request-id=<request_id>`
   when set. No key pair (the CA is used). The instance ignores AMI changes after creation, so a retry after
   a newer bake never replaces it.

@@ -74,6 +74,21 @@ resource "aws_iam_role_policy" "idp_describe_instance_types" {
   })
 }
 
+# VM health check: the IDP polls power state, status checks and public IP of VMs tagged
+# cf:poc=true. Read-only; describe actions do not support resource-level scoping.
+resource "aws_iam_role_policy" "idp_observe_vms" {
+  name = "observe-vms"
+  role = aws_iam_role.idp.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus"]
+      Resource = "*"
+    }]
+  })
+}
+
 resource "aws_iam_role_policy_attachment" "idp_ssm" {
   role       = aws_iam_role.idp.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"

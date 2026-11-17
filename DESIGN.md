@@ -102,9 +102,10 @@ spec:
 The request template serializes desired spec as JSON, keeping requester identity and team claims
 separate. The `register` stage validates/normalizes it and commits the entity before provisioning.
 Terraform reads persisted spec into a temporary `.tfvars.json`; Ansible parameters and optional stage
-decisions derive from that entity too. Refry persists software/AD configuration changes before
-applying them. Observed-status writes never alter desired spec. Software refry remains additive,
-not an uninstall/reconciliation engine. Editing Git alone does not trigger an apply.
+decisions derive from that entity too. Modify persists the new size, software list and AD join
+before applying only what changed; unchecked software is uninstalled. Observed-status writes never
+alter desired spec, and power state (running/stopped) is observed by the IDP health check, never
+stored as desired state. Editing Git alone does not trigger an apply.
 
 The request form has one **Tags** table: `cost_center` and `project_code` (fixed keys, required
 values, stored as `spec.billing`) plus optional extra tags (`spec.cloudTags`). They are self-reported
@@ -188,8 +189,7 @@ ansible/
 catalog/
   templates/
     vm-request/template.yaml   # Backstage Software Template: new VM
-    vm-destroy/template.yaml   # Backstage Software Template: destroy VM
-    vm-refry/template.yaml     # re-run one fry stage
+    vm-modify/template.yaml    # change size, software or AD join (opened prefilled from the VM page)
     # ("Get SSH certificate" template lives in the idp repo; it doesn't touch this repo)
 vms/                           # inventory (written by stage runs only)
 .github/workflows/
@@ -201,9 +201,12 @@ vms/                           # inventory (written by stage runs only)
 | Stage | When | What it does |
 |---|---|---|
 | `baseline` | always | Hostname set to the VM name, `/etc/hosts`, login banner (VM, team, requester, platform), `/etc/compute-factory/vm-info.json` |
-| `software` | if any software picked | Installs the picks using `software-catalog.yml` |
-| `ad-join` | if picked (mock) | Writes `/etc/compute-factory/ad-join.json` (domain `corp.example.local`, OU, timestamp), adds a banner line, logs "joined CORP.EXAMPLE.LOCAL". No real AD. |
+| `software` | if any software picked | Installs the picks using `software-catalog.yml`; in a Modify run also removes unchecked catalog packages |
+| `ad-join` | if picked (mock) | Writes `/etc/compute-factory/ad-join.json` (domain `corp.example.local`, OU, timestamp), adds a banner line, logs "joined CORP.EXAMPLE.LOCAL". No real AD. When Modify turns AD join off, removes them again. |
 | `access` | always, last | Adds `team-<owning team>` to `/etc/ssh/auth_principals/ubuntu`, then `sshd -t` and reload |
+
+`ansible/maintain/os-update.yml` (stage `os-update`, the "Apply OS updates" action) is maintenance,
+not a fry stage: a full `apt` upgrade, then a reboot only if `/var/run/reboot-required` exists.
 
 **Software catalog** (`ansible/software-catalog.yml`). The POC set:
 
@@ -220,7 +223,8 @@ docker: { linux: docker.io, windows: null }
   file, in the same repo.
 - The `register` stage's validation rejects any name not in the catalog for the chosen OS, so the form
   can't be bypassed.
-- To add software to an existing VM, use "Refry" → `software` with a new selection.
+- To add or remove software on an existing VM, use **Modify** on the VM page and check or uncheck it.
+  Removal uses `apt` `state: absent`, so package data and configuration files stay.
 
 **Ansible conventions** (bake and fry):
 - Every role's `tasks/main.yml` includes `tasks/linux.yml` or `tasks/windows.yml` based on `ansible_os_family`.
@@ -314,8 +318,8 @@ Enforced in three places:
 2. **Templates**:
    - The team field only offers the user's own teams: the stock `MyGroupsPicker` field, which lists Groups
      with `relations.hasMember` = the current user.
-   - Refry and destroy (`cf:vm:run`) read the VM entity with the initiating user's credentials, so a VM
-     the user can't read fails before any run is created. Run pages, retry and skip are limited to the
+   - Day-2 runs (`POST /api/vms/runs`, from the VM page or `cf:vm:run`) read the VM entity with the
+     initiating user's credentials, so a VM the user can't read fails before any run is created. Run pages, retry and skip are limited to the
      run's team and admins by the `vms` plugin.
 3. **Stage guard** (defense in depth, because Backstage dispatches with a shared token):
    - The orchestrator passes `requester_teams`, derived server-side from the user's ownership claims, so
@@ -369,10 +373,13 @@ dispatches workflows and reads catalog files. Users therefore **don't need any a
 
 ### 5.3 Status and stages: run page and `vm-status` card
 
-- The VM entity page shows the VM's latest orchestrator run (stages, attempts, errors, Retry/Skip),
-  plus IP, SSH user, a ready-to-paste SSH command, desired configuration from structured spec, and
-  links to certificate, refry and destroy. Home and the Resources list show each VM's latest run as a
-  pipeline line from one `/api/vms/summary` call, falling back to `cf/status`.
+- The VM entity page header shows the VM's live state (latest run while active or failed, else the
+  health check: Running, Stopped, Not found in AWS) and the day-2 actions (5.4). The body has
+  **Connect** (copyable SSH command, Get SSH certificate), **Activity** (the active or failed run with
+  its stage line and Retry/Skip, then the last 10 runs), **Configuration** (size, software, AD join,
+  tags; Modify) and **Details** (health check, instance, IP, provenance, inventory source).
+  Home and the Resources list show each VM's latest run as a pipeline line and its state from one
+  `/api/vms/summary` call, falling back to `cf/status`.
 - Run state comes from the `vms` plugin API, which applies the same team rule as the catalog (5.1a):
   members of the run's team and admins only. No GitHub token reaches the browser; the plugin polls
   GitHub server-side and stores job steps per attempt.
@@ -396,19 +403,30 @@ to one VM's run, and would expose runs through a shared token regardless of team
 ### 5.4 Manage / destroy
 
 - The Create page lists only `vm-request` (`sub-page:scaffolder/templates` `templateFilter` in the IDP
-  `app-config.yaml`). Destroy, refry and SSH certificate are reached from the VM page and Home; their
-  direct template URLs still work, and the listing filter is not an authorization boundary.
-- The VM entity page has links to the `vm-destroy` and `vm-refry` templates, prefilled with the
-  entity (scaffolder `?formData=` query param). Both use an EntityPicker (kind Resource, type vm; it
-  only lists the user's teams' VMs) and `cf:vm:run`, which creates a destroy or refry run.
-- Team guard: see 5.1a.
-- Day-2 actions in the POC:
-  - Destroy (required). It supersedes any other active run of the VM.
+  `app-config.yaml`). Modify and SSH certificate are reached from the VM page (and Home for the
+  certificate); their direct template URLs still work, and the listing filter is not an authorization
+  boundary.
+- Day-2 actions, all on the VM page header. Each creates an orchestrator run (`POST /api/vms/runs`):
+  - **Start / Stop / Reboot** (confirm dialog). Stop releases the public IP; start gets a new one,
+    which the stage records in inventory. Reboot keeps the IP.
+  - **Modify** opens the `vm-modify` form prefilled with the VM's current size, software and AD join.
+    Only what changed is applied: a size change re-runs `provision` (Terraform updates the instance
+    type in place: stop, change, start; new IP), software changes install checked and uninstall
+    unchecked packages, AD join can be turned on or off.
+  - **Apply OS updates** and **Re-apply configuration** (repair drift: baseline, software, AD join and
+    access again) in the ⋯ menu, with a confirm dialog.
+  - **Destroy** in the ⋯ menu; the dialog asks for the VM name. It supersedes any other active run.
+  - **Retry / Skip** on a failed run, from the run page or the VM page (6.2).
   - Access: there's no per-VM action. Any member of the owning team connects with their personal SSH
     certificate (see 7).
-  - **Refry**: pick a VM and a fry stage (software refry adds packages first). A new refry supersedes a
-    failed refry; a running run or a failed provision must be retried, skipped or destroyed first.
-  - **Retry / Skip** on a failed run, from the run page or the VM page (6.2).
+- Rules: a running run blocks every action except Destroy; a failed (incomplete) provision must be
+  retried, skipped or destroyed first; any new action supersedes a failed day-2 run. Modify, Reboot,
+  OS updates and Re-apply need a running VM; the backend refuses them (and a redundant start/stop) when
+  the health check says otherwise.
+- **Health check**: the IDP polls EC2 every 30 seconds (`DescribeInstances`/`DescribeInstanceStatus`,
+  read-only, tag `cf:poc=true`), so a VM stopped or terminated outside the IDP shows as Stopped or
+  Not found in AWS. `CONTRACTS.md` §8.3.
+- Team guard: see 5.1a.
 
 ## 6. Pipelines
 
@@ -423,7 +441,10 @@ run and its stages in its database. Stage lists are code:
 | Run | Stages (in order) |
 |---|---|
 | provision | `servicenow` (mock ServiceNow request, runs in the IDP) → `register` (validate + commit inventory) → `provision` (Terraform) → `baseline` → `software` (if picked) → `ad-join` (if picked, mock) → `access` → `finalize` (`cf/status: ready`) |
-| refry | `configure` (persist the software/AD change; software and AD refry only) → the chosen fry stage → `finalize` |
+| modify | `configure` (persist the new desired compute and configuration) → `provision` (if size changed) → `software` (if changed) → `ad-join` (if changed) → `finalize` |
+| reapply | `baseline` → `software` (if any) → `ad-join` (if enabled) → `access` → `finalize` |
+| power | `start`, `stop` or `reboot` (one stage; no `finalize`, `cf/status` unchanged) |
+| update | `os-update` (no `finalize`, `cf/status` unchanged) |
 | destroy | `destroy` (guards, `cf/status: destroying`, `terraform destroy`, delete state and inventory) → `finalize` (failure path only) |
 
 Each stage runs either inside the IDP (non-VM business steps such as the mock ServiceNow request;
@@ -454,8 +475,9 @@ inventory (host, spec, provenance), so stages share no runner state and any one 
 A stage can be dispatched again after any partial completion. `register` is a no-op for the same
 request ID and refuses a different one. `provision` ignores AMI changes after creation, adopts an
 instance tagged with the VM's `cf:request-id` that is missing from state instead of creating another,
-and clears stale state locks. Fry stages are Ansible (`state: present`, templated files), so a re-run
-converges; nothing is uninstalled. `destroy` and `finalize` succeed without changes when the inventory
+and clears stale state locks. Fry stages are Ansible (`state: present`/`absent`, templated files), so
+a re-run converges. Power stages succeed without changes when the instance is already in the target
+state. `destroy` and `finalize` succeed without changes when the inventory
 is already gone. All stages are serialized per VM by the workflow concurrency group `vm-<name>`.
 
 ### 6.4 How a stage reaches the VM (fry stages)
@@ -567,7 +589,8 @@ cost cents. After `./poc down` the cost is $0: no AWS resources remain.
 
 Resolved:
 - Ubuntu: latest LTS, 26.04.
-- Day-2 actions: destroy, re-run fry stage; SSH access via personal certs.
+- Day-2 actions: start/stop/reboot, Modify (size, software install/uninstall, AD join), OS updates,
+  re-apply configuration, destroy; SSH access via personal certs.
 - Team-owned VMs only; no personal VMs.
 - VMs never expire; they're removed only through destroy.
 - SSH: per-user, team-scoped certs from Backstage (instant, 12h). No per-VM access step.
@@ -616,7 +639,7 @@ compute-factory/                 # 4th repo: the "home" of the POC
     state-bucket.tf              #   S3 bucket for VM Terraform state, force_destroy = true
     ssh-ca.tf                    #   tls_private_key (ed25519) -> Secrets Manager secret (recovery_window_in_days = 0)
                                  #   + SSM parameter /compute-factory/ssh-ca-pub
-    idp.tf                       #   IDP EC2 (t4g.medium), EIP, SG, instance role (read the CA secret only)
+    idp.tf                       #   IDP EC2 (t4g.medium), EIP, SG, instance role (read the CA secret; read-only EC2 describe for sizes and the VM health check)
     tokens.tf                    #   random_password: backend secret, PG password, BACKSTAGE_TOKEN
     outputs.tf
   ../compute-factory-idp, ../compute-factory-builder, ../compute-factory-platform   # sibling clones
