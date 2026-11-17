@@ -50,12 +50,14 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
      v                                                v
  idp.amirasyraf.dev  (EC2: Caddy -> Backstage -> Postgres)        VM (EC2, golden AMI)
      |  1. Software Template form -> mock ServiceNow REST (HTTP 201)  ^
-     |  2. cf:vm:dispatch (quota)   ------------------------------+  |  terraform / ansible over SSH
-     |  5. reads catalog (vms/*/catalog-info.yaml)                 |  |  (pipeline uses its own short cert)
-     v                                                             v  |
+     |  2. cf:vm:dispatch (quota) -> provision run in the `vms`      ^
+     |     orchestrator, which dispatches one stage at a time ---+  |  terraform / ansible over SSH
+     |     (retries, retry/skip, run state in its DB)            |  |  (pipeline uses its own short cert)
+     |  5. reads catalog (vms/*/catalog-info.yaml)               |  |
+     v                                                           v  |
  GitHub: compute-factory-platform                         GHA runner (OIDC -> AWS)
-   - workflows: provision / fry-stage / destroy              3. terraform apply (S3 state)
-   - vms/<name>/  (inventory, written by workflows)          4. fry stages (ansible), commit status
+   - workflow: stage.yml (one stage per dispatch)            3. terraform apply (S3 state)
+   - vms/<name>/  (inventory, written by stages)             4. fry stages (ansible), commit status
                                                                 to vms/<name>/, ping Backstage refresh
  GitHub: compute-factory-builder
    - push to main -> packer + ansible -> golden AMI (tagged) ---------------^ (Terraform looks it up)
@@ -63,11 +65,12 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
 
 ### Key design choice: Git is the VM inventory
 
-Each VM has a folder `vms/<name>/` in `compute-factory-platform` that the workflows write:
+Each VM has a folder `vms/<name>/` in `compute-factory-platform` that the stage workflow writes:
 
 - `catalog-info.yaml`: the single desired-configuration source, a Backstage `Resource` entity with
   `spec.owner`, `spec.compute`, `spec.configuration`, optional `spec.billing` and `spec.cloudTags`.
-  Annotations contain observed status, per-stage status, IP, SSH user, run ID and request provenance.
+  Annotations contain the coarse observed status, IP, SSH user, last run ID and request provenance.
+  Per-stage status, attempts and retries live in the IDP orchestrator's database (see 6), not in Git.
   There is no separate `request.yaml` and no duplicate desired-input annotations.
 
 That's all. No user keys or certs are stored per VM (see 7).
@@ -81,8 +84,7 @@ metadata:
   name: demo-vm-1
   annotations:
     cf/status: frying            # provisioning | frying | ready | failed | destroying
-    cf/stages: '{"provision":"success","baseline":"success","software":"running","ad-join":"pending","access":"pending"}'
-    cf/processes: '{"validate":"success","register":"success","provision":"success","fry-baseline":"success","fry-software":"running","fry-ad-join":"pending","fry-access":"pending","finalize":"pending","on-failure":"pending"}'
+    cf/request-id: "<scaffolder task id>"   # VM incarnation, checked by every stage
     cf/public-ip: 3.25.x.x
     cf/ssh-user: ubuntu
     cf/requested-by: user:default/alice
@@ -97,9 +99,9 @@ spec:
   cloudTags: {environment: test}
 ```
 
-The request template serializes desired spec as `spec_json`, keeping requester identity and team
-claims separate. The workflow validates/normalizes it and commits the entity before provisioning.
-Terraform reads persisted spec into a temporary `.tfvars.json`; Ansible parameters and optional job
+The request template serializes desired spec as JSON, keeping requester identity and team claims
+separate. The `register` stage validates/normalizes it and commits the entity before provisioning.
+Terraform reads persisted spec into a temporary `.tfvars.json`; Ansible parameters and optional stage
 decisions derive from that entity too. Refry persists software/AD configuration changes before
 applying them. Observed-status writes never alter desired spec. Software refry remains additive,
 not an uninstall/reconciliation engine. Editing Git alone does not trigger an apply.
@@ -116,10 +118,11 @@ Backstage registers one `Location` entity named `cf-vms` with a glob target,
 so new VMs show up automatically. When a VM folder is deleted, `catalog.orphanStrategy: delete`
 removes its entity.
 
-Why: it needs no extra database or custom backend, it works the same way on every platform,
-it gives an audit trail for free, and Backstage already knows how to read it.
-Trade-off: concurrent workflow commits can race, so the commit step uses a `pull --rebase` retry
-loop. That's fine at POC volume.
+Why: it works the same way on every platform, it gives an audit trail for free, and Backstage
+already knows how to read it. Only fast-changing orchestration state (stages, attempts, retries) is
+kept out of Git, in the IDP orchestrator's database.
+Trade-off: concurrent stage commits for different VMs can race, so the commit step uses a
+`pull --rebase` retry loop. That's fine at POC volume.
 
 ## 4. Repositories
 
@@ -188,12 +191,9 @@ catalog/
     vm-destroy/template.yaml   # Backstage Software Template: destroy VM
     vm-refry/template.yaml     # re-run one fry stage
     # ("Get SSH certificate" template lives in the idp repo; it doesn't touch this repo)
-vms/                           # inventory (written by workflows only)
+vms/                           # inventory (written by stage runs only)
 .github/workflows/
-  provision.yml                # workflow_dispatch: the full pipeline
-  _fry-stage.yml               # workflow_call: one isolated fry stage
-  fry.yml                      # workflow_dispatch: re-run a single stage on an existing VM
-  destroy.yml                  # workflow_dispatch: terraform destroy + remove inventory
+  stage.yml                    # workflow_dispatch: run exactly one stage (dispatched by the IDP orchestrator)
 ```
 
 **Fry stages (Ansible)**
@@ -218,8 +218,9 @@ docker: { linux: docker.io, windows: null }
   `winget install --id <windows id> --silent --accept-package-agreements --accept-source-agreements`.
 - The request form's checkboxes list the same names, filtered by OS. They're maintained by hand next to this
   file, in the same repo.
-- The `validate` job rejects any name not in the catalog for the chosen OS, so the form can't be bypassed.
-- To add software to an existing VM, use "Re-run fry stage" → `software` with a new selection.
+- The `register` stage's validation rejects any name not in the catalog for the chosen OS, so the form
+  can't be bypassed.
+- To add software to an existing VM, use "Refry" → `software` with a new selection.
 
 **Ansible conventions** (bake and fry):
 - Every role's `tasks/main.yml` includes `tasks/linux.yml` or `tasks/windows.yml` based on `ansible_os_family`.
@@ -253,7 +254,8 @@ backstage/                     # npx @backstage/create-app@latest
   app-config.yaml              # base
   app-config.production.yaml   # prod: domain, postgres, password auth, integration, catalog locations
   plugins/vm-status/           # custom frontend plugin: full VM pipeline/status card (see 5.3)
-  plugins/cf-backend/          # backend module: permission policy (5.1a) + `cf:ssh:sign` scaffolder action (7)
+  plugins/cf-backend/          # backend: permission policy (5.1a), `cf:ssh:sign` (7), the `vms` plugin
+                               # (VM orchestrator + demo mode, see 6) and the VM scaffolder actions
   catalog/org.yaml             # User + Group (team) entities = who may log in and their teams
   catalog/locations.yaml       # Location `cf-vms` (glob over the platform repo's vms/*/catalog-info.yaml)
   catalog/templates/ssh-cert/  # "Get SSH certificate" template
@@ -312,13 +314,15 @@ Enforced in three places:
 2. **Templates**:
    - The team field only offers the user's own teams: the stock `MyGroupsPicker` field, which lists Groups
      with `relations.hasMember` = the current user.
-   - The destroy and manage templates look the VM up with `catalog:fetch` as the initiating user, so a VM
-     the user can't read fails before anything is dispatched (to verify during build).
-3. **Workflow guard** (defense in depth, because Backstage dispatches with a shared token):
-   - The template passes `requester_teams: ${{ user.entity.spec.memberOf | join(',') }}`. This is resolved
-     server-side from the user's catalog entity, so the form can't override it.
-   - `provision.yml` refuses unless `team ∈ requester_teams`.
-   - `destroy.yml` and `fry.yml` refuse unless the group from persisted `spec.owner` is in `requester_teams`.
+   - Refry and destroy (`cf:vm:run`) read the VM entity with the initiating user's credentials, so a VM
+     the user can't read fails before any run is created. Run pages, retry and skip are limited to the
+     run's team and admins by the `vms` plugin.
+3. **Stage guard** (defense in depth, because Backstage dispatches with a shared token):
+   - The orchestrator passes `requester_teams`, derived server-side from the user's ownership claims, so
+     the form can't override it.
+   - `register` refuses unless the requested team is in `requester_teams`; every later stage refuses
+     unless the group from persisted `spec.owner` is in `requester_teams` and the inventory's
+     `cf/request-id` matches the run's VM incarnation.
 
 Trust boundary for the POC: anyone with write access to the platform repo, or holding the integration
 token, can bypass this. That's acceptable; they're platform admins.
@@ -344,113 +348,118 @@ Steps:
    tickets or approvals. It sends VM name/team/compute and server-derived requester/task identity;
    failure prevents workflow dispatch. Caddy rewrites the public path to `/api/mock-rest/servicenow`;
    only Scaffolder service credentials are accepted. See `CONTRACTS.md` §8 for the exact interface.
-2. `cf:vm:dispatch` → the authenticated demo-mode backend → `provision.yml` with `name` and
-   JSON-string `spec_json`, plus server-derived `requested_by`, `requester_teams` (see 5.1a) and
-   `request_id` (the Scaffolder task ID). The backend reserves a quota slot before dispatch and
-   returns workflow run details. Demo controls and cleanup semantics are defined in `CONTRACTS.md` §8.1.
-3. `cf:watch-workflow` polls the dispatched GitHub Actions run and streams every job and step into the
-   Scaffolder task, including a versioned structured snapshot on each change. The task detail page
-   renders actual GHA jobs as individual stage cards with status, duration and expandable steps; this
-   is separate from the Backstage template steps (mock REST, dispatch and monitor for VM requests;
-   dispatch and monitor for refry/destroy). The same view covers
-   VM request, fry refry and destroy, even when destroy removes the VM entity. It uses the existing
-   task-owner-authorized event stream and replays on reload, without exposing a GitHub token or adding
-   an arbitrary-run API. The stock logs, controls and output links remain below the stage view.
+2. `cf:vm:dispatch` → the authenticated `vms` backend (`POST /api/vms/requests`), which reserves a
+   demo quota slot and creates a provision run in the orchestrator (6). `request_id` is the Scaffolder
+   task ID, so a task retry or recovery returns the same run. Identity and teams are server-derived
+   (see 5.1a). Demo controls and cleanup semantics are defined in `CONTRACTS.md` §8.1.
+3. The task then finishes. Its output links to the run page (`/vms/runs/<id>`), the live view of the
+   run: every stage with status, attempt, retry countdown, errors, the GitHub run and its steps, and
+   Retry/Skip when a stage has failed for good. It does not depend on the VM's catalog entity, which
+   appears a few seconds after `register` (see 5.3a). Scaffolder task recovery is on, so a backend
+   restart mid-task resumes the task instead of failing it.
    The browser long-polls the task `/events` endpoint instead of SSE `/eventstream`, because
    TLS-inspecting corporate proxies (e.g. Netskope) buffer SSE and leave the page blank; see the IDP
-   README for behavior and how to revert. GitHub is polled about every 10 seconds.
+   README for behavior and how to revert.
    Open tabs check for a newer deployed frontend and show a reload banner. Browser-side failures are
    reported to the backend log (`client-log` plugin), and Caddy keeps a JSON access log; see the IDP
-   README "Logging and troubleshooting" and `./poc logs` / `./poc task`. Old tasks without snapshots retain text logs; monitoring failures
-   or cancellation show the last observed state, not a claim that the GHA run stopped.
-4. Output links: "Open VM in catalog" (`resource:default/<name>`) and the full GitHub Actions run. The VM
-   entity appears within seconds (see 5.3a).
+   README "Logging and troubleshooting" and `./poc logs` / `./poc task`.
+4. Output links: "Follow provisioning" (the run page) and "Open VM in catalog" (`resource:default/<name>`).
 
 Backstage uses a **backend integration token** (a fine-grained PAT you create, scoped to
 `compute-factory-platform`: Actions read/write, Contents read, **Commit statuses read**, which Backstage's
 GitHub URL reader needs to resolve the commit SHA; without it, url Locations fail with 403). It
 dispatches workflows and reads catalog files. Users therefore **don't need any access to the platform repo**.
 
-### 5.3 Status and stages: the `vm-status` card
+### 5.3 Status and stages: run page and `vm-status` card
 
-Each VM entity page shows a custom card that reads **only the VM's catalog entity**:
-- `cf/status`, `cf/stages` and `cf/processes`, rendered as the complete process graph (`validate` → `register`
-  → `provision` → `fry: baseline` → `fry: software` → `fry: AD join` → `fry: team access` → `finalize`,
-  plus `failure handling`), with a description and status for every process;
-- overall progress, current activity, desired configuration from structured spec (including optional
-  informational billing and cloud tags), the last catalog refresh time and the full
-  GitHub Actions run link;
-- IP, SSH user, a ready-to-paste SSH command, and links to certificate, refry and destroy actions.
-
-The card re-fetches the entity every ~10s while the VM isn't `ready` or `failed`.
+- The VM entity page shows the VM's latest orchestrator run (stages, attempts, errors, Retry/Skip),
+  plus IP, SSH user, a ready-to-paste SSH command, desired configuration from structured spec, and
+  links to certificate, refry and destroy. Home and the Resources list show each VM's latest run as a
+  pipeline line from one `/api/vms/summary` call, falling back to `cf/status`.
+- Run state comes from the `vms` plugin API, which applies the same team rule as the catalog (5.1a):
+  members of the run's team and admins only. No GitHub token reaches the browser; the plugin polls
+  GitHub server-side and stores job steps per attempt.
+- Views poll about every 5 seconds while a run is running.
 
 ### 5.3a How status gets into Backstage quickly
 
-1. Each workflow job updates `cf/stages` and `cf/status` in `vms/<name>/catalog-info.yaml` when it
-   starts and when it finishes (commit with a `pull --rebase` retry loop).
-2. Right after committing, the job calls Backstage `POST /api/catalog/refresh`:
+1. Stages update the coarse `cf/status` in `vms/<name>/catalog-info.yaml` (commit with a `pull --rebase`
+   retry loop). Fine-grained progress is in the orchestrator, which polls GitHub every 10 seconds.
+2. Right after committing, the stage calls Backstage `POST /api/catalog/refresh`:
    - for the VM entity (`resource:default/<name>`), or for `location:default/cf-vms` on the first commit,
      so the new VM is discovered;
    - authenticated with a static external-access token restricted to catalog and the read-only
-     demo cleanup check, stored as GHA
-     secret `BACKSTAGE_TOKEN`.
-3. Backstage re-reads the file and the card picks it up on its next poll. Expect a few seconds end to end.
-   The call is best-effort: if it fails, the normal catalog refresh (a few minutes) catches up.
+     demo cleanup check, stored as GHA secret `BACKSTAGE_TOKEN`.
+3. Backstage re-reads the file. Expect a few seconds end to end. The call is best-effort: if it fails,
+   the normal catalog refresh (a few minutes) catches up.
 
-Without step 2, status would only update on Backstage's normal refresh cycle, which is why I estimated
-about a minute before.
-
-Why this way rather than calling the GitHub API live: a live call would go through a shared token that
-bypasses team permissions, so any user could read any team's run. With everything in the catalog, the
-team permission rules (5.1a) cover status too, with no extra backend code.
-Why custom at all: the community GitHub Actions plugin lists every run in a repo and has no way to filter
-to one VM's run. The portal uses the catalog as the team-scoped projection of the workflow: the frontend
-  card renders it, and `cf:watch-workflow` streams operation status into the request, refry and destroy
-  tasks without exposing a shared GitHub token.
+Why custom at all: the community GitHub Actions plugin lists every run in a repo, has no way to filter
+to one VM's run, and would expose runs through a shared token regardless of team.
 
 ### 5.4 Manage / destroy
 
 - The Create page lists only `vm-request` (`sub-page:scaffolder/templates` `templateFilter` in the IDP
   `app-config.yaml`). Destroy, refry and SSH certificate are reached from the VM page and Home; their
   direct template URLs still work, and the listing filter is not an authorization boundary.
-- The VM entity page has links to the `vm-destroy` (and optional `vm-refry`) templates, prefilled with the
-  entity (scaffolder `?formData=` query param).
-- `vm-destroy`: an EntityPicker (kind Resource, type vm; it only lists the user's teams' VMs) dispatches
-  `destroy.yml` with `vm`, `requested_by` and `requester_teams`.
+- The VM entity page has links to the `vm-destroy` and `vm-refry` templates, prefilled with the
+  entity (scaffolder `?formData=` query param). Both use an EntityPicker (kind Resource, type vm; it
+  only lists the user's teams' VMs) and `cf:vm:run`, which creates a destroy or refry run.
 - Team guard: see 5.1a.
 - Day-2 actions in the POC:
-  - Destroy (required).
+  - Destroy (required). It supersedes any other active run of the VM.
   - Access: there's no per-VM action. Any member of the owning team connects with their personal SSH
     certificate (see 7).
-  - **Re-run a fry stage**: pick a VM and a stage, which dispatches `fry.yml` (reuses `_fry-stage.yml`).
-- Every action that dispatches GHA has a following `cf:watch-workflow` step. Its task log is the
-  persisted source for both the graphical stage monitor and text logs, including the current job,
-  current step, progress and final result.
+  - **Refry**: pick a VM and a fry stage (software refry adds packages first). A new refry supersedes a
+    failed refry; a running run or a failed provision must be retried, skipped or destroyed first.
+  - **Retry / Skip** on a failed run, from the run page or the VM page (6.2).
 
 ## 6. Pipelines
 
-### 6.1 `provision.yml` (jobs = processes shown in the IDP)
+Orchestration lives in the IDP; GitHub Actions executes. `CONTRACTS.md` §6 and §8.2 hold the exact
+interfaces.
 
-| Job | What it does | Portal process status |
-|---|---|---|
-| `validate` | Input sanity, name unique (`vms/<name>/` absent), platform/os supported, `team ∈ requester_teams`, software picks exist in the catalog for the OS | `validate` |
-| `register` | Commit `vms/<name>/catalog-info.yaml` with desired spec, `cf/status: provisioning`, `cf/run-id` | `register` |
-| `provision` | OIDC → AWS; `terraform -chdir=terraform/platforms/${platform} apply` with state key `vms/<name>`; outputs IP/user | `provision` |
-| `fry-baseline` | `uses: ./.github/workflows/_fry-stage.yml` with `stage: baseline` | `fry-baseline` |
-| `fry-software` | same, `if:` any software picked | `fry-software` |
-| `fry-ad-join` | same, `if:` selected (mock) | `fry-ad-join` |
-| `fry-access` | same, `stage: access` (writes principal `team-<owning team>` to the VM) | `fry-access` |
-| `finalize` | Commit `cf/status: ready` | `finalize` |
-| `on-failure` | `if: failure()`: set `cf/status: failed` (the VM is kept for debugging; destroy cleans up) | `on-failure` |
+### 6.1 Runs and stages
 
-Every inventory-writing job updates `cf/stages`, `cf/processes` and `cf/status` and pings Backstage (one
-shared script, see 5.3a). The request task and the VM card both show this same catalog-backed state.
+The `vms` backend plugin (`compute-factory-idp/plugins/cf-backend/src/orchestrator.ts`) stores each
+run and its stages in its database. Stage lists are code:
 
-The stages run in sequence via `needs:`. Each fry stage is its own job and its own runner, with no shared
-state beyond inputs (VM IP, OS, stage vars). That's what keeps them independent and isolated, and why any
-stage can be re-run alone via `fry.yml`.
+| Run | Stages (in order) |
+|---|---|
+| provision | `register` (validate + commit inventory) → `provision` (Terraform) → `baseline` → `software` (if picked) → `ad-join` (if picked, mock) → `access` → `finalize` (`cf/status: ready`) |
+| refry | `configure` (persist the software/AD change; software and AD refry only) → the chosen fry stage → `finalize` |
+| destroy | `destroy` (guards, `cf/status: destroying`, `terraform destroy`, delete state and inventory) → `finalize` (failure path only) |
 
-### 6.2 `_fry-stage.yml` (how the runner reaches the VM)
+A 10-second worker dispatches `stage.yml` for the next due stage, polls its GitHub run and job steps
+(ETag requests), and advances the run. Each stage reads everything it needs from the committed
+inventory (host, spec, provenance), so stages share no runner state and any one can run again alone.
+
+### 6.2 Failure handling
+
+- **Automatic retry**: up to 4 attempts per stage, waiting 30 s, 2 min and 8 min. An attempt still
+  running 45 minutes after dispatch is cancelled and counts as failed. Failures in the stage's
+  `Validate inputs` step, broken workflow files and rejected dispatches are permanent and are not
+  retried.
+- **Giving up**: the orchestrator runs `finalize` with `outcome: failed` (`cf/status: failed`,
+  `cf/failed-at`) and marks the run failed. Retried transient failures never reach the inventory, so
+  they don't start demo-mode failure timers. The VM is kept for debugging; destroy cleans up.
+- **Manual**: on a failed run, team members and admins can **Retry** the failed stage (fresh attempt
+  budget, then the run continues) or **Skip** it (`software` and `ad-join` only; the desired spec is
+  unchanged). Everything else is retried or destroyed.
+- **Transient IDP failures**: run state and due times are in the database, so a backend restart loses
+  nothing. Every attempt is stored with its run key (`<run>.<stage>.<attempt>`, the end of the GitHub
+  run title) before dispatch; a lost dispatch response is recovered by finding that title rather than
+  dispatching again. Scaffolder task recovery resumes interrupted request tasks.
+
+### 6.3 Idempotent stages
+
+A stage can be dispatched again after any partial completion. `register` is a no-op for the same
+request ID and refuses a different one. `provision` ignores AMI changes after creation, adopts an
+instance tagged with the VM's `cf:request-id` that is missing from state instead of creating another,
+and clears stale state locks. Fry stages are Ansible (`state: present`, templated files), so a re-run
+converges; nothing is uninstalled. `destroy` and `finalize` succeed without changes when the inventory
+is already gone. All stages are serialized per VM by the workflow concurrency group `vm-<name>`.
+
+### 6.4 How a stage reaches the VM (fry stages)
 
 1. Generate an ephemeral SSH keypair on the runner.
 2. Fetch the CA private key from Secrets Manager (`compute-factory/ssh-ca`, via OIDC), sign the
@@ -461,12 +470,7 @@ No per-VM keys and no key pairs in Terraform. The pipeline is just another CA cl
 For Windows later, Ansible connects over SSH as well (`ansible_shell_type: powershell`), because OpenSSH
 Server is baked into the Windows image.
 
-### 6.3 `destroy.yml`
-
-`validate team` → `cf/status: destroying` → `terraform destroy` (same state key) → delete the state object → `git rm -r vms/<name>` →
-the catalog orphans and deletes the entity.
-
-### 6.4 `bake.yml` (builder repo)
+### 6.5 `bake.yml` (builder repo)
 
 On push to `main` (paths `packer/**`, `ansible/**`, `images.yaml`): matrix over `images.yaml`, then OIDC,
 then `packer init` and `packer build -only=amazon-ebs.ubuntu packer/ubuntu`. Packer's `ansible` provisioner
@@ -484,13 +488,13 @@ store anyone's public key.
   (ap-southeast-2). Two signers fetch it at signing time and keep it only in memory, never on disk:
   - the Backstage backend signs user certs. It reads the secret through the IDP EC2 instance role, which
     has `secretsmanager:GetSecretValue` on that one secret ARN only;
-  - `_fry-stage.yml` signs the pipeline's throwaway certs. It reads the secret through the existing OIDC role.
+  - `stage.yml` (fry stages) signs the pipeline's throwaway certs. It reads the secret through the existing OIDC role.
 - Rotation means updating the secret and re-baking with the new public key. Moving to Vault later only
   replaces the signing function in those two places.
 
 | Who | Principals in cert | Validity | Issued by |
 |---|---|---|---|
-| Pipeline (fry) | `cf-automation` | 1h | `_fry-stage.yml`, ephemeral keypair per job |
+| Pipeline (fry) | `cf-automation` | 1h | `stage.yml`, ephemeral keypair per stage run |
 | User | `team-<t>` for each team they're in, e.g. `team-a`, `team-b` | 12h | Backstage "Get SSH certificate" |
 | Admin | adds `team-platform-admins` | 12h | same |
 
@@ -539,9 +543,9 @@ Check a cert with `ssh-keygen -L -f ~/.ssh/id_ed25519-cert.pub` (shows principal
 | To add | Add |
 |---|---|
 | Windows OS | `packer/windows-2022/`, Windows task files in roles (OpenSSH Server + CA config, winget), OS row in `images.yaml`, `ssh_user` mapping, form option |
-| Azure | `source.azure.pkr.hcl`, matrix row, `terraform/platforms/azure/` with the same contract, OIDC login step for Azure in `provision.yml` keyed on platform, form option |
+| Azure | `source.azure.pkr.hcl`, matrix row, `terraform/platforms/azure/` with the same contract, OIDC login step for Azure in `stage.yml` keyed on platform, form option |
 | vSphere | Same pattern; needs a self-hosted GHA runner with network reach to vCenter |
-| New fry stage | `ansible/fry/<stage>.yml` + role, one job line in `provision.yml`, one form checkbox |
+| New fry stage | `ansible/fry/<stage>.yml` + role, one entry in the orchestrator's stage list and `stage.yml`'s stage enum, one form checkbox |
 
 ## 9. One-time manual steps (outside `./poc`)
 

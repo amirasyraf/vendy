@@ -88,35 +88,65 @@ docker: { linux: docker.io, windows: null }
 
 The `vm-request` template's software enum must be exactly `[git, htop, nginx, docker]`.
 
-## 6. Platform repo: workflows
+## 6. Platform repo: stage workflow
 
-All `workflow_dispatch` inputs are strings. Run names start with `<workflow> <name> by <requested_by>`;
-provision appends `[<request_id>]`, destroy appends `[<demo_generation>:<expected_request_id>]` for
-dispatch recovery. Optional manual-dispatch fields may be empty.
+The IDP `vms` backend plugin is the orchestrator (§8.2); GitHub Actions only **executes one stage
+per dispatch**. `provision.yml`, `fry.yml`, `destroy.yml` and `_fry-stage.yml` are removed. There is
+no supported direct (non-IDP) VM lifecycle pipeline; a trusted manual `stage.yml` dispatch runs exactly
+one stage and is not tracked by the orchestrator.
 
-### 6.1 `provision.yml` inputs
+### 6.1 `stage.yml` (`workflow_dispatch`)
+
+All inputs are strings and required unless noted.
 
 | Input | Example | Notes |
 |---|---|---|
+| `stage` | `provision` | `register` \| `provision` \| `baseline` \| `software` \| `ad-join` \| `access` \| `configure` \| `destroy` \| `finalize` |
 | `name` | `demo-1` | `^[a-z][a-z0-9-]{2,20}$` |
-| `spec_json` | serialized Resource spec | desired configuration as defined in §7; max 32 KiB |
-| `requested_by` | `amirasyraf` | Backstage user name |
-| `requester_teams` | `alpha,bravo` | comma-separated group names, server-side from Backstage |
-| `request_id` | Scaffolder task ID | optional for trusted manual dispatch; stable VM incarnation |
+| `request_id` | Scaffolder task ID | VM incarnation, `^[a-zA-Z0-9_-]{1,100}$`; written once by `register`, checked by every other stage |
+| `run_key` | `42.provision.2` | `<orchestrator run id>.<stage>.<attempt>`; unique per dispatch |
+| `requested_by` | `amirasyraf` | Backstage user who created the orchestrator run (`demo-mode` for automatic cleanup) |
+| `requester_teams` | `alpha,bravo` | comma-separated bare group names, server-derived by the IDP |
+| `params_json` | `{}` | optional, default `{}`; stage-specific JSON object (below); max 40 KiB |
 
-### 6.2 Other workflow inputs
+- `run-name: "stage <stage> <name> by <requested_by> [<run_key>]"`. The orchestrator recovers a lost
+  dispatch response by this exact `[<run_key>]` suffix, so it must stay the end of the title.
+- `concurrency: { group: vm-<name>, cancel-in-progress: false }`. The orchestrator dispatches at most one
+  stage at a time per VM (destroy may be queued behind a still-running stage of a superseded run).
+- `permissions: { contents: write, id-token: write }`. Executor code (scripts, Ansible, Terraform) comes
+  from the dispatched commit (`github.sha`). Inventory is read from, and committed to, a separate
+  checkout of current `main` taken when the job starts, because a stage queued behind another one must
+  see that stage's inventory commits. Inventory commits keep the `pull --rebase` retry loop.
+- `params_json` per stage:
+  - `register`: `{"spec": <Resource spec, §7>}`;
+  - `configure`: exactly one of `{"software": ["git", ...]}` (union into the recorded list) or `{"adJoin": true}`;
+  - `destroy`: `{"demoGeneration": "<uuid>"}` for automatic demo cleanup, `{}` for a user destroy;
+  - `finalize`: `{"outcome": "ready"}` or `{"outcome": "failed"}`;
+  - every other stage: `{}`.
+- **Failure classification.** All input, identity and authorization validation runs in a step named
+  exactly `Validate inputs`, before any side effect. If that step fails, the orchestrator treats the
+  failure as permanent and does not retry automatically. A `startup_failure` conclusion (broken
+  workflow file) is also permanent. Every other failure, including timeouts, cancellation and runner
+  loss, is treated as transient.
 
-- `destroy.yml`: `name`, `requested_by`, `requester_teams`; optional `demo_generation` and
-  `expected_request_id` for automatic cleanup. Both must match current policy/VM identity before deletion.
-- `fry.yml`: `name`, `stage` (`baseline`|`software`|`ad-join`|`access`), `software` (JSON string array, default `[]`, used when stage=software), `requested_by`, `requester_teams`.
-- `_fry-stage.yml` (`workflow_call`, internal): `name`, `stage`, `host`, `ssh_user`, `os`, `vars_json`.
-  The caller grants `id-token: write` and `contents: write`.
+### 6.2 Stage semantics
 
-Team guard: the group from the desired `spec.owner` must belong to `requester_teams`. On provision
-the spec comes from the validated dispatch payload; destroy/refry read the persisted entity in
-`vms/<name>/catalog-info.yaml`. A `platform-admins` member passes all guards. Authorization context
-(`requested_by`, `requester_teams`) is not part of user-editable desired configuration.
+Every stage is idempotent: re-dispatching it for the same `name` + `request_id` after any partial
+completion converges and never duplicates resources, packages or inventory. Unless stated, a stage
+first checks that `vms/<name>/catalog-info.yaml` exists with `cf/request-id == request_id`
+(permanent failure otherwise) and applies the team guard to the persisted `spec.owner`.
 
+| Stage | Behaviour |
+|---|---|
+| `register` | Validate `params_json.spec` with `scripts/spec.py`; team guard on the desired owner. Inventory with the same `cf/request-id` → success, no change. Inventory with a different request ID → permanent failure. Otherwise create the entity (§7) with `cf/status: provisioning`. |
+| `provision` | `cf/status: provisioning`; `terraform apply`; record outputs; `cf/status: frying`. Never a second instance for the same incarnation: the AMI is ignored after creation, an untracked instance tagged `cf:vm=<name>` and `cf:request-id=<request_id>` is adopted into state, and a stale state lock cannot block retries indefinitely. |
+| `baseline`, `software`, `ad-join`, `access` | `cf/status: frying`; read host and SSH user from inventory; run the stage playbook (§6.3) with variables derived from the persisted spec. |
+| `configure` | Persist the desired configuration change from `params_json` (software union, or `adJoin: true`) through `spec.py`. No VM contact. |
+| `destroy` | Inventory missing → success (already destroyed). With `demoGeneration`: the existing fail-closed cleanup check (`GET $BACKSTAGE_URL/api/vms/cleanup-check/<name>?generation=…&request_id=…`); ineligible → success without changes. Otherwise identity check, `cf/status: destroying`, `terraform destroy`, delete the state object, delete the inventory directory. A retry after partial completion converges. |
+| `finalize` | Inventory missing or a different request ID → success without changes. `ready` → `cf/status: ready`, `cf/ready-at` (first time only). `failed` → `cf/status: failed`, `cf/failed-at` (first time only). |
+
+Team guard: the persisted (or, for `register`, desired) `spec.owner` group must be in `requester_teams`;
+`platform-admins` passes every guard. Authorization context is never part of the spec.
 ### 6.3 Ansible invocation contract (Agent B calls, Agent A implements)
 
 ```
@@ -153,19 +183,16 @@ metadata:
   description: ubuntu VM on aws (S) for team alpha
   annotations:
     cf/status: provisioning        # provisioning | frying | ready | failed | destroying
-    cf/stages: '{"provision":"pending","baseline":"pending","software":"pending","ad-join":"pending","access":"pending"}'
-    cf/processes: '{"validate":"success","register":"success","provision":"running","fry-baseline":"pending","fry-software":"pending","fry-ad-join":"pending","fry-access":"pending","finalize":"pending","on-failure":"pending"}'
     cf/public-ip: ""               # filled after provision
     cf/ssh-user: ubuntu
     cf/instance-id: ""
     cf/instance-type: ""   # launched EC2 type, set with cf/instance-id after apply
     cf/requested-by: amirasyraf
     cf/requested-at: "2026-11-15T12:00:00Z"
-    cf/request-id: "scaffolder-task-id" # manual:<provision-run-id> for manual dispatch
-    cf/provision-run-id: "1234567890" # immutable; cf/run-id may later refer to refry/destroy
+    cf/request-id: "scaffolder-task-id" # VM incarnation; equals the stage.yml request_id input
     cf/ready-at: "2026-11-15T12:03:00Z" # first readiness only; absent until ready
     # cf/failed-at is set on first recorded failure; neither timestamp is reset by refry
-    cf/run-id: "1234567890"
+    cf/run-id: "1234567890"        # last stage.yml run that wrote this file
     cf/run-url: https://github.com/amirasyraf/compute-factory-platform/actions/runs/1234567890
 spec:
   type: vm
@@ -206,7 +233,7 @@ spec:
   Mandatory platform tags cannot be overridden. Never store secrets in catalog data or tags.
 - Terraform loads persisted spec and maps it to temporary `.tfvars.json` (`name`, `os`, `size`,
   `team`, original `requested_by`, `cloud_tags` including billing). It deletes that file on exit.
-  The provision job derives Ansible variables/optional-job decisions from the committed entity.
+  Each stage derives Ansible variables and applicability from the committed entity.
 - Refry persists desired configuration before applying: software refry adds the selected packages
   to the software list (union; an empty selection keeps it); AD refry enables `adJoin`. Other spec
   sections and original request provenance are preserved. Software installation remains additive:
@@ -215,20 +242,19 @@ spec:
   update. New enterprise sections require explicit validation/consumer changes. Legacy inventory is
   not migrated; this change rolls out against an empty inventory after VM teardown.
 
-- Stage values: `pending | running | success | failed | skipped`.
-- Stage keys are always these five, in this order: `provision`, `baseline`, `software`, `ad-join`, `access`.
-- `cf/processes` is the complete workflow-job view, with the same status values and these keys in order:
-  `validate`, `register`, `provision`, `fry-baseline`, `fry-software`, `fry-ad-join`, `fry-access`,
-  `finalize`, `on-failure`. Optional software and AD jobs are `skipped`; `on-failure` is `skipped` on a
-  successful run and `success` when it records a failed run.
+- `cf/status` is the coarse, catalog-visible lifecycle written by stages (§6.2). Per-stage state,
+  attempts, retries and errors live only in the IDP orchestrator database (§8.2); `cf/stages`,
+  `cf/processes` and `cf/provision-run-id` are removed. `failed` is written only by `finalize` with
+  `outcome: failed`, after the orchestrator has given up on a stage, so transient failures that are
+  being retried never start demo-mode failure timers.
 - `vms/.gitkeep` always exists.
 
 ## 8. Backstage ↔ platform integration
 
 - `BACKSTAGE_URL` = `https://idp.amirasyraf.dev` (platform repo variable).
 - `BACKSTAGE_TOKEN` (platform repo secret) is a Backstage static external-access token restricted to
-  `catalog` and `demo-mode`. Its subject is `compute-factory-workflows`. Demo mode accepts it only on
-  the read-only cleanup eligibility check; it cannot toggle settings, launch VMs or read user state.
+  `catalog` and `vms`. Its subject is `compute-factory-workflows`. The `vms` plugin accepts it only on
+  the read-only cleanup eligibility check; it cannot toggle settings, launch VMs or read run state.
 - After each inventory commit, the workflow calls (best-effort, never fails the job):
   `POST $BACKSTAGE_URL/api/catalog/refresh` with header `Authorization: Bearer $BACKSTAGE_TOKEN` and JSON
   body `{"entityRef":"resource:default/<name>"}`. On the first commit it also refreshes
@@ -240,9 +266,9 @@ spec:
   - templates: `https://github.com/amirasyraf/compute-factory-platform/blob/main/catalog/templates/*/template.yaml`;
   - org and the ssh-cert template come from the idp repo itself.
 - `catalog.orphanStrategy: delete`. Catalog processing interval should be short (POC).
-- Template names (`metadata.name`): `vm-request`, `vm-destroy`, `vm-refry` (platform repo, Agent B) and
-  `ssh-cert` (idp repo, Agent C).
-- `vm-request` dispatches with `cf:vm:dispatch`; refry/destroy retain `github:actions:dispatch`:
+- Template names (`metadata.name`): `vm-request`, `vm-destroy`, `vm-refry` (platform repo) and
+  `ssh-cert` (idp repo). VM templates only **create an orchestrator run** and then finish; live progress,
+  retry and skip are on the IDP run page (`/vms/runs/<id>`) and the VM entity page, not the task page.
   - `vm-request` first runs step `servicenow`, action `cf:servicenow:create`, named
     `Create ServiceNow request (mock)`. Inputs: `{vmName, team, platform, os, size}` from the form;
     outputs: `{number: string, httpStatus: number}`. The action obtains requester identity from
@@ -255,70 +281,153 @@ spec:
     `{number: "RITM" + ten digits, status: "created", mock: true, requestId}`. Numbers are deterministic
     per task ID; there is no persistent ticket store, real ServiceNow integration, approval or outcome
     update. Only the number/status appear in task logs/output, not GHA inputs or VM inventory.
-    Template Editor dry-runs make the real stateless POST. Direct GHA dispatch and refry/destroy do not.
-   - `cf:vm:dispatch` inputs `{name, specJson}`; outputs `{workflowRunId, workflowRunHtmlUrl}`. It uses
-     initiating user credentials to call the demo-mode backend, which reserves quota and dispatches
-     `provision.yml` against the fixed platform repo/main branch. Identity/team claims are server-derived;
-     `request_id` is the task ID. No dry-run support; uncertain dispatches retain a visible reservation.
-   - Refry/destroy use `repoUrl: github.com?owner=amirasyraf&repo=compute-factory-platform`, `branchOrTagName: main`;
-  - pass `requested_by: ${{ user.entity.metadata.name }}`;
-  - pass `requester_teams: ${{ user.entity.spec.memberOf | join(',') }}`. `memberOf` may contain refs like
-    `group:default/alpha`, so the workflow normalises by stripping everything up to the last `/` or `:`.
-  - VM pickers use `EntityPicker` with `catalogFilter: { kind: Resource, spec.type: vm }`.
+    Template Editor dry-runs make the real stateless POST. Refry/destroy do not.
+  - `vm-request` step `dispatch`, action `cf:vm:dispatch`, inputs `{name, specJson}` (unchanged spec
+    JSON construction); outputs `{runId: number, runUrl: string}`. It calls `POST /api/vms/requests`
+    with the initiating user's credentials; admission reserves demo quota and creates the provision run.
+    `request_id` is the task ID, so a Scaffolder retry or recovery returns the same run.
+    Template output links: `Follow provisioning` → `${{ steps.dispatch.output.runUrl }}`, and
+    `Open VM in catalog` → `resource:default/<name>`.
+  - `vm-refry` step `run`, action `cf:vm:run`, inputs `{operation: refry, vm: <entity ref>, stage,
+    software}`; `vm-destroy` step `run`, action `cf:vm:run`, inputs `{operation: destroy, vm}`. Outputs
+    `{runId, runUrl}`; link `Follow run` → `runUrl`. The action reads the VM entity with the initiating
+    user's credentials (so the catalog permission policy authorizes it) and derives identity and teams
+    server-side. The parameter forms are unchanged (`EntityPicker` with `catalogFilter: { kind: Resource,
+    spec.type: vm }`; refry `stage` enum `[baseline, software, ad-join, access]`; `software` checkboxes).
   - The team picker is the stock `MyGroupsPicker` (Groups with `relations.hasMember` = the current user). It
-    returns an entity ref, which the workflow normalises to the bare name.
-  - Every GHA-backed template follows dispatch with `cf:watch-workflow`. That custom action polls the
-     workflow's jobs and steps and streams the operation status into the Scaffolder task until it finishes.
-     The watcher step ID remains `monitor`. Alongside human-readable logs it emits one-line messages
-     prefixed `CF_WORKFLOW_PROGRESS_V1 ` followed by JSON: `{ version: 1, operation, status, conclusion,
-     jobs: [{ name, status, startedAt, completedAt, steps: [{ name, status, startedAt, completedAt }] }] }`.
-     Times are GitHub timestamps or null; completed statuses use the job/step conclusion. Missing jobs
-     are `waiting` while active and `unknown` after completion, never assumed successful or skipped.
-     A skipped reusable-workflow job, which GitHub names by its caller ID (`fry-software`), is reported
-     under the expected name (`fry-software / fry`). Monitoring failures never fail the task early:
-     rate limits (403/429), GitHub 5xx, timeouts and network errors are retried with backoff until the
-     30-minute deadline; a 404 is retried for 2 minutes (a just-dispatched run); other 4xx fail at once.
-     GitHub reads use conditional requests (ETag), whose 304 replies do not consume the rate limit.
-     The IDP task page uses these persisted, task-owner-authorized events for stage cards, timings and
-     expandable steps. No credentials or new privileged GitHub endpoint enter the frontend contract.
-   - The browser link to the run is the dispatch output `workflowRunHtmlUrl`. Stock GitHub dispatch also
-     supplies `workflowRunUrl` (API URL); `cf:vm:dispatch` does not.
-- Custom scaffolder action (idp repo, Agent C):
-  - `cf:ssh:sign`, input `{ publicKey: string }`, output `{ certificate, principals, validUntil }`;
-  - `cf:watch-workflow`, input `{ operation: provision|refry|destroy, workflowRunId: number }`, output
-    `{ status: string }`; reads GitHub Actions job/step status with the server-side integration token and
-    streams the complete operation until it finishes;
-  - reads the CA key from Secrets Manager `compute-factory/ssh-ca` (region from `AWS_REGION`) using
-    default AWS credentials, which on EC2 come from the instance role through IMDS (hop limit 2 is set by infra).
+    returns an entity ref, which the backend normalises to the bare name.
+  - `github:actions:dispatch` and `cf:watch-workflow` are no longer used; the `CF_WORKFLOW_PROGRESS_V1`
+    task-event format is removed.
+- Custom scaffolder actions (idp repo): `cf:servicenow:create`, `cf:vm:dispatch`, `cf:vm:run`, and
+  `cf:ssh:sign` (input `{ publicKey: string }`, output `{ certificate, principals, validUntil }`; reads the
+  CA key from Secrets Manager `compute-factory/ssh-ca` (region from `AWS_REGION`) using default AWS
+  credentials, which on EC2 come from the instance role through IMDS (hop limit 2 is set by infra)).
 
 ### 8.1 Demo mode control
 
-- `demo-mode` backend: authenticated-user `GET /state`, admin-only `POST /settings`
-  (`{enabled: boolean, generation: string}`), user `POST /requests` (`{name, specJson, requestId}`).
-  `GET /cleanup-check/:name?generation=...&request_id=...` accepts only the workflow service subject
-  and returns `{destroy: boolean}`. Ordinary users cannot toggle mode or inspect others' control records.
+- Part of the `vms` backend plugin (`/api/vms`): authenticated-user `GET /demo/state`, admin-only
+  `POST /demo/settings` (`{enabled: boolean, generation: string}`), user `POST /requests`
+  (`{name, specJson, requestId}` → `{runId, runUrl}`). `GET /cleanup-check/:name?generation=...&request_id=...`
+  accepts only the workflow service subject and returns `{destroy: boolean}`. The `/demo/state` response
+  shape is unchanged. Ordinary users cannot toggle mode or inspect others' control records.
 - Defaults off. Settings and request/cleanup intent are persisted in the plugin database. One backend
-  instance serializes admission and cleanup. A 15-second worker reconciles immutable Git inventory,
-  not the catalog projection. Concurrent request reservations count immediately; destroying/failed VMs
-  retain their slots until inventory is removed. Repository writers remain trusted and can bypass
-  portal admission through direct workflow dispatch; reconciliation still applies policy to their VMs.
+  instance serializes admission, cleanup and orchestration. A 15-second worker reconciles immutable Git
+  inventory, not the catalog projection. Concurrent request reservations count immediately;
+  destroying/failed VMs retain their slots until inventory is removed. A reservation whose provision run
+  ended without ever registering inventory (failed or cancelled) is released; such a run can no longer be
+  retried, so the user submits a new request.
 - Enabled: 3 VMs per original requesting account (including admins), reject a fourth portal request;
   when enabling, destroy oldest excess requests and retain newest 3. Ready VMs expire at
-  `max(first_ready_at, enabled_at) + 5 min`; terminal failures use first failure time if never ready.
-  Refry does not extend lifetime. Disable invalidates queued cleanup generations; re-enable starts
-  fresh timers. Already-started destruction cannot be undone. Actions queues/Terraform add latency.
-- Automatic destroy checks the current generation and exact VM incarnation before guard validation
-  and again immediately before destructive work; stale or missing VMs skip. Network/auth errors fail
-  closed. Deadlines survive restarts; cleanup pauses while IDP/GitHub is unavailable. Ambiguous
-  dispatches are recovered from the newest 100 matching workflow-dispatch runs; unresolved cases
-  remain visible/reserved rather than being blindly redispatched. Failed or rejected cleanup is
-  retried at most 3 times per VM per generation, then shown as "Cleanup stopped" for an operator.
-  A failed inventory scan blocks portal requests only while demo mode is enabled (quota fails closed).
-  Operator intervention may be needed.
+  `max(first_ready_at, enabled_at) + 5 min`; terminal failures use first failure time (`cf/failed-at`,
+  written only after orchestration gives up) if never ready. Refry does not extend lifetime. Disable
+  invalidates queued cleanup generations; re-enable starts fresh timers. Already-started destruction
+  cannot be undone. Actions queues/Terraform add latency.
+- Automatic cleanup creates an orchestrator `destroy` run (requested by `demo-mode`, `params_json`
+  `{"demoGeneration": …}`, the VM's request ID). The stage checks the current generation and exact VM
+  incarnation before destructive work; stale or missing VMs skip. Network/auth errors fail closed.
+  Deadlines survive restarts; cleanup pauses while IDP/GitHub is unavailable. Orchestrator retries
+  apply; a cleanup run that still fails is shown as "Cleanup stopped" for an operator (retry it from
+  the run page), and a new generation creates a new run. A failed inventory scan blocks portal requests
+  only while demo mode is enabled (quota fails closed).
 - `computeFactory.demoAutomation: true` is production backend config. Default false makes local
-  development/smoke safe: settings can be exercised, but no inventory scan, launch or cleanup runs.
-  This is not a separate cloud scheduler or a hard termination-time/cost guarantee.
+  development/smoke safe: settings and read APIs can be exercised, but no inventory scan, launch,
+  orchestration dispatch or cleanup runs. This is not a separate cloud scheduler or a hard
+  termination-time/cost guarantee.
 
+### 8.2 VM orchestrator (`vms` backend plugin)
+
+The orchestrator owns stage order, retries, skips and run state in the plugin database. GitHub
+Actions executes stages (§6). Stage lists are code, not configuration.
+
+**Runs and stages.** One active run (`running` or `failed`) per VM name. Creating a `destroy` run
+cancels any other active run for that VM; a new `refry` run cancels a failed refry run. Any other
+creation while a run is active is rejected (409): a running run, or a failed (incomplete) provision,
+must be retried, skipped or destroyed first.
+
+| Run kind | Stages, in order |
+|---|---|
+| `provision` | `register`, `provision`, `baseline`, `software`, `ad-join`, `access`, `finalize` |
+| `refry` | `configure`, `<stage>`, `finalize` (`configure` applies only to software and ad-join) |
+| `destroy` | `destroy`, `finalize` (`finalize` runs only on the failure path) |
+
+- Not-applicable stages (no software selected, no AD join, refry `configure` for baseline/access,
+  destroy `finalize` on success) are `skipped` with `skippedBy: null`.
+- Stage statuses: `pending | running | retrying | success | failed | skipped | cancelled`.
+  Run statuses: `running | failed | succeeded | cancelled`.
+- Automatic retry: at most 4 attempts per stage (1 + 3 retries), waiting 30 s, 2 min and 8 min before
+  attempts 2–4 (`retrying` while waiting). An attempt that has not completed 45 min after dispatch is
+  failed (and its GitHub run cancelled, best effort). Permanent failures (§6.1, and dispatch rejections
+  other than 429/5xx) fail the stage immediately.
+- When a stage fails for good, the orchestrator runs `finalize` with `outcome: failed` (same retry
+  policy) and then sets the run to `failed`. If `finalize` itself fails, the run is `failed` without a
+  further failure record. Success of every stage ends with `finalize` `outcome: ready` (provision,
+  refry) and run `succeeded`.
+- Manual actions, allowed only while the run is `failed`, for `platform-admins` and members of the run's
+  team:
+  - **retry** resets the failed stage to a fresh attempt budget (and `finalize` to pending), then
+    continues the run from that stage;
+  - **skip** marks the failed stage `skipped` (`skippedBy` = user) and continues with the next stage.
+    Only `software` and `ad-join` are skippable. The desired spec is not changed by a skip.
+- Dispatch recovery: the attempt is persisted (with its `run_key`) before dispatch. A lost dispatch
+  response is resolved by finding the `stage.yml` run whose title ends in `[<run_key>]` among the newest
+  100 runs; if none appears within 3 minutes, the attempt counts as a transient failure. Stages are
+  idempotent, so a late duplicate is harmless.
+
+**HTTP API** (`/api/vms`, user credentials; deliberate errors are `{ "error": string }`). Reads return
+404 for runs the caller may not see: `platform-admins` see everything, others see runs whose team is
+one of their groups.
+
+| Route | Result |
+|---|---|
+| `GET /runs/:id` | `RunView` |
+| `GET /runs?name=<vm>&limit=<1-20>` | `{ runs: RunView[] }`, newest first (default limit 10) |
+| `GET /summary` | `{ vms: [{ name, latest: RunView }] }`: the newest run per VM name visible to the caller |
+| `POST /runs/:id/retry` | `RunView`; 409 when not retryable, 403 when not allowed |
+| `POST /runs/:id/skip` | `RunView`; 409 when the failed stage is not skippable or the run is not failed |
+
+```ts
+type RunView = {
+  id: number;
+  kind: 'provision' | 'refry' | 'destroy';
+  name: string;
+  team: string;                 // bare group name
+  requestId: string;            // VM incarnation
+  requestedBy: string;
+  status: 'running' | 'failed' | 'succeeded' | 'cancelled';
+  error: string | null;         // why the run failed or was cancelled
+  createdAt: string;            // ISO 8601
+  updatedAt: string;
+  finishedAt: string | null;
+  actions: { retry: boolean; skip: boolean };   // for this caller, on the failed stage
+  stages: StageView[];
+};
+type StageView = {
+  id: string;                   // e.g. 'provision', 'software', 'finalize'
+  status: 'pending' | 'running' | 'retrying' | 'success' | 'failed' | 'skipped' | 'cancelled';
+  attempt: number;              // 0 before the first dispatch
+  maxAttempts: number;
+  nextAttemptAt: string | null; // set while retrying
+  startedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+  skippable: boolean;
+  skippedBy: string | null;
+  retriedBy: string | null;     // last user who manually retried this stage
+  outcome: 'ready' | 'failed' | null;          // finalize only
+  runUrl: string | null;        // GitHub run of the current or last attempt
+  steps: { name: string; status: string }[];   // that run's job steps
+  attempts: {                   // earlier attempts, oldest first
+    attempt: number;
+    runUrl: string | null;
+    conclusion: string;         // success | failure | cancelled | timed_out | dispatch_failed | ...
+    error: string | null;
+    finishedAt: string;
+  }[];
+};
+```
+
+- `runUrl` from `cf:vm:dispatch`/`cf:vm:run` is `<app.baseUrl>/vms/runs/<id>`. The frontend polls
+  `GET /runs/:id` (or `/summary`) about every 5 s while a run is `running`.
 ## 9. IDP runtime (orchestrator infra ↔ Agent C deploy)
 
 - EC2: Ubuntu 26.04 **arm64** (t4g.medium). Cloud-init installs Docker Engine + compose plugin, puts
@@ -355,7 +464,8 @@ spec:
   `-backend-config=bucket=$TF_STATE_BUCKET -backend-config=key=vms/aws/<name>/terraform.tfstate -backend-config=region=ap-southeast-2 -backend-config=use_lockfile=true`.
 - Variables: `name` (required), `os` (default `ubuntu`), `size` (default `S`), `instance_type` (default
   `""`; overrides `size`), `team` (default `""`),
-  `requested_by` (default `""`). **`terraform destroy -var name=<name>` must work with nothing else**,
+  `requested_by` (default `""`), `request_id` (default `""`; VM incarnation, tagged as `cf:request-id`).
+  **`terraform destroy -var name=<name>` must work with nothing else**,
   because `./poc down` uses that.
 - Outputs: `public_ip`, `ssh_user`, `instance_id`, `instance_type`.
 - Size map: `terraform/platforms/aws/sizes.json` in the platform repo, a JSON object of size
@@ -366,8 +476,10 @@ spec:
   region (`ec2:DescribeInstanceTypeOfferings`; IDP host role, read-only). Terraform rejects types that
   cannot boot x86_64 and launches into a default subnet whose AZ offers the type.
 - Demo mode: while on, the IDP accepts `compute.instanceType` only from `t3.micro`, `t3.small`,
-  `t3.medium`, `t3.large` (`demo-mode` `/state` returns them as `instanceTypes`); sizes are allowed.
-- Resources are tagged `cf:poc=true`, `cf:vm=<name>`, `cf:team=<team>`. No key pair (the CA is used).
+  `t3.medium`, `t3.large` (`/api/vms/demo/state` returns them as `instanceTypes`); sizes are allowed.
+- Resources are tagged `cf:poc=true`, `cf:vm=<name>`, `cf:team=<team>`, and `cf:request-id=<request_id>`
+  when set. No key pair (the CA is used). The instance ignores AMI changes after creation, so a retry after
+  a newer bake never replaces it.
 - `./poc down` runs, for each key under `vms/aws/*/terraform.tfstate`:
   `terraform -chdir=~/projects/compute-factory-platform/terraform/platforms/aws init -reconfigure <backend-config…> && terraform … destroy -auto-approve -var name=<name>`.
 

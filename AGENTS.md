@@ -68,4 +68,7 @@ store it there (or another gitignored file) immediately. Never commit or echo th
 - After a frontend deploy, open tabs show a "new version" banner within a minute or on focus; a
   `Browser stale-bundle` log line means a user is still on the old bundle. Rule that out before
   concluding a deployed fix "didn't work".
-- The static `BACKSTAGE_TOKEN` is restricted to `catalog` and `demo-mode`; it cannot read scaffolder tasks.
+- The static `BACKSTAGE_TOKEN` is restricted to `catalog` and `vms`; it cannot read scaffolder tasks or runs.
+- VM orchestration state (runs, stages, attempts, GitHub run IDs) is in Postgres DB `backstage_plugin_vms`
+  (`vm_runs`, `vm_run_stages`); read it with `./poc run <run-id>`. Backstage log lines `VM run <id> ...`
+  trace dispatches, failed attempts, retries and outcomes; the stage's GitHub run title ends in `[<run>.<stage>.<attempt>]`.

@@ -8,6 +8,7 @@
 #   ./poc set-password <user>   add/change an IDP login (hash stored in .poc-users)
 #   ./poc logs [backstage|caddy|postgres|all] [since]   IDP container logs (default: backstage, 30m)
 #   ./poc task <task-id>        Scaffolder task status and stored events, straight from Postgres
+#   ./poc run <run-id>          VM orchestrator run and stage state, straight from Postgres
 # See DESIGN.md section 12.
 set -euo pipefail
 
@@ -581,10 +582,21 @@ cmd_task() {
     -c \"select id, event_type, created_at, left(body::text, 300) as body from task_events where task_id = '$id' order by id\"" </dev/null
 }
 
+# Read-only. Orchestrator state of one VM run (the IDP run page shows the same data).
+cmd_run() {
+  local id="${1:-}"
+  [[ "$id" =~ ^[1-9][0-9]{0,9}$ ]] || die "usage: $0 run <run-id>"
+  local host; host="$(idp_host)"
+  ssh "${SSH_OPTS[@]}" "$host" "cd /opt/idp && docker compose exec -T postgres psql -U backstage -d backstage_plugin_vms \
+    -c \"select id, kind, name, team, status, requested_by, to_timestamp(created_at/1000) as created, left(error, 200) as error from vm_runs where id = $id\" \
+    -c \"select stage, status, attempt, max_attempts + budget_start as max, gha_run_id, conclusion, to_timestamp(next_attempt_at/1000) as next_attempt, left(error, 160) as error from vm_run_stages where run_id = $id order by position\"" </dev/null
+}
+
 case "${1:-}" in
   up)          cmd_up ;;
   logs)        shift; cmd_logs "$@" ;;
   task)        shift; cmd_task "$@" ;;
+  run)         shift; cmd_run "$@" ;;
   down)        cmd_down ;;
   status)      cmd_status ;;
   watch-bake)  command -v gh >/dev/null || die "missing tool: gh"
@@ -596,5 +608,5 @@ case "${1:-}" in
                [[ -s "$USERS_FILE" ]] || die "no IDP users; run ./poc set-password <user> first"
                deploy_idp "$(infra_out idp_ip)" ;;
   _destroy_vm) shift; cmd_destroy_vm "$@" ;;
-  *) echo "usage: $0 up|down|status|deploy-idp|set-password <user>|watch-bake <run-id>|logs [service] [since]|task <task-id>" >&2; exit 2 ;;
+  *) echo "usage: $0 up|down|status|deploy-idp|set-password <user>|watch-bake <run-id>|logs [service] [since]|task <task-id>|run <run-id>" >&2; exit 2 ;;
 esac
