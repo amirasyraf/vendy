@@ -1,6 +1,5 @@
-# Shared Azure pieces: the golden-image gallery (filled by the builder repo's Packer bake) and the
-# IDP's read-only Azure credential. Identities (GitHub OIDC app, Reader SP) live outside up/down;
-# see DESIGN.md §9.
+# The IDP's read-only Azure credential. The golden-image gallery is in images/; identities (GitHub
+# OIDC app, Reader SP) live outside up/down; see DESIGN.md §9.
 variable "azure_subscription_id" {
   type    = string
   default = "74b39a79-f79d-4adb-8ae0-fe9118fc564a"
@@ -25,49 +24,6 @@ variable "azure_reader_client_id" {
 variable "azure_reader_cert_path" {
   type    = string
   default = "../.poc-azure-reader.pem"
-}
-
-provider "azurerm" {
-  subscription_id = var.azure_subscription_id
-  tenant_id       = var.azure_tenant_id
-  features {}
-}
-
-locals {
-  azure_tags = { "cf:poc" = "true", "cf:module" = "infra" }
-}
-
-resource "azurerm_resource_group" "images" {
-  name     = "cf-images"
-  location = var.azure_location
-  tags     = local.azure_tags
-}
-
-resource "azurerm_shared_image_gallery" "images" {
-  name                = "cfimages"
-  resource_group_name = azurerm_resource_group.images.name
-  location            = azurerm_resource_group.images.location
-  description         = "Compute Factory golden images (POC)"
-  tags                = local.azure_tags
-}
-
-# One definition per OS; Packer publishes versions, Terraform launches the latest.
-resource "azurerm_shared_image" "ubuntu" {
-  name                = "ubuntu"
-  gallery_name        = azurerm_shared_image_gallery.images.name
-  resource_group_name = azurerm_resource_group.images.name
-  location            = azurerm_resource_group.images.location
-  os_type             = "Linux"
-  hyper_v_generation  = "V2"
-  architecture        = "x64"
-  # The sizes with quota in australiaeast (v6/v7) are NVMe-only; the Canonical base supports both.
-  disk_controller_type_nvme_enabled = true
-  identifier {
-    publisher = "compute-factory"
-    offer     = "ubuntu"
-    sku       = "26.04"
-  }
-  tags = local.azure_tags
 }
 
 resource "aws_secretsmanager_secret" "azure_reader" {

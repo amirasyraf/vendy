@@ -1,4 +1,5 @@
-# Mock SSH CA: a fresh CA per `./poc up`. Private key lives only in Secrets Manager (and local state).
+# Mock SSH CA. Private key lives only in Secrets Manager (and local state). It is created with the
+# image tier and replaced only when `./poc down` (without --keep-images) destroys that tier.
 resource "tls_private_key" "ssh_ca" {
   algorithm = "ED25519"
 }

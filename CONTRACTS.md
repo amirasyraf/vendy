@@ -27,7 +27,7 @@ Default branch: `main`. Commit directly to `main`, with no PRs (POC). Use `git p
 | Mandatory tag | `cf:poc = "true"` on **every** AWS and Azure resource (AWS Terraform `default_tags`; Packer `tags`, `run_tags`, `run_volume_tags`, `snapshot_tags`, `azure_tags`; Azure Terraform per resource) |
 | TF state bucket | `cf-tfstate-134584031874-apse2` (repo variable `TF_STATE_BUCKET` on platform) |
 | VM state key | `vms/<platform>/<name>/terraform.tfstate`, e.g. `vms/aws/demo-1/terraform.tfstate` |
-| CA private key | Secrets Manager secret id `compute-factory/ssh-ca`; `SecretString` = OpenSSH-format ed25519 private key |
+| CA private key | Secrets Manager secret id `compute-factory/ssh-ca`; `SecretString` = OpenSSH-format ed25519 private key. Created by `infra/images` (tag `cf:module=images`); `infra/` grants the IDP role read access by name (`compute-factory/ssh-ca-??????`) |
 | CA public key | SSM parameter `/compute-factory/ssh-ca-pub` (String; one OpenSSH public key line) |
 | Network | default VPC; public IPs; SG ingress tcp/22 from `0.0.0.0/0` |
 
@@ -41,10 +41,10 @@ AWS remains the shared base (SSH CA, Terraform state bucket, IDP host); Azure ho
 | Location | `australiaeast` |
 | GHA identity (OIDC) | Entra app `cf-github-actions` (`2e6cce7d-…`), Contributor on the subscription; federated subjects `repo:amirasyraf@15522007/compute-factory-{builder@1458285691,platform@1458285776}:ref:refs/heads/main` |
 | GHA repo variables (builder + platform) | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_LOCATION` |
-| Image gallery | resource group `cf-images`, gallery `cfimages`, one definition per OS release (`ubuntu`: Ubuntu 26.04, Linux, Gen2, x64, NVMe + SCSI); the current definition is created by `infra/azure.tf` |
+| Image gallery | resource group `cf-images`, gallery `cfimages`, one definition per OS release (`ubuntu`: Ubuntu 26.04, Linux, Gen2, x64, NVMe + SCSI); the group (tag `cf:module=images`), gallery and current definition are created by `infra/images/gallery.tf` |
 | Per-VM resources | resource group `cf-vm-<name>`; VNet, subnet, NSG (tcp/22 from anywhere), static Standard public IP, NIC and VM all named `cf-<name>` |
 | IDP reader | service principal `cf-idp-azure-reader` (Reader, certificate); Secrets Manager `compute-factory/azure-reader`, `SecretString` JSON `{tenantId, clientId, subscriptionId, location, certificatePem}` |
-| Laptop admin | service principal `cf-admin-local` (Owner, certificate; `ARM_*` in `~/.zshrc`) for `infra/` and `./poc` |
+| Laptop admin | service principal `cf-admin-local` (Owner, certificate; `ARM_*` in `~/.zshrc`) for `infra/images` and `./poc` |
 
 Tooling versions (pin these):
 - Terraform `>= 1.10` (S3 `use_lockfile`), AWS provider `~> 6.0`.
@@ -56,8 +56,12 @@ Tooling versions (pin these):
 
 - Base: official Canonical Ubuntu **26.04** amd64 (owner `099720109477` or SSM `/aws/service/canonical/ubuntu/server/26.04/stable/current/amd64/hvm/ebs-gp3/ami-id`).
 - AMI name `cf-ubuntu-26.04-<YYYYMMDDhhmmss>`.
-- AMI tags: `cf:os=ubuntu`, `cf:os-family=linux`, `cf:os-version=26.04`, `cf:managed=true`, `cf:poc=true`, `cf:git-sha=<sha>`.
-  Snapshots get the same tags.
+- AMI tags: `cf:os=ubuntu`, `cf:os-family=linux`, `cf:os-version=26.04`, `cf:managed=true`, `cf:poc=true`, `cf:git-sha=<sha>`,
+  `cf:ssh-ca-fingerprint=<SHA256:...>` (OpenSSH fingerprint of the baked CA public key, `ssh-keygen -lf`;
+  equals `infra/images` output `ssh_ca_fingerprint`). Snapshots and Azure gallery versions get the same tags.
+- `./poc up` reuses images only when, for every `images.yaml` row, the image a new VM would launch is
+  usable and carries the current CA fingerprint; otherwise it bakes. After a verified bake, `./poc`
+  deletes the row's other images (AMIs with their snapshots, gallery versions of the mapped definition).
 - Terraform selects the latest bake within the chosen release: `most_recent = true`, `owners = ["self"]`,
   and tags `cf:os=<os>`, `cf:os-version=<imageVersion>`, `cf:managed=true`.
 - Baked on the image:
@@ -668,7 +672,7 @@ type ObservedVm = {
   initializes the S3 backend from the canonical platform `main` checkout and runs
   `terraform destroy -auto-approve -var name=<name>` (Azure with the laptop's `ARM_*` service principal).
   Only successful destroys remove the corresponding S3 state object. Outstanding or unverified VM
-  state keeps the bucket and golden images available for recovery.
+  state keeps the bucket and the image tier (CA and golden images) available for recovery.
 
 ### 10a. IDP `vm-sizes` API (signed-in users)
 

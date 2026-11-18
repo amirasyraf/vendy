@@ -18,7 +18,7 @@ and no automatic reconciliation on Git edits. See `CONTRACTS.md` §7 for the val
 
 | Repo | Purpose |
 |---|---|
-| `compute-factory` (this) | design, `./poc` lifecycle, shared AWS + Azure infra (`infra/`) |
+| `compute-factory` (this) | design, `./poc` lifecycle, shared AWS infra (`infra/`), SSH CA + image gallery (`infra/images/`) |
 | `compute-factory-idp` | Backstage app + deployment |
 | `compute-factory-builder` | bake: golden images (Packer + Ansible) |
 | `compute-factory-platform` | provision + fry: Terraform, Ansible, GHA workflows, VM inventory, templates |
@@ -31,7 +31,8 @@ without changing existing checkouts). Bootstrap and teardown use temporary clone
 ```bash
 cp poc.env.example .poc.env   # once: Backstage PAT
 ./poc set-password amirasyraf  # once per user: IDP login (hash kept in .poc-users)
-./poc up                      # shared infra, exact AWS/Azure bake verification, then IDP deploy
+./poc up                      # image tier, shared infra, bake (or reuse matching images), then IDP deploy
+./poc up --images-only        # SSH CA/gallery if missing, bake + verify every images.yaml row, prune old images
 ./poc status                  # what exists right now
 ./poc watch-bake <run-id>      # monitor an existing bake; never dispatches another
 ./poc deploy-idp              # build and deploy Backstage on the existing host
@@ -41,6 +42,7 @@ cp poc.env.example .poc.env   # once: Backstage PAT
 ./poc task <task-id>          # Scaffolder task status + stored events from Postgres
 ./poc run <run-id>            # VM orchestrator run + stage state (attempts, GitHub run IDs, errors)
 ./poc down                    # freeze workflows, destroy VMs and infra, sweep owned orphans, verify CLEAN
+./poc down --keep-images      # the same, but keep the SSH CA and golden images for the next up
 ```
 
 For an application change, [build and smoke-check one local image](../compute-factory-idp/README.md#checks)
@@ -60,7 +62,15 @@ If `up` cannot finish, it leaves resources in place. Check `./poc status` and `.
 `up` never guesses or automatically dispatches again. The platform workflow stays gated and the IDP
 unpublished until both artifacts are verified. `up` is not a resume command: it refuses nonempty state
 or VM inventory and never resets the inventory. Use `./poc down` only for intentional teardown of the POC
-**and all requested VMs**. `up` and `down` reject all arguments; there is no dry-run or force-up option.
+**and all requested VMs**. `up` accepts only `--images-only` and `down` only `--keep-images`; there is no
+dry-run or force-up option.
+
+Golden images bake the SSH CA public key, so the CA and images are one tier with its own Terraform root,
+`infra/images` (DESIGN.md §12.1). Every image is tagged `cf:ssh-ca-fingerprint`. `up` reuses the images
+when each `images.yaml` row's current image trusts the current CA and bakes otherwise; if a reused image
+was built from an older builder commit than `main` it only warns, so run `./poc up --images-only` after
+changing the image recipe. `--images-only` works whether the POC is up or down and returns the builder
+gate to its previous state afterwards. A successful bake deletes that row's older images.
 
 After a VM request, the browser goes to the run page: every stage of the run (ServiceNow mock,
 registration, Terraform provisioning, every fry stage, finalization) with retries, errors and GitHub
@@ -74,7 +84,8 @@ Requirements: `terraform`, `gh` (authenticated), `aws` (profile `amirasyraf`), `
 subscription `74b39a79-…`, e.g. `azsp`), plus the `cf-admin-local` `.pfx` certificate at
 `~/.config/azure/cf-admin-local.pfx` (the POC script supplies its fixed `ARM_*` defaults and accepts
 explicit environment overrides). The gitignored Azure reader certificate `.poc-azure-reader.pem`,
-`docker` (buildx, for the arm64 IDP image), `jq`, `python3`, `ssh` with `~/.ssh/id_ed25519`, and `dig`
+`docker` (buildx, for the arm64 IDP image), `jq`, `python3` with PyYAML, `ssh`/`ssh-keygen` with
+`~/.ssh/id_ed25519`, and `dig`
 are also needed. A per-user host lock covers lifecycle and IDP deploy/maintenance commands across
 checkouts, including their active workers. Do not run POC mutations from another host or directly
 against its Terraform state. Lifecycle commands use the default Terraform workspace and reject
@@ -83,14 +94,17 @@ The Azure identities and `AZURE_*` repo variables are one-time setup that surviv
 
 `down` is safe to rerun after a partial `up` or `down`. It gates and disables both resource workflows,
 cancels runs until they are quiescent, then stops the owned IDP. A failed VM destroy retains the state
-bucket and golden images for recovery; independent owned compute cleanup still runs when lock safety
+bucket and the image tier for recovery (still `NOT CLEAN`); independent owned compute cleanup still runs when lock safety
 and quiescence can be proven. The retained state or images can still incur charges. Check the named
 logs and leftover checks, fix the reported blocker, and rerun; do not empty the bucket manually.
 Azure gallery deletion can take several minutes. Untagged/shared resources such as `NetworkWatcherRG`
 are not removed, and possible legacy AWS Packer leftovers are reported rather than deleted by name.
 
 `CLEAN` requires repeated AWS, Azure and DNS absence checks, empty local Terraform state, cleared
-GitHub wiring, an empty `vms/` inventory, and workflows verified disabled and idle. The manual Azure
+GitHub wiring, an empty `vms/` inventory, and workflows verified disabled and idle. With
+`--keep-images` the same checks allow exactly the image tier (CA secret and parameter, the `cf-images`
+gallery and AMIs/snapshots tagged `cf:managed=true`) and report `CLEAN (images retained)`; it costs
+cents a month plus about $0.40 for the CA secret. A later plain `down` removes it. The manual Azure
 identities, repository credentials and Caddy TLS backup remain by design.
 
 The `idp.amirasyraf.dev` DNS record lives in `~/projects/cloudflare/amirasyraf.dev/idp.tf` and is only

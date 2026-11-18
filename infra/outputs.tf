@@ -11,19 +11,11 @@ output "idp_instance_id" {
 }
 
 output "ssh_ca_secret_id" {
-  value = aws_secretsmanager_secret.ssh_ca.name
-}
-
-output "ssh_ca_pub" {
-  value = trimspace(tls_private_key.ssh_ca.public_key_openssh)
+  value = local.ssh_ca_secret
 }
 
 output "azure_reader_secret_id" {
   value = aws_secretsmanager_secret.azure_reader.name
-}
-
-output "azure_gallery" {
-  value = "${azurerm_resource_group.images.name}/${azurerm_shared_image_gallery.images.name}"
 }
 
 output "postgres_password" {

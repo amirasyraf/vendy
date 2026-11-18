@@ -1,6 +1,8 @@
 .poc.env
 infra/.terraform/
 infra/*.tfstate*
+infra/images/.terraform/
+infra/images/*.tfstate*
 infra/.terraform.lock.hcl.bak
 .generated/
 .poc-users

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Compute Factory POC lifecycle.
-#   ./poc up       create everything (assumes a clean slate)
+#   ./poc up       create everything (assumes a clean slate apart from a kept SSH CA + golden images)
+#   ./poc up --images-only   create the SSH CA/gallery if missing, bake every images.yaml row, prune old images
 #   ./poc down     destroy everything, including user VMs, then verify nothing tagged cf:poc=true remains
+#   ./poc down --keep-images  the same, but keep the SSH CA and golden images (infra/images) for the next up
 #   ./poc status   read-only overview
 #   ./poc deploy-idp [<image-id>]  deploy to the existing host, building only when no artifact is supplied
 #   ./poc prune-idp-images        explicitly collect old IDP registry blobs and dangling IDP images
@@ -23,7 +25,9 @@ PLATFORM_DIR="$PROJECTS/compute-factory-platform"
 IDP_DIR="$PROJECTS/compute-factory-idp"
 CF_DNS_DIR="$HOME/projects/cloudflare/amirasyraf.dev"
 INFRA_DIR="$ROOT/infra"
+IMAGES_DIR="$INFRA_DIR/images" # SSH CA + Azure gallery; survives down --keep-images
 GEN="$ROOT/.generated"
+CA_FINGERPRINT_RE='^SHA256:[A-Za-z0-9+/]{43}$'
 HEALTH_URL="https://$DOMAIN/.backstage/health/v1/readiness"
 USERS_FILE="$ROOT/.poc-users" # username:scrypt-hash lines, gitignored, persists across cycles
 PASSWORDS_FILE="$ROOT/.poc-passwords" # username:plaintext, gitignored; POC test logins for agents/scripts
@@ -107,11 +111,26 @@ prepare_lifecycle() {
 }
 
 tf_infra()  { TF_DATA_DIR="$INFRA_DIR/.terraform" terraform -chdir="$INFRA_DIR" "$@"; }
+tf_images() { TF_DATA_DIR="$IMAGES_DIR/.terraform" terraform -chdir="$IMAGES_DIR" "$@"; }
 infra_out() { tf_infra output -raw "$1" 2>/dev/null || true; }
-infra_state() {
-  [[ ! -L "$INFRA_DIR/terraform.tfstate" ]] || { warn "refusing a symlinked local Terraform state"; return 1; }
+root_state() {
+  local dir="$1"
+  [[ ! -L "$dir/terraform.tfstate" ]] || { warn "refusing a symlinked local Terraform state in $dir"; return 1; }
+  [[ -e "$dir/terraform.tfstate" ]] || return 0
+  TF_DATA_DIR="$dir/.terraform" terraform -chdir="$dir" state list
+}
+infra_state()  { root_state "$INFRA_DIR"; }
+images_state() { root_state "$IMAGES_DIR"; }
+
+# Before the image tier had its own root, infra/ held the CA and gallery. Applying the current
+# infra/ to such a state would destroy the CA, so refuse; this reads the file and needs no init.
+require_split_layout() {
+  local legacy
   [[ -e "$INFRA_DIR/terraform.tfstate" ]] || return 0
-  tf_infra state list
+  legacy="$(jq -r '.resources[]? | select(.mode == "managed") | "\(.type).\(.name)"
+    | select(test("^(tls_private_key|aws_secretsmanager_secret(_version)?\\.ssh_ca$|aws_ssm_parameter\\.ssh_ca_pub$|azurerm_)"))' \
+    "$INFRA_DIR/terraform.tfstate")" || die "cannot read $INFRA_DIR/terraform.tfstate"
+  [[ -z "$legacy" ]] || die "infra state still holds image-tier resources ($(tr '\n' ' ' <<<"$legacy")); move them to infra/images with terraform state mv first (DESIGN.md §12.1)"
 }
 aws() { command aws --cli-connect-timeout 10 --cli-read-timeout 20 "$@"; }
 az_poc() { az "$@" --subscription "$AZURE_SUBSCRIPTION" --only-show-errors; }
@@ -190,6 +209,182 @@ infra_apply_or_destroy() {
     -var "azure_subscription_id=$AZURE_SUBSCRIPTION" -var "azure_tenant_id=$AZURE_TENANT" \
     -var "azure_location=australiaeast" -var "azure_reader_cert_path=../.poc-azure-reader.pem" \
     -var "admin_ssh_public_key_path=$HOME/.ssh/id_ed25519.pub"
+}
+
+images_apply_or_destroy() {
+  tf_images "$1" -auto-approve -input=false \
+    -var "aws_profile=$POC_AWS_PROFILE" -var "region=$POC_AWS_REGION" \
+    -var "azure_subscription_id=$AZURE_SUBSCRIPTION" -var "azure_tenant_id=$AZURE_TENANT" \
+    -var "azure_location=australiaeast"
+}
+
+check_repo_variables() {
+  local repo var value
+  for repo in "$@"; do
+    for var in AWS_ROLE_ARN AWS_REGION AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_LOCATION; do
+      value="$(gh variable get "$var" -R "$repo")" && [[ -n "$value" ]] || die "$repo is missing $var (DESIGN.md section 9)"
+      case "$var" in
+        AWS_ROLE_ARN) [[ "$value" == "arn:aws:iam::$POC_AWS_ACCOUNT:role/"* ]] || die "$repo uses an unexpected AWS role" ;;
+        AWS_REGION) [[ "$value" == "$POC_AWS_REGION" ]] || die "$repo uses an unexpected AWS region" ;;
+        AZURE_TENANT_ID) [[ "$value" == "$AZURE_TENANT" ]] || die "$repo uses an unexpected Azure tenant" ;;
+        AZURE_SUBSCRIPTION_ID) [[ "$value" == "$AZURE_SUBSCRIPTION" ]] || die "$repo uses an unexpected Azure subscription" ;;
+        AZURE_LOCATION) [[ "$value" == australiaeast ]] || die "$repo uses an unexpected Azure location" ;;
+      esac
+    done
+  done
+}
+
+# ---------------------------------------------------------------- image tier (SSH CA + golden images)
+
+ca_fingerprint_from_ssm() {
+  local key fp
+  key="$(aws ssm get-parameter --name /compute-factory/ssh-ca-pub --query Parameter.Value --output text)" || return 1
+  fp="$(printf '%s\n' "$key" | ssh-keygen -lf /dev/stdin | awk '{print $2}')" || return 1
+  [[ "$fp" =~ $CA_FINGERPRINT_RE ]] || return 1
+  printf '%s\n' "$fp"
+}
+
+# Create the CA and gallery if missing (otherwise a no-op) and print the CA fingerprint. The bake
+# reads the CA from SSM, so require SSM to hold exactly the key in this root's state.
+apply_images_root() {
+  local fp ssm
+  tf_images init -input=false -lockfile=readonly >"$GEN/logs/images-init.log" 2>&1 \
+    || { cat "$GEN/logs/images-init.log" >&2; warn "image tier Terraform init failed"; return 1; }
+  images_apply_or_destroy apply >"$GEN/logs/images-apply.log" 2>&1 \
+    || { tail -40 "$GEN/logs/images-apply.log" >&2; warn "image tier apply failed"; return 1; }
+  fp="$(tf_images output -raw ssh_ca_fingerprint)" && [[ "$fp" =~ $CA_FINGERPRINT_RE ]] \
+    || { warn "image tier returned no valid CA fingerprint"; return 1; }
+  ssm="$(ca_fingerprint_from_ssm)" && [[ "$ssm" == "$fp" ]] \
+    || { warn "SSM /compute-factory/ssh-ca-pub (${ssm:-unreadable}) does not match the CA in state ($fp)"; return 1; }
+  printf '%s\n' "$fp"
+}
+
+# Prints "<os> <version> <platform>" for each images.yaml row at a builder ref.
+image_rows() {
+  gh api -H 'Accept: application/vnd.github.raw' "repos/$BUILDER_REPO/contents/images.yaml?ref=$1" | python3 -c '
+import re, sys, yaml
+rows = yaml.safe_load(sys.stdin)
+if not isinstance(rows, list) or not rows:
+    sys.exit("images.yaml has no rows")
+for row in rows:
+    values = [str(row.get(key, "")) for key in ("os", "version", "platform")]
+    if not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", v) for v in values):
+        sys.exit(f"unexpected images.yaml row: {row}")
+    print(*values)
+'
+}
+
+# The gallery definition a release launches from (the platform repo's mapping, as Terraform uses it).
+azure_gallery_image() {
+  gh api -H 'Accept: application/vnd.github.raw' \
+    "repos/$PLATFORM_REPO/contents/terraform/platforms/azure/platform.json?ref=main" \
+    | jq -er --arg os "$1" --arg version "$2" \
+      '.os[$os].galleryImages[$version] | strings | select(test("^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"))'
+}
+
+# Prints "<image-id>\t<git-sha>\t<created>" for the image a new VM of this row would launch (the
+# newest one, as platform Terraform selects it), only if it is usable and trusts CA $4.
+current_image() {
+  local platform="$1" os="$2" version="$3" fp="$4" json def
+  case "$platform" in
+    aws)
+      json="$(aws ec2 describe-images --owners self --filters Name=tag:cf:os,Values="$os" \
+        Name=tag:cf:os-version,Values="$version" Name=tag:cf:managed,Values=true --output json)" || return 1
+      jq -er --arg fp "$fp" '.Images | sort_by(.CreationDate) | last
+        | select(. != null and .State == "available")
+        | (.Tags // [] | from_entries) as $t
+        | select($t["cf:poc"] == "true" and $t["cf:ssh-ca-fingerprint"] == $fp)
+        | [.ImageId, ($t["cf:git-sha"] // "unknown"), .CreationDate] | @tsv' <<<"$json"
+      ;;
+    azure)
+      def="$(azure_gallery_image "$os" "$version")" || { warn "no Azure gallery definition mapped for $os $version"; return 1; }
+      json="$(az_poc sig image-version list -g cf-images -r cfimages -i "$def" -o json)" || return 1
+      jq -er --arg fp "$fp" --arg os "$os" --arg version "$version" '
+        map(select(.publishingProfile.excludeFromLatest != true))
+        | sort_by(.name | split(".") | map(tonumber)) | last
+        | select(. != null and .provisioningState == "Succeeded")
+        | select(.tags["cf:poc"] == "true" and .tags["cf:ssh-ca-fingerprint"] == $fp
+            and .tags["cf:os"] == $os and .tags["cf:os-version"] == $version)
+        | [.id, (.tags["cf:git-sha"] // "unknown"), (.publishingProfile.publishedDate // "unknown")] | @tsv' <<<"$json"
+      ;;
+    *) warn "./poc cannot verify images for platform $platform"; return 1 ;;
+  esac
+}
+
+# Prints "<platform> <os> <version>\t<image-id>\t<git-sha>\t<created>" per images.yaml row at $2.
+# Fails unless every row has a current, usable image that trusts CA $1.
+current_images() {
+  local fp="$1" ref="$2" rows os version platform line failed=0
+  rows="$(image_rows "$ref")" || { warn "could not read images.yaml at builder $ref"; return 1; }
+  while read -r os version platform <&3; do
+    if line="$(current_image "$platform" "$os" "$version" "$fp")"; then
+      printf '%s %s %s\t%s\n' "$platform" "$os" "$version" "$line"
+    else
+      info "no current $platform $os $version image trusting CA $fp" >&2
+      failed=1
+    fi
+  done 3<<<"$rows"
+  return "$failed"
+}
+
+# Warn only: kept images are used even when builder main has moved on.
+report_images() {
+  local main row id sha created
+  main="$(gh api "repos/$BUILDER_REPO/commits/main" --jq .sha)" || { warn "could not read builder main"; main=; }
+  while IFS=$'\t' read -r row id sha created; do
+    info "$row: $id (built $created from builder ${sha:0:7})"
+    if [[ -n "$main" && "$sha" != "$main" ]]; then
+      warn "$row image is from builder ${sha:0:7}, main is ${main:0:7}; run ./poc up --images-only to rebake"
+    fi
+  done <<<"$1"
+}
+
+same_image() {
+  [[ "$(tr '[:upper:]' '[:lower:]' <<<"$1")" == "$(tr '[:upper:]' '[:lower:]' <<<"$2")" ]]
+}
+
+# After a verified bake, remove every other image of the same row so only the current one remains.
+prune_superseded() {
+  local platform="$1" os="$2" version="$3" keep="$4" json ami snaps s def versions v failed=0
+  case "$platform" in
+    aws)
+      json="$(aws ec2 describe-images --include-disabled --owners self --filters Name=tag:cf:poc,Values=true \
+        Name=tag:cf:managed,Values=true Name=tag:cf:os,Values="$os" Name=tag:cf:os-version,Values="$version" \
+        --output json)" || return 1
+      while IFS=$'\t' read -r ami snaps <&3; do
+        [[ "$ami" =~ ^ami-[0-9a-f]+$ && "$ami" != "$keep" ]] || continue
+        delete_aws "superseded AMI $ami" InvalidAMIID.NotFound aws ec2 deregister-image --image-id "$ami" \
+          || { failed=1; continue; }
+        for s in $snaps; do
+          delete_aws "its snapshot $s" InvalidSnapshot.NotFound aws ec2 delete-snapshot --snapshot-id "$s" || failed=1
+        done
+      done 3< <(jq -r '.Images[] | [.ImageId, ([.BlockDeviceMappings[]?.Ebs.SnapshotId // empty] | join(" "))] | @tsv' <<<"$json")
+      ;;
+    azure)
+      def="$(azure_gallery_image "$os" "$version")" || return 1
+      versions="$(az_poc sig image-version list -g cf-images -r cfimages -i "$def" --query '[].name' -o tsv)" || return 1
+      for v in $versions; do
+        [[ "$v" != "${keep##*/}" ]] || continue
+        info "deleting superseded Azure gallery version $def/$v (can take several minutes)"
+        az_poc sig image-version delete -g cf-images -r cfimages -i "$def" -e "$v" || failed=1
+      done
+      ;;
+  esac
+  [[ "$failed" == 0 ]]
+}
+
+# Print the kept image tier: CA fingerprint plus every POC image with its CA fingerprint and git SHA.
+list_image_tier() {
+  local fp def
+  if fp="$(ca_fingerprint_from_ssm 2>/dev/null)"; then info "SSH CA: $fp"; else info "SSH CA: none"; fi
+  # shellcheck disable=SC2016
+  aws ec2 describe-images --owners self --filters Name=tag:cf:poc,Values=true \
+    --query 'Images[].[ImageId,Name,CreationDate,Tags[?Key==`cf:ssh-ca-fingerprint`]|[0].Value,Tags[?Key==`cf:git-sha`]|[0].Value]' \
+    --output text | sed 's/^/    /'
+  for def in $(az_poc sig image-definition list -g cf-images -r cfimages --query '[].name' -o tsv 2>/dev/null); do
+    az_poc sig image-version list -g cf-images -r cfimages -i "$def" \
+      --query '[].[name,provisioningState,tags."cf:ssh-ca-fingerprint",tags."cf:git-sha"]' -o tsv | sed "s/^/    $def /"
+  done
 }
 
 # ---------------------------------------------------------------- up
@@ -272,7 +467,7 @@ watch_bake() {
 }
 
 run_bake() {
-  local id response
+  local fp="$1" id response
   # Never retry dispatch: a lost response could still have created a run.
   if ! response="$(gh api "repos/$BUILDER_REPO/actions/workflows/bake.yml/dispatches" \
         -f ref=main -F return_run_details=true)"; then
@@ -285,40 +480,52 @@ run_bake() {
   fi
   printf '%s\n' "$id" >"$GEN/bake-run-id" || return 1
   watch_bake "$id" || return $?
-  verify_bake_images "$id"
+  verify_bake_images "$id" "$fp"
 }
 
+# Every images.yaml row of the run's commit must have produced exactly one artifact that is now the
+# current usable image of its row and trusts CA $2. Then superseded images of that row are removed.
 verify_bake_images() (
-  local id="$1" tmp ami azure aws_state azure_state aws_manifest azure_manifest deadline
+  local id="$1" fp="$2" tmp sha rows os version platform name builder artifact expected line deadline failed=0
   tmp="$(mktemp -d "$GEN/bake.XXXXXX")" || return 1
   trap 'rm -rf "$tmp"' EXIT
-  aws_manifest=manifest-ubuntu-26.04-aws
-  azure_manifest=manifest-ubuntu-26.04-azure
-  gh run download "$id" -R "$BUILDER_REPO" -n "$aws_manifest" -n "$azure_manifest" -D "$tmp" \
-    || { warn "could not download image manifests from bake run $id"; return 1; }
-  ami="$(jq -er '[.builds[] | select(.builder_type == "amazon-ebs") | .artifact_id] | select(length == 1) | .[0]' \
-    "$tmp/$aws_manifest/packer-manifest.json")" || return 1
-  azure="$(jq -er '[.builds[] | select(.builder_type == "azure-arm") | .artifact_id] | select(length == 1) | .[0]' \
-    "$tmp/$azure_manifest/packer-manifest.json")" || return 1
-  [[ "$ami" =~ ^${POC_AWS_REGION}:ami-[0-9a-f]+$ ]] || { warn "unexpected AWS artifact: $ami"; return 1; }
-  [[ "$azure" =~ ^/subscriptions/${AZURE_SUBSCRIPTION}/resourceGroups/cf-images/providers/Microsoft\.Compute/galleries/cfimages/images/ubuntu/versions/[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-    || { warn "unexpected Azure artifact: $azure"; return 1; }
-  ami="${ami#*:}"
-  deadline=$((SECONDS + 120))
-  while (( SECONDS < deadline )); do
-    if aws_state="$(aws ec2 describe-images --owners self --image-ids "$ami" \
-      --filters Name=tag:cf:poc,Values=true Name=tag:cf:managed,Values=true Name=tag:cf:os-version,Values=26.04 \
-      --query 'Images[0].State' --output text)" && [[ "$aws_state" == available ]] \
-      && azure_state="$(az_poc sig image-version show -g cf-images -r cfimages -i ubuntu -e "${azure##*/}" \
-        --query provisioningState -o tsv)" \
-      && [[ "$azure_state" == Succeeded ]]; then
-      printf 'Bake %s images: %s and %s\n' "$id" "$ami" "$azure"
-      return 0
+  sha="$(gh run view "$id" -R "$BUILDER_REPO" --json headSha --jq .headSha)" && [[ "$sha" =~ ^[0-9a-f]{40}$ ]] \
+    || { warn "could not read the commit of bake run $id"; return 1; }
+  rows="$(image_rows "$sha")" || { warn "could not read images.yaml at builder $sha"; return 1; }
+  while read -r os version platform <&3; do
+    name="manifest-$os-$version-$platform"
+    case "$platform" in
+      aws) builder=amazon-ebs ;;
+      azure) builder=azure-arm ;;
+      *) warn "./poc cannot verify images for platform $platform"; failed=1; continue ;;
+    esac
+    if ! gh run download "$id" -R "$BUILDER_REPO" -n "$name" -D "$tmp/$name" </dev/null \
+      || ! artifact="$(jq -er --arg b "$builder" '[.builds[] | select(.builder_type == $b) | .artifact_id] | select(length == 1) | .[0]' \
+        "$tmp/$name/packer-manifest.json")"; then
+      warn "bake run $id has no single $builder artifact in $name"; failed=1; continue
     fi
-    sleep 5
-  done
-  warn "bake $id did not produce two usable images: $ami (${aws_state:-unknown}), $azure (${azure_state:-unknown})"
-  return 1
+    if [[ "$platform" == aws && "$artifact" =~ ^${POC_AWS_REGION}:ami-[0-9a-f]+$ ]]; then
+      expected="${artifact#*:}"
+    elif [[ "$platform" == azure && "$artifact" =~ ^/subscriptions/${AZURE_SUBSCRIPTION}/resourceGroups/cf-images/providers/Microsoft\.Compute/galleries/cfimages/images/[A-Za-z0-9._-]+/versions/[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      expected="$artifact"
+    else
+      warn "unexpected $platform artifact in $name: $artifact"; failed=1; continue
+    fi
+    deadline=$((SECONDS + 120))
+    while ! line="$(current_image "$platform" "$os" "$version" "$fp" 2>/dev/null)" \
+      || ! same_image "${line%%$'\t'*}" "$expected"; do
+      if (( SECONDS >= deadline )); then line=; break; fi
+      sleep 5
+    done
+    if [[ -z "$line" ]]; then
+      warn "bake $id: $platform $os $version artifact $expected is not the current usable image trusting CA $fp"
+      failed=1; continue
+    fi
+    printf 'Bake %s %s %s %s: %s\n' "$id" "$platform" "$os" "$version" "$expected"
+    prune_superseded "$platform" "$os" "$version" "$expected" \
+      || warn "could not remove every superseded $platform $os $version image; the next bake or down retries"
+  done 3<<<"$rows"
+  return "$failed"
 )
 
 # The catalog keeps entities in Postgres across redeploys; re-read every location now so changes to
@@ -409,10 +616,16 @@ cmd_prune_idp_images() {
   "$IDP_DIR/deploy/deploy.sh" --prune "$ip"
 }
 
+require_image_tools() {
+  require_tools ssh-keygen python3 "$@"
+  python3 -c 'import yaml' 2>/dev/null || die "python3 needs PyYAML (pip install pyyaml) to read images.yaml"
+  require_terraform_azure_auth || die "Terraform Azure authentication is required for the image tier"
+  require_split_layout
+}
+
 cmd_up() (
   log "Preflight"
-  require_tools docker scp dig
-  require_terraform_azure_auth || die "Terraform Azure authentication is required for up"
+  require_image_tools docker scp dig
   if ! docker info >/dev/null 2>&1 || ! docker buildx version >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
     die "Docker, buildx and Compose must be usable"
   fi
@@ -424,19 +637,8 @@ cmd_up() (
   [[ -s "$USERS_FILE" ]] || die "no IDP users; run ./poc set-password <user> first"
   # One-time Azure setup that survives down (DESIGN.md section 9).
   [[ -s "$ROOT/.poc-azure-reader.pem" ]] || die "missing $ROOT/.poc-azure-reader.pem (IDP Azure reader certificate; DESIGN.md section 9)"
-  local repo var value state ip bucket tmp
-  for repo in "$BUILDER_REPO" "$PLATFORM_REPO"; do
-    for var in AWS_ROLE_ARN AWS_REGION AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_LOCATION; do
-      value="$(gh variable get "$var" -R "$repo")" && [[ -n "$value" ]] || die "$repo is missing $var (DESIGN.md section 9)"
-      case "$var" in
-        AWS_ROLE_ARN) [[ "$value" == "arn:aws:iam::$POC_AWS_ACCOUNT:role/"* ]] || die "$repo uses an unexpected AWS role" ;;
-        AWS_REGION) [[ "$value" == "$POC_AWS_REGION" ]] || die "$repo uses an unexpected AWS region" ;;
-        AZURE_TENANT_ID) [[ "$value" == "$AZURE_TENANT" ]] || die "$repo uses an unexpected Azure tenant" ;;
-        AZURE_SUBSCRIPTION_ID) [[ "$value" == "$AZURE_SUBSCRIPTION" ]] || die "$repo uses an unexpected Azure subscription" ;;
-        AZURE_LOCATION) [[ "$value" == australiaeast ]] || die "$repo uses an unexpected Azure location" ;;
-      esac
-    done
-  done
+  local state ip bucket tmp fp images
+  check_repo_variables "$BUILDER_REPO" "$PLATFORM_REPO"
   tf_infra init -input=false -lockfile=readonly >/dev/null
   state="$(infra_state)" || die "cannot read local Terraform state; refusing to apply"
   [[ -z "$state" ]] || die "infra state already exists; use ./poc down only if you intend to destroy the POC"
@@ -450,10 +652,14 @@ cmd_up() (
   set_maintenance_gate 1 "$BUILDER_REPO" "$PLATFORM_REPO"
   workflow_action disable "${WORKFLOW_SPECS[@]}"
   verify_quiescent || die "cannot verify bootstrap freeze and workflow quiescence"
-  verify_cloud_clean || die "cannot prove a clean cloud/DNS starting point; inspect the checks above"
+  verify_cloud_clean 1 || die "cannot prove a clean cloud/DNS starting point (only the SSH CA and golden images may remain); inspect the checks above"
   verify_quiescent || die "resource workflows changed during preflight; refusing to apply"
 
-  log "Shared AWS infra (state bucket, SSH CA, IDP host, tokens)"
+  log "Image tier (SSH CA, Azure gallery)"
+  fp="$(apply_images_root)" || die "image tier not ready (see $GEN/logs/images-apply.log)"
+  info "SSH CA $fp"
+
+  log "Shared AWS infra (state bucket, IDP host, tokens)"
   infra_apply_or_destroy apply >"$GEN/logs/infra-apply.log" 2>&1 \
     || { tail -40 "$GEN/logs/infra-apply.log" >&2; die "infra apply failed"; }
   ip="$(tf_infra output -raw idp_ip)"; bucket="$(tf_infra output -raw state_bucket)"
@@ -464,13 +670,19 @@ cmd_up() (
   gh variable set TF_STATE_BUCKET -R "$PLATFORM_REPO" -b "$bucket"
   gh variable set BACKSTAGE_URL -R "$PLATFORM_REPO" -b "https://$DOMAIN"
   tf_infra output -raw backstage_token | gh secret set BACKSTAGE_TOKEN -R "$PLATFORM_REPO"
-  log "Bake and verify both golden images"
+  log "Golden images"
   set_maintenance_gate 0 "$BUILDER_REPO"
   verify_maintenance_gate 0 "$BUILDER_REPO" || die "builder maintenance gate did not open"
   workflow_action enable "$BUILDER_REPO:bake.yml"
-  info "live log: $GEN/logs/bake.log"
-  run_bake >"$GEN/logs/bake.log" 2>&1 \
-    || { tail -30 "$GEN/logs/bake.log" >&2; die "bake not verified; platform remains gated and the IDP is not published. Resources remain; use down only for intentional teardown."; }
+  if images="$(current_images "$fp" main)"; then
+    info "reusing images that trust this CA; no bake"
+  else
+    info "baking every images.yaml row; live log: $GEN/logs/bake.log"
+    run_bake "$fp" >"$GEN/logs/bake.log" 2>&1 \
+      || { tail -30 "$GEN/logs/bake.log" >&2; die "bake not verified; platform remains gated and the IDP is not published. Resources remain; use down only for intentional teardown."; }
+    images="$(current_images "$fp" main)" || die "baked images are not current for builder main; platform remains gated"
+  fi
+  report_images "$images"
 
   log "Enable VM stages and bootstrap IDP"
   workflow_action enable "$PLATFORM_REPO:stage.yml"
@@ -482,8 +694,50 @@ cmd_up() (
 
   log "Up"
   info "IDP:          https://$DOMAIN"
-  info "Golden image: $(tail -1 "$GEN/logs/bake.log")"
+  info "SSH CA:       $fp"
   info "IDP host:     ssh ubuntu@$ip"
+)
+
+# Bake and verify every images.yaml row, whether the POC is up or down. The builder gate and bake
+# workflow are returned to their previous state afterwards, also on failure.
+cmd_images_only() (
+  log "Preflight"
+  require_image_tools
+  check_repo_variables "$BUILDER_REPO"
+  local prev_gate prev_workflow fp images
+  prev_gate="$(gh variable get "$MAINTENANCE_VARIABLE" -R "$BUILDER_REPO")" || die "could not read the builder gate"
+  [[ "$prev_gate" == 0 || "$prev_gate" == 1 ]] || die "builder $MAINTENANCE_VARIABLE is '$prev_gate'; run up or down first"
+  prev_workflow="$(gh api "repos/$BUILDER_REPO/actions/workflows/bake.yml" --jq .state)" || die "could not read bake.yml state"
+  [[ "$prev_workflow" == active || "$prev_workflow" == disabled_manually ]] || die "unexpected bake.yml state: $prev_workflow"
+
+  log "Image tier (SSH CA, Azure gallery)"
+  fp="$(apply_images_root)" || die "image tier not ready (see $GEN/logs/images-apply.log)"
+  info "SSH CA $fp"
+
+  log "Bake every images.yaml row"
+  # shellcheck disable=SC2329 # invoked by the EXIT trap
+  restore_builder() {
+    local status=$?
+    trap - EXIT
+    log "Restore builder gate ($MAINTENANCE_VARIABLE=$prev_gate, bake.yml $prev_workflow)"
+    if [[ "$prev_workflow" == disabled_manually ]]; then workflow_action disable "$BUILDER_REPO:bake.yml"; fi
+    if [[ "$prev_gate" == 1 ]]; then
+      set_maintenance_gate 1 "$BUILDER_REPO"
+      verify_maintenance_gate 1 "$BUILDER_REPO" || die "could not restore the builder gate"
+      [[ "$status" == 0 ]] || warn "if the bake is still running, ./poc down cancels it and sweeps its build resources"
+    fi
+    exit "$status"
+  }
+  trap restore_builder EXIT
+  set_maintenance_gate 0 "$BUILDER_REPO"
+  verify_maintenance_gate 0 "$BUILDER_REPO" || die "builder maintenance gate did not open"
+  workflow_action enable "$BUILDER_REPO:bake.yml"
+  info "live log: $GEN/logs/bake.log"
+  run_bake "$fp" >"$GEN/logs/bake.log" 2>&1 \
+    || { tail -30 "$GEN/logs/bake.log" >&2; die "bake not verified; see $GEN/logs/bake.log"; }
+  images="$(current_images "$fp" main)" || die "baked images are not current for builder main"
+  log "Images"
+  report_images "$images"
 )
 
 # ---------------------------------------------------------------- down
@@ -874,15 +1128,15 @@ cmd_sweep_region() {
   AWS_REGION="$region" AWS_DEFAULT_REGION="$region" sweep_tagged_region "$exclude_infra" "$keep_images"
 }
 
-# Azure: every VM and Packer build has its own resource group tagged cf:poc=true; infra's is cf:module=infra.
+# Azure: every VM and Packer build has its own resource group tagged cf:poc=true; the image tier's
+# gallery group cf-images is cf:module=images.
 sweep_azure() {
-  local exclude_infra="$1" q groups g failed=0
+  local exclude_infra="$1" keep_gallery="$2" q groups g failed=0
   local queued=()
-  if [[ "$exclude_infra" == "1" ]]; then
-    q="[?tags.\"cf:poc\"=='true' && tags.\"cf:module\"!='infra' && name!='cf-images']"
-  else
-    q="[?tags.\"cf:poc\"=='true']"
-  fi
+  q="tags.\"cf:poc\"=='true'"
+  if [[ "$exclude_infra" == "1" ]]; then q+=" && tags.\"cf:module\"!='infra'"; fi
+  if [[ "$keep_gallery" == "1" ]]; then q+=" && tags.\"cf:module\"!='images' && name!='cf-images'"; fi
+  q="[?$q]"
   groups="$(az_poc group list --query "$q.name" -o tsv)" || return 1
   for g in $groups; do
     if az_poc group delete -n "$g" --yes --no-wait; then
@@ -908,7 +1162,7 @@ delete_image_versions() {
     *) warn "unexpected Azure response while checking for cf-images: $exists"; return 1 ;;
   esac
   az_poc group show -n cf-images --query tags -o json \
-    | jq -e '."cf:poc" == "true" and ."cf:module" == "infra"' >/dev/null \
+    | jq -e '."cf:poc" == "true" and ."cf:module" == "images"' >/dev/null \
     || { warn "cannot establish ownership of Azure resource group cf-images"; return 1; }
   gallery="$(az_poc sig list -g cf-images --query "[?name=='cfimages'].name" -o tsv)" || return 1
   [[ -n "$gallery" ]] || return 0
@@ -923,9 +1177,10 @@ delete_image_versions() {
   [[ "$failed" == 0 ]]
 }
 
-owned_infra_tags() {
-  jq -e 'any(.[]?; .Key == "cf:poc" and .Value == "true") and any(.[]?; .Key == "cf:module" and .Value == "infra")' >/dev/null
+owned_tags() { # $1 = cf:module value; reads an AWS tag list
+  jq -e --arg m "$1" 'any(.[]?; .Key == "cf:poc" and .Value == "true") and any(.[]?; .Key == "cf:module" and .Value == $m)' >/dev/null
 }
+owned_infra_tags() { owned_tags infra; }
 
 remove_empty_state_bucket() {
   local owned versions keys
@@ -943,12 +1198,18 @@ remove_empty_state_bucket() {
 }
 
 # Fallback when Terraform state was lost. Names are not sufficient proof of ownership.
+# $1 = 1 when the image tier (SSH CA) is being removed too.
 sweep_infra_orphans() {
-  local result secret policies p failed=0
+  local sweep_ca="$1" result secret module policies p failed=0
   for secret in compute-factory/ssh-ca compute-factory/azure-reader; do
+    module=infra
+    if [[ "$secret" == compute-factory/ssh-ca ]]; then
+      [[ "$sweep_ca" == 1 ]] || continue
+      module=images
+    fi
     if result="$(aws secretsmanager describe-secret --secret-id "$secret" --output json 2>&1)"; then
       if jq -e '.DeletedDate != null' <<<"$result" >/dev/null; then continue; fi
-      if ! jq '.Tags' <<<"$result" | owned_infra_tags \
+      if ! jq '.Tags' <<<"$result" | owned_tags "$module" \
         || ! delete_aws "$secret" ResourceNotFoundException aws secretsmanager delete-secret --secret-id "$secret" --force-delete-without-recovery; then
         warn "$secret not removed; check its ownership tags and deletion error"
         failed=1
@@ -957,8 +1218,10 @@ sweep_infra_orphans() {
       warn "cannot inspect $secret: $result"; failed=1
     fi
   done
-  if result="$(aws ssm list-tags-for-resource --resource-type Parameter --resource-id /compute-factory/ssh-ca-pub --output json 2>&1)"; then
-    if ! jq '.TagList' <<<"$result" | owned_infra_tags \
+  if [[ "$sweep_ca" != 1 ]]; then
+    :
+  elif result="$(aws ssm list-tags-for-resource --resource-type Parameter --resource-id /compute-factory/ssh-ca-pub --output json 2>&1)"; then
+    if ! jq '.TagList' <<<"$result" | owned_tags images \
       || ! delete_aws "CA public parameter" ParameterNotFound aws ssm delete-parameter --name /compute-factory/ssh-ca-pub; then
       warn "CA public parameter not removed; check its ownership tags and deletion error"
       failed=1
@@ -1057,15 +1320,23 @@ verify_tagged_instance_gone() {
   fi
 }
 
+# $1 = 1 to allow the image tier: golden AMIs/snapshots (cf:managed=true) and cf:module=images resources.
 verify_aws_region() {
-  local region="$1" tagged arn failed=0
+  local allow_images="$1" region="$2" tagged allowed=" " arn failed=0 ami_query snapshot_query
+  ami_query='Images[].ImageId'
+  snapshot_query='Snapshots[].SnapshotId'
+  if [[ "$allow_images" == 1 ]]; then
+    # Raw string literals: a JMESPath `true` literal is a boolean and never equals the tag value.
+    ami_query="Images[?!(Tags[?Key=='cf:managed'&&Value=='true'])].ImageId"
+    snapshot_query="Snapshots[?!(Tags[?Key=='cf:managed'&&Value=='true'])].SnapshotId"
+  fi
   verify_absent "AWS $region instances" "" aws ec2 describe-instances \
     --filters Name=tag:cf:poc,Values=true Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
     --query 'Reservations[].Instances[].InstanceId' --output text || failed=1
   verify_absent "AWS $region AMIs" "" aws ec2 describe-images --include-disabled --owners self \
-    --filters Name=tag:cf:poc,Values=true --query 'Images[].ImageId' --output text || failed=1
+    --filters Name=tag:cf:poc,Values=true --query "$ami_query" --output text || failed=1
   verify_absent "AWS $region snapshots" "" aws ec2 describe-snapshots --owner-ids self \
-    --filters Name=tag:cf:poc,Values=true --query 'Snapshots[].SnapshotId' --output text || failed=1
+    --filters Name=tag:cf:poc,Values=true --query "$snapshot_query" --output text || failed=1
   verify_absent "AWS $region volumes" "" aws ec2 describe-volumes \
     --filters Name=tag:cf:poc,Values=true --query 'Volumes[].VolumeId' --output text || failed=1
   verify_absent "AWS $region network interfaces" "" aws ec2 describe-network-interfaces \
@@ -1098,9 +1369,18 @@ verify_aws_region() {
   fi
   tagged="$(aws resourcegroupstaggingapi get-resources --tag-filters Key=cf:poc,Values=true \
     --query 'ResourceTagMappingList[].ResourceARN' --output text)" || return 1
+  if [[ "$allow_images" == 1 ]]; then
+    allowed+="$(aws resourcegroupstaggingapi get-resources --tag-filters Key=cf:poc,Values=true Key=cf:module,Values=images \
+      --query 'ResourceTagMappingList[].ResourceARN' --output text | tr '\t\n' '  ')" || return 1
+    allowed+=" $(aws resourcegroupstaggingapi get-resources --tag-filters Key=cf:poc,Values=true Key=cf:managed,Values=true \
+      --resource-type-filters ec2:image ec2:snapshot \
+      --query 'ResourceTagMappingList[].ResourceARN' --output text | tr '\t\n' '  ') " || return 1
+  fi
   while IFS= read -r arn; do
     [[ -n "$arn" ]] || continue
-    if verify_tagged_instance_gone "$region" "$arn"; then
+    if [[ "$allowed" == *" $arn "* ]]; then
+      : # kept image tier
+    elif verify_tagged_instance_gone "$region" "$arn"; then
       info "ignoring stale AWS tag entry for EC2 instance verified absent or terminated: $arn"
     else
       warn "AWS $region tagging API still reports a resource not verified gone: $arn"
@@ -1111,39 +1391,55 @@ verify_aws_region() {
 }
 
 verify_aws_regions() {
-  local regions
+  local allow_images="$1" regions
   # shellcheck disable=SC2016
   regions="$(aws ec2 describe-regions --all-regions \
     --query 'Regions[?OptInStatus==`opt-in-not-required` || OptInStatus==`opted-in`].RegionName' \
     --output text)" && [[ -n "$regions" ]] || { warn "could not enumerate AWS regions"; return 1; }
   printf '%s\n' "$regions" | xargs -n 1 -P "$AWS_REGION_PARALLEL" \
-    "$ROOT/poc" _verify_region
+    "$ROOT/poc" _verify_region "$allow_images"
 }
 
 cmd_verify_region() {
-  local region="$1"
-  AWS_REGION="$region" AWS_DEFAULT_REGION="$region" verify_aws_region "$region"
+  local allow_images="$1" region="$2"
+  AWS_REGION="$region" AWS_DEFAULT_REGION="$region" verify_aws_region "$allow_images" "$region"
 }
 
+# $1 = 1 to allow the image tier (SSH CA, cf-images gallery, golden AMIs and snapshots) to remain.
 verify_cloud_clean() {
-  local failed=0
-  verify_aws_regions || failed=1
+  local allow_images="$1" failed=0 lookup_stdout lookup_stderr
+  verify_aws_regions "$allow_images" || failed=1
 
   verify_absent "state bucket" "" find_state_bucket "$STATE_BUCKET" || failed=1
-  verify_absent "CA secret" ResourceNotFoundException aws secretsmanager describe-secret \
-      --secret-id compute-factory/ssh-ca --query ARN --output text || failed=1
-  verify_absent "CA public key parameter" ParameterNotFound aws ssm get-parameter \
-      --name /compute-factory/ssh-ca-pub --query Parameter.Name --output text || failed=1
+  if [[ "$allow_images" != 1 ]]; then
+    verify_absent "CA secret" ResourceNotFoundException aws secretsmanager describe-secret \
+        --secret-id compute-factory/ssh-ca --query ARN --output text || failed=1
+    verify_absent "CA public key parameter" ParameterNotFound aws ssm get-parameter \
+        --name /compute-factory/ssh-ca-pub --query Parameter.Name --output text || failed=1
+  fi
   verify_absent "IAM role cf-idp" NoSuchEntity aws iam get-role \
     --role-name cf-idp --query Role.RoleName --output text || failed=1
   verify_absent "IAM instance profile cf-idp" NoSuchEntity aws iam get-instance-profile \
     --instance-profile-name cf-idp --query InstanceProfile.InstanceProfileName --output text || failed=1
   verify_absent "Azure reader secret" ResourceNotFoundException aws secretsmanager describe-secret \
       --secret-id compute-factory/azure-reader --query ARN --output text || failed=1
-  verify_absent "Azure tagged groups" "" az_poc group list --query "[?tags.\"cf:poc\"=='true'].name" -o tsv || failed=1
-  verify_absent "Azure cf-images group" "" az_poc group list --query "[?name=='cf-images'].id" -o tsv || failed=1
-  verify_absent "Azure tagged resources" "" az_poc resource list \
-      --tag 'cf:poc=true' --query '[].id' -o tsv || failed=1
+  if [[ "$allow_images" != 1 ]]; then
+    verify_absent "Azure tagged groups" "" az_poc group list --query "[?tags.\"cf:poc\"=='true'].name" -o tsv || failed=1
+    verify_absent "Azure cf-images group" "" az_poc group list --query "[?name=='cf-images'].id" -o tsv || failed=1
+    verify_absent "Azure tagged resources" "" az_poc resource list \
+        --tag 'cf:poc=true' --query '[].id' -o tsv || failed=1
+  else
+    verify_absent "Azure tagged groups outside the image tier" "" az_poc group list \
+      --query "[?tags.\"cf:poc\"=='true' && tags.\"cf:module\"!='images' && name!='cf-images'].name" -o tsv || failed=1
+    # Resource IDs differ in resource group case; compare case-insensitively.
+    if capture_lookup az_poc resource list --tag 'cf:poc=true' --query '[].id' -o json; then
+      lookup_stdout="$(jq -r '.[] | select(ascii_downcase | contains("/resourcegroups/cf-images/") | not)' <<<"$lookup_stdout")" \
+        || { warn "could not parse Azure tagged resources"; failed=1; }
+      [[ -z "$lookup_stdout" ]] || { warn "Azure tagged resources outside cf-images: $lookup_stdout"; failed=1; }
+    else
+      warn "could not verify Azure tagged resources: $lookup_stderr"; failed=1
+    fi
+  fi
   verify_dns_absent || failed=1
   [[ "$failed" == 0 ]]
 }
@@ -1161,13 +1457,20 @@ verify_infra_state_empty() {
   [[ -z "$state" ]] || { warn "local Terraform state is not empty: $state"; return 1; }
 }
 
+verify_images_state_empty() {
+  local state
+  state="$(images_state)" || { warn "cannot read local image tier Terraform state"; return 1; }
+  [[ -z "$state" ]] || { warn "local image tier Terraform state is not empty: $state"; return 1; }
+}
+
 verify_clean() {
-  local pass=0 attempt started delay
+  local allow_images="$1" pass=0 attempt started delay
   verify_infra_state_empty || return 1
+  if [[ "$allow_images" != 1 ]]; then verify_images_state_empty || return 1; fi
   for ((attempt=1; attempt<=CLEAN_MAX_ATTEMPTS; attempt++)); do
     started=$SECONDS
     verify_quiescent || return 1
-    if verify_cloud_clean; then
+    if verify_cloud_clean "$allow_images"; then
       pass=$((pass + 1))
       info "clean cloud/DNS verification: $pass/$CLEAN_STABILITY_PASSES consecutive passes"
       if (( pass == CLEAN_STABILITY_PASSES )); then return 0; fi
@@ -1204,13 +1507,22 @@ clear_platform_wiring() {
   names="$(platform_wiring)" && [[ -z "$names" ]]
 }
 
+# $1 = --keep-images: keep the image tier (SSH CA, gallery, AMIs/snapshots, gallery versions).
 cmd_down() (
+  local retain=0
+  case "${1:-}" in
+    "") ;;
+    --keep-images) retain=1 ;;
+    *) die "usage: ./poc down [--keep-images]" ;;
+  esac
   log "Preflight"
   require_tools dig
+  require_split_layout
   if [[ ! "$PARALLEL_DESTROYS" =~ ^[1-9][0-9]?$ ]] || (( PARALLEL_DESTROYS > 20 )); then
     die "PARALLEL_DESTROYS must be between 1 and 20"
   fi
-  local tmp PLATFORM_DIR keep_bucket=0 keep_images=0 gallery_ok=0 tf_ready=0 azure_auth=0 aws_pid state wiring dns_ok=0
+  local tmp PLATFORM_DIR keep_bucket=0 keep_images="$retain" azure_ok=0 versions_ok=0 images_done=0
+  local infra_tf=0 images_tf=0 aws_pid state wiring dns_ok=0
   tmp="$(mktemp -d "$GEN/down.XXXXXX")"
   trap 'rm -rf "$tmp"' EXIT
   PLATFORM_DIR="$tmp/platform"
@@ -1242,10 +1554,13 @@ cmd_down() (
 
   log "Sweep owned AWS leftovers and Azure VM/build groups"
   sweep_tagged 1 "$keep_images" & aws_pid=$!
-  if sweep_azure 1 && [[ "$keep_images" == 0 ]] && delete_image_versions; then
-    gallery_ok=1
-  else
-    warn "Azure gallery will be preserved until VM/build groups and image versions are reconciled"
+  if sweep_azure 1 1; then azure_ok=1; else warn "Azure VM/build groups remain; the image tier is preserved"; fi
+  if [[ "$azure_ok" == 1 && "$keep_images" == 0 ]]; then
+    if delete_image_versions; then
+      versions_ok=1
+    else
+      warn "Azure gallery versions remain; the SSH CA and gallery are preserved until they are reconciled"
+    fi
   fi
   wait "$aws_pid" || warn "some owned AWS resources could not be swept; a final sweep and verification follow"
 
@@ -1253,36 +1568,57 @@ cmd_down() (
   if dns_apply ""; then dns_ok=1; else warn "DNS removal failed (see $GEN/logs/dns.log)"; fi
 
   log "Destroy shared infra"
-  if [[ "$keep_bucket" == 0 && "$gallery_ok" == 1 ]]; then
+  if [[ "$keep_bucket" == 0 ]]; then
     if tf_infra init -input=false -lockfile=readonly >"$GEN/logs/infra-init.log" 2>&1; then
-      tf_ready=1
+      infra_tf=1
     else
       warn "shared Terraform init failed (see $GEN/logs/infra-init.log); using the owned-resource sweep"
     fi
-    if [[ "$tf_ready" == 1 ]] && state="$(infra_state)" && [[ -n "$state" ]] && require_terraform_azure_auth; then
-      azure_auth=1
+    if [[ "$infra_tf" == 1 ]] && state="$(infra_state)" && [[ -n "$state" ]]; then
       if ! infra_apply_or_destroy destroy >"$GEN/logs/infra-destroy.log" 2>&1; then
         tail -30 "$GEN/logs/infra-destroy.log" >&2
         warn "Terraform destroy failed; sweeping independently and then retrying the local state"
       fi
     fi
   fi
+  if [[ "$versions_ok" == 1 ]]; then
+    log "Destroy image tier (SSH CA, Azure gallery)"
+    if ! tf_images init -input=false -lockfile=readonly >"$GEN/logs/images-init.log" 2>&1; then
+      warn "image tier Terraform init failed (see $GEN/logs/images-init.log); using the owned-resource sweep"
+    elif state="$(images_state)" && [[ -n "$state" ]] && require_terraform_azure_auth; then
+      images_tf=1
+      if ! images_apply_or_destroy destroy >"$GEN/logs/images-destroy.log" 2>&1; then
+        tail -30 "$GEN/logs/images-destroy.log" >&2
+        warn "image tier Terraform destroy failed; sweeping independently and then retrying the local state"
+      fi
+    fi
+  elif [[ "$retain" == 1 ]]; then
+    info "keeping the image tier (--keep-images)"
+  fi
   sweep_tagged 0 "$keep_images" & aws_pid=$!
-  if [[ "$gallery_ok" == 1 ]]; then sweep_azure 0 || warn "final Azure sweep failed"; fi
+  if [[ "$azure_ok" == 1 ]]; then
+    sweep_azure 0 "$((1 - versions_ok))" || { azure_ok=0; warn "final Azure sweep failed"; }
+  fi
   wait "$aws_pid" || warn "final AWS regional sweep failed"
-  sweep_infra_orphans || warn "some shared AWS fallbacks failed"
-  if [[ "$azure_auth" == 1 ]] && ! verify_infra_state_empty; then
+  sweep_infra_orphans "$versions_ok" || warn "some shared AWS fallbacks failed"
+  if [[ "$infra_tf" == 1 ]] && ! verify_infra_state_empty; then
     infra_apply_or_destroy destroy >>"$GEN/logs/infra-destroy.log" 2>&1 \
       || warn "shared Terraform state still needs recovery (see $GEN/logs/infra-destroy.log)"
   fi
+  if [[ "$images_tf" == 1 ]] && ! verify_images_state_empty; then
+    images_apply_or_destroy destroy >>"$GEN/logs/images-destroy.log" 2>&1 \
+      || warn "image tier Terraform state still needs recovery (see $GEN/logs/images-destroy.log)"
+  fi
 
-  if [[ "$keep_bucket" == 1 || "$gallery_ok" == 0 || "$dns_ok" == 0 ]]; then
+  # Requested retention only needs the VM/build groups gone; full teardown also needs the gallery versions.
+  if [[ "$retain" == 1 ]]; then images_done="$azure_ok"; else images_done="$versions_ok"; fi
+  if [[ "$keep_bucket" == 1 || "$azure_ok" == 0 || "$images_done" == 0 || "$dns_ok" == 0 ]]; then
     log "Report remaining cloud/DNS resources"
-    verify_cloud_clean || true
+    verify_cloud_clean "$retain" || true
     die "NOT CLEAN: teardown retained recovery state or could not complete Azure/DNS cleanup. Fix the reported blocker and rerun down."
   fi
   log "Verify cloud, DNS and local state"
-  verify_clean || die "NOT CLEAN: state remains, workflows are active, or required cloud/DNS checks did not pass"
+  verify_clean "$retain" || die "NOT CLEAN: state remains, workflows are active, or required cloud/DNS checks did not pass"
 
   log "Clear and verify GitHub wiring and inventory"
   clear_platform_wiring || die "NOT CLEAN: platform GitHub wiring could not be cleared and verified"
@@ -1293,7 +1629,13 @@ cmd_down() (
   fi
   verify_quiescent || die "NOT CLEAN: resource workflows are no longer quiescent"
   wiring="$(platform_wiring)" && [[ -z "$wiring" ]] || die "NOT CLEAN: platform GitHub wiring remains or could not be read"
-  printf '\n\033[32mCLEAN: POC cloud resources, DNS, Terraform state, GitHub wiring and inventory verified.\033[0m\n'
+  if [[ "$retain" == 1 ]]; then
+    log "Kept image tier"
+    list_image_tier
+    printf '\n\033[32mCLEAN (images retained): POC cloud resources, DNS, Terraform state, GitHub wiring and inventory verified; the SSH CA and golden images above remain.\033[0m\n'
+  else
+    printf '\n\033[32mCLEAN: POC cloud resources, DNS, Terraform state, GitHub wiring and inventory verified.\033[0m\n'
+  fi
 )
 
 # ---------------------------------------------------------------- users
@@ -1336,20 +1678,14 @@ cmd_status() {
   else
     info "none"
   fi
-  log "Golden images"
-  aws ec2 describe-images --owners self --filters Name=tag:cf:poc,Values=true \
-    --query 'Images[].[ImageId,Name,CreationDate]' --output text | sed 's/^/    /'
+  log "Image tier: SSH CA and golden images (id, name/state, created, CA fingerprint, git SHA)"
+  list_image_tier
   log "Instances tagged cf:poc=true"
   # shellcheck disable=SC2016
   aws ec2 describe-instances --filters Name=tag:cf:poc,Values=true Name=instance-state-name,Values=pending,running,stopping,stopped \
     --query 'Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress,Tags[?Key==`Name`]|[0].Value]' --output text | sed 's/^/    /'
   log "Azure resource groups tagged cf:poc=true"
   az group list --query "[?tags.\"cf:poc\"=='true'].[name,properties.provisioningState]" -o tsv | sed 's/^/    /'
-  log "Azure golden images"
-  local def
-  for def in $(az sig image-definition list -g cf-images -r cfimages --query '[].name' -o tsv 2>/dev/null); do
-    az sig image-version list -g cf-images -r cfimages -i "$def" --query '[].[name,provisioningState]' -o tsv | sed "s/^/    $def /"
-  done
   log "VM state files"
   aws s3 ls "s3://cf-tfstate-134584031874-apse2/vms/" --recursive 2>/dev/null | sed 's/^/    /' || info "no bucket"
   log "Active pipeline runs"
@@ -1401,8 +1737,13 @@ cmd_run() {
 }
 
 case "${1:-}" in
-  up|down)
-    [[ $# == 1 ]] || die "usage: ./poc $1 (no options)"
+  up)
+    [[ $# == 1 || ( $# == 2 && "$2" == --images-only ) ]] || die "usage: ./poc up [--images-only]"
+    acquire_poc_lock "$@"
+    prepare_lifecycle
+    ;;
+  down)
+    [[ $# == 1 || ( $# == 2 && "$2" == --keep-images ) ]] || die "usage: ./poc down [--keep-images]"
     acquire_poc_lock "$@"
     prepare_lifecycle
     ;;
@@ -1416,11 +1757,11 @@ case "${1:-}" in
 esac
 
 case "${1:-}" in
-  up)          cmd_up ;;
+  up)          if [[ "${2:-}" == --images-only ]]; then cmd_images_only; else cmd_up; fi ;;
   logs)        shift; cmd_logs "$@" ;;
   task)        shift; cmd_task "$@" ;;
   run)         shift; cmd_run "$@" ;;
-  down)        cmd_down ;;
+  down)        cmd_down "${2:-}" ;;
   status)      cmd_status ;;
   watch-bake)  command -v gh >/dev/null || die "missing tool: gh"
                command -v jq >/dev/null || die "missing tool: jq"
@@ -1431,5 +1772,5 @@ case "${1:-}" in
   _destroy_vm) shift; PLATFORM_DIR="${CF_POC_PLATFORM_DIR:?}"; cmd_destroy_vm "$@" ;;
   _sweep_region) shift; cmd_sweep_region "$@" ;;
   _verify_region) shift; cmd_verify_region "$@" ;;
-  *) echo "usage: $0 up|down|status|deploy-idp [<image-id>]|prune-idp-images|set-password <user>|watch-bake <run-id>|logs [service] [since]|task <task-id>|run <run-id>" >&2; exit 2 ;;
+  *) echo "usage: $0 up [--images-only]|down [--keep-images]|status|deploy-idp [<image-id>]|prune-idp-images|set-password <user>|watch-bake <run-id>|logs [service] [since]|task <task-id>|run <run-id>" >&2; exit 2 ;;
 esac

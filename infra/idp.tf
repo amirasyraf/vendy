@@ -53,7 +53,8 @@ resource "aws_iam_role_policy" "idp_read_ca" {
     Statement = [{
       Effect   = "Allow"
       Action   = "secretsmanager:GetSecretValue"
-      Resource = aws_secretsmanager_secret.ssh_ca.arn
+      # The CA secret belongs to the images/ root; match its name plus Secrets Manager's 6-character suffix.
+      Resource = "arn:aws:secretsmanager:${var.region}:${local.account_id}:secret:${local.ssh_ca_secret}-??????"
     }]
   })
 }

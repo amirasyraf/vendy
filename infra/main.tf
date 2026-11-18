@@ -1,12 +1,11 @@
 terraform {
   required_version = ">= 1.10"
   required_providers {
-    aws     = { source = "hashicorp/aws", version = "~> 6.0" }
-    tls     = { source = "hashicorp/tls", version = "~> 4.0" }
-    random  = { source = "hashicorp/random", version = "~> 3.6" }
-    azurerm = { source = "hashicorp/azurerm", version = "~> 4.0" }
+    aws    = { source = "hashicorp/aws", version = "~> 6.0" }
+    random = { source = "hashicorp/random", version = "~> 3.6" }
   }
-  # Local state on purpose: nothing remote may outlive `./poc down`.
+  # Local state on purpose: nothing remote may outlive `./poc down`. The SSH CA and image gallery
+  # are in the separate images/ root, which `./poc down --keep-images` keeps.
 }
 
 provider "aws" {
@@ -46,4 +45,5 @@ data "aws_caller_identity" "current" {}
 locals {
   account_id   = data.aws_caller_identity.current.account_id
   state_bucket = "cf-tfstate-${local.account_id}-apse2"
+  ssh_ca_secret = "compute-factory/ssh-ca" # created by infra/images
 }
