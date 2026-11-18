@@ -41,7 +41,7 @@ AWS remains the shared base (SSH CA, Terraform state bucket, IDP host); Azure ho
 | Location | `australiaeast` |
 | GHA identity (OIDC) | Entra app `cf-github-actions` (`2e6cce7d-…`), Contributor on the subscription; federated subjects `repo:amirasyraf@15522007/compute-factory-{builder@1458285691,platform@1458285776}:ref:refs/heads/main` |
 | GHA repo variables (builder + platform) | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_LOCATION` |
-| Image gallery | resource group `cf-images`, gallery `cfimages`, definition per OS (`ubuntu`: Linux, Gen2, x64, NVMe + SCSI); created by `infra/azure.tf` |
+| Image gallery | resource group `cf-images`, gallery `cfimages`, one definition per OS release (`ubuntu`: Ubuntu 26.04, Linux, Gen2, x64, NVMe + SCSI); the current definition is created by `infra/azure.tf` |
 | Per-VM resources | resource group `cf-vm-<name>`; VNet, subnet, NSG (tcp/22 from anywhere), static Standard public IP, NIC and VM all named `cf-<name>` |
 | IDP reader | service principal `cf-idp-azure-reader` (Reader, certificate); Secrets Manager `compute-factory/azure-reader`, `SecretString` JSON `{tenantId, clientId, subscriptionId, location, certificatePem}` |
 | Laptop admin | service principal `cf-admin-local` (Owner, certificate; `ARM_*` in `~/.zshrc`) for `infra/` and `./poc` |

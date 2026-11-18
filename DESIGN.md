@@ -183,7 +183,7 @@ Bake does:
    `cf:os=ubuntu`, `cf:os-family=linux`, `cf:os-version=26.04`, `cf:managed=true`, `cf:git-sha=<sha>`.
    On Azure, after `waagent -deprovision+user`, a gallery image version `1.<YYYYMMDD>.<hhmmss>` of
    definition `ubuntu` (NVMe-capable: the sizes with quota in the region are NVMe-only), with the same
-   tags; Terraform launches the definition's latest version.
+   tags; Terraform launches the latest bake from the definition mapped to the selected OS release.
 
 Platform agnosticism: Packer `-only=<source>.<os>` comes from the matrix. Adding a platform means
 adding a source file, a matrix row and its case in the workflow's source selector. Ansible roles branch on `ansible_os_family` (Windows tasks go in
@@ -257,7 +257,7 @@ docker: { linux: docker.io, windows: null }
 
 | Inputs | Outputs |
 |---|---|
-| `name`, `os`, `size` (XS/S/M/L) or `instance_type`, `owner`, `tags` | `public_ip`, `ssh_user`, `instance_id`, `instance_type` |
+| `name`, `os`, `image_version`, `size` (XS/S/M/L) or `instance_type`, `team`, `cloud_tags` | `public_ip`, `ssh_user`, `instance_id`, `instance_type` |
 
 - Each platform maps sizes in one data file. AWS: `sizes.json` (XS=`t3.micro`, S=`t3.small`,
   M=`t3.medium`, L=`t3.large`; all 2 vCPU, 1/2/4/8 GiB). Azure: `Standard_D2ls_v6`, `D2s_v6`,
@@ -270,8 +270,9 @@ docker: { linux: docker.io, windows: null }
   without enough free vCPU quota (family and regional) are greyed out as "Over vCPU quota". The choice
   is stored as `compute.instanceType`. Demo mode greys out everything except the types some platform's
   `sizes.json` maps a size to, and the IDP backend enforces it. VM pages show the launched type.
-- Image lookup: AWS `data "aws_ami"` with `cf:os=<os>`, `cf:managed=true`, `most_recent`; Azure the
-  gallery definition `cf-images/cfimages/<os>` (latest version). Both ignore image changes after launch.
+- Image lookup: AWS `data "aws_ami"` with `cf:os=<os>`, `cf:os-version=<imageVersion>`,
+  `cf:managed=true`, `most_recent`; Azure uses the latest bake in the definition mapped to the
+  selected release. Both ignore image changes after launch.
 - `ssh_user` comes from the OS entry in `platform.json`: `ubuntu` for Ubuntu, `Administrator` for Windows later.
 - State: S3 bucket `cf-tfstate-134584031874-apse2`, key `vms/<platform>/<name>/terraform.tfstate`, S3 native
   locking (`use_lockfile = true`). The workflow passes the key through `-backend-config`.
