@@ -33,12 +33,19 @@ cp poc.env.example .poc.env   # once: Backstage PAT
 ./poc up                      # ~15-20 min: infra, GitHub wiring, bake, IDP deploy
 ./poc status                  # what exists right now
 ./poc watch-bake <run-id>      # monitor an existing bake; never dispatches another
-./poc deploy-idp              # rebuild + redeploy Backstage on the existing host
+./poc deploy-idp              # build and deploy Backstage on the existing host
+./poc deploy-idp "$image"     # ship an already-built image by its full sha256 image ID
+./poc prune-idp-images         # explicit maintenance: collect old registry blobs and dangling IDP images
 ./poc logs [backstage|caddy|postgres|all] [since]   # IDP container logs (default backstage, 30m)
 ./poc task <task-id>          # Scaffolder task status + stored events from Postgres
 ./poc run <run-id>            # VM orchestrator run + stage state (attempts, GitHub run IDs, errors)
 ./poc down                    # ~5-10 min: cancels runs, destroys all VMs, sweeps, destroys infra, verifies CLEAN
 ```
+
+For an application change, [build and smoke-check one local image](../compute-factory-idp/README.md#checks)
+and pass its image ID to `./poc deploy-idp`. Routine releases use the existing DNS and Caddy storage,
+do not run image cleanup, and report stage timings. Start with the hot-reload dev server for layout
+iterations.
 
 Bake monitoring polls GitHub every 30 seconds and retries status-read errors. A temporary API timeout
 does not mean the workflow failed. Monitoring stops after 10 consecutive read errors or one hour,

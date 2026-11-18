@@ -292,7 +292,8 @@ backstage/                     # npx @backstage/create-app@latest
 deploy/                        # (the IDP EC2 itself is created by the compute-factory repo's infra/, see 12)
   docker-compose.yml           # caddy, backstage, postgres
   Caddyfile
-  deploy.sh                    # local: build image (linux/arm64) -> push changed layers to host-local registry via SSH tunnel -> compose up -d
+  build.sh                     # build one linux/arm64 image, print its immutable local ID
+  deploy.sh                    # ship a prebuilt image or build if omitted; verify the remote image ID
   .env.example                 # IDP_USERS_B64 (password hashes), integration token, PG password,
                                # static token for the GHA -> catalog refresh call
                                # (no CA key here; it's read from Secrets Manager via the instance role)
@@ -726,11 +727,11 @@ compute-factory/                 # 4th repo: the "home" of the POC
      discovery reports an unknown outcome, not a failed workflow. After confirmed success, query AWS
      for the latest managed Ubuntu AMI and Azure for the latest gallery version.
    - B. **IDP**:
-     - DNS: targeted apply of the `idp` record in `~/projects/cloudflare/amirasyraf.dev`, with the EIP passed in;
+      - DNS: targeted apply of the `idp` record in `~/projects/cloudflare/amirasyraf.dev`, with the EIP passed in; restore saved Caddy TLS storage if present;
      - write `.env` from Terraform outputs and `.poc.env`;
      - run `compute-factory-idp/deploy/deploy.sh`: build the image locally, ship it, `docker compose up -d`;
-      - wait for `https://idp.amirasyraf.dev/.backstage/health/v1/readiness` to return 200, which proves
-        the Backstage runtime and Caddy/TLS path are healthy.
+       - wait for `https://idp.amirasyraf.dev/.backstage/health/v1/readiness` to return 200, which proves
+         the Backstage runtime and Caddy/TLS path are healthy.
 5. **Done**: print the URL and a summary of what was created.
 
 On failure or an unknown bake outcome, `up` leaves resources and workflows in place and still waits
@@ -740,6 +741,12 @@ changing GitHub wiring or resetting inventory. It exits 0 for success, 1 for a c
 conclusion, and 2 for an unknown outcome. It does not check IDP health or AMI existence. If the run ID
 was not discovered, find it in the builder's Actions page first. Do not rerun `up` to reconnect a
 watcher; it is not a resume command. `down` is intentional teardown, not a monitoring recovery step.
+
+Routine `./poc deploy-idp [<image-id>]` skips infrastructure setup and image cleanup. Build with
+`compute-factory-idp/deploy/build.sh`, smoke-test that local image ID, and pass the same ID to deploy
+without rebuilding. The existing host runs the packaged Compose/Caddy config and is health-checked.
+Run `./poc prune-idp-images` separately when the dedicated host needs disk space; the registry pauses
+for garbage collection but the running application stays up.
 
 ### 12.3 `./poc down` (about 5–10 min)
 

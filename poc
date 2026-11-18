@@ -3,7 +3,8 @@
 #   ./poc up       create everything (assumes a clean slate)
 #   ./poc down     destroy everything, including user VMs, then verify nothing tagged cf:poc=true remains
 #   ./poc status   read-only overview
-#   ./poc deploy-idp   rebuild and redeploy Backstage onto the existing IDP host
+#   ./poc deploy-idp [<image-id>]  deploy to the existing host, building only when no artifact is supplied
+#   ./poc prune-idp-images        explicitly collect old IDP registry blobs and dangling IDP images
 #   ./poc watch-bake <run-id>   monitor an existing bake without dispatching another
 #   ./poc set-password <user>   add/change an IDP login (hash stored in .poc-users)
 #   ./poc logs [backstage|caddy|postgres|all] [since]   IDP container logs (default: backstage, 30m)
@@ -110,10 +111,11 @@ dns_apply() { # $1 = ip or empty (remove)
 }
 
 write_idp_env() {
+  local file=$1
   # shellcheck disable=SC1091
   set -a; source "$ROOT/.poc.env"; set +a
   umask 077
-  cat >"$GEN/idp.env" <<EOF
+  cat >"$file" <<EOF
 IDP_DOMAIN=$DOMAIN
 IDP_USERS_B64=$(base64 <"$USERS_FILE" | tr -d '\n')
 GITHUB_TOKEN=$GITHUB_TOKEN
@@ -202,26 +204,70 @@ refresh_catalog_locations() {
   echo "catalog locations refreshed"
 }
 
-deploy_idp() {
-  local ip="$1"
-  wait_for_ssh_ready "$ip"
-  echo "host ready"
-  dns_apply "$ip"
-  echo "dns: $DOMAIN -> $ip"
-  write_idp_env
-  restore_caddy_data "$ip"
-  "$IDP_DIR/deploy/deploy.sh" "$ip" "$GEN/idp.env"
+deploy_idp() (
+  local ip="$1" mode="$2" image="${3:-}" env_file start deadline
+  env_file=$(mktemp "$GEN/idp.env.XXXXXX")
+  trap 'rm -f "$env_file"' EXIT
+  if [[ "$mode" == bootstrap ]]; then
+    wait_for_ssh_ready "$ip"
+    echo "host ready"
+    dns_apply "$ip"
+    echo "dns: $DOMAIN -> $ip"
+    restore_caddy_data "$ip"
+  fi
+  start=$SECONDS
+  write_idp_env "$env_file"
+  echo "Prepare IDP configuration: $((SECONDS - start))s"
+  if [[ -n "$image" ]]; then
+    "$IDP_DIR/deploy/deploy.sh" "$ip" "$env_file" "$image"
+  else
+    "$IDP_DIR/deploy/deploy.sh" "$ip" "$env_file"
+  fi
+  start=$SECONDS
+  deadline=$((SECONDS + 600))
   echo "waiting for $HEALTH_URL"
-  for _ in $(seq 1 60); do
-    if [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$HEALTH_URL" || true)" == "200" ]]; then
+  while (( SECONDS < deadline )); do
+    if [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$HEALTH_URL" || true)" == "200" ]]; then
       echo "IDP healthy"
+      echo "Wait for readiness: $((SECONDS - start))s"
+      start=$SECONDS
       refresh_catalog_locations
+      echo "Refresh catalog: $((SECONDS - start))s"
       return 0
     fi
-    sleep 10
+    sleep 2
   done
   echo "IDP not healthy after 10 min" >&2
   return 1
+)
+
+existing_idp_ip() {
+  local ip
+  ip="$(infra_out idp_ip)"
+  [[ -n "$ip" ]] || die "no IDP host in local infra state; run ./poc up first"
+  printf '%s\n' "$ip"
+}
+
+cmd_deploy_idp() {
+  [[ $# -le 1 ]] || die "usage: ./poc deploy-idp [<sha256:image-id>]"
+  if [[ $# -eq 1 && ! "$1" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    die "pass the full image ID printed by compute-factory-idp/deploy/build.sh"
+  fi
+  local tool ip
+  for tool in terraform docker curl jq ssh scp; do
+    command -v "$tool" >/dev/null || die "missing tool: $tool"
+  done
+  [[ -s "$USERS_FILE" ]] || die "no IDP users; run ./poc set-password <user> first"
+  [[ -s "$ROOT/.poc.env" ]] || die "missing $ROOT/.poc.env"
+  ip="$(existing_idp_ip)"
+  deploy_idp "$ip" routine "${1:-}"
+}
+
+cmd_prune_idp_images() {
+  [[ $# -eq 0 ]] || die "usage: ./poc prune-idp-images"
+  local ip
+  ip="$(existing_idp_ip)"
+  "$IDP_DIR/deploy/deploy.sh" --prune "$ip"
 }
 
 cmd_up() {
@@ -260,7 +306,7 @@ cmd_up() {
 
   log "Bake golden image + deploy IDP (in parallel)"
   run_bake   >"$GEN/logs/bake.log" 2>&1 & local bake_pid=$!
-  deploy_idp "$ip" >"$GEN/logs/idp.log" 2>&1 & local idp_pid=$!
+  deploy_idp "$ip" bootstrap >"$GEN/logs/idp.log" 2>&1 & local idp_pid=$!
   info "logs: $GEN/logs/bake.log, $GEN/logs/idp.log"
   local rc=0
   local bake_rc=0
@@ -667,10 +713,8 @@ case "${1:-}" in
                command -v jq >/dev/null || die "missing tool: jq"
                watch_bake "${2:-}" ;;
   set-password) shift; cmd_set_password "$@" ;;
-  deploy-idp)  require_tools docker; terraform -chdir="$INFRA_DIR" init -input=false >/dev/null
-               infra_has_state || die "no infra; run ./poc up"
-               [[ -s "$USERS_FILE" ]] || die "no IDP users; run ./poc set-password <user> first"
-               deploy_idp "$(infra_out idp_ip)" ;;
+  deploy-idp)  shift; cmd_deploy_idp "$@" ;;
+  prune-idp-images) shift; cmd_prune_idp_images "$@" ;;
   _destroy_vm) shift; cmd_destroy_vm "$@" ;;
-  *) echo "usage: $0 up|down|status|deploy-idp|set-password <user>|watch-bake <run-id>|logs [service] [since]|task <task-id>|run <run-id>" >&2; exit 2 ;;
+  *) echo "usage: $0 up|down|status|deploy-idp [<image-id>]|prune-idp-images|set-password <user>|watch-bake <run-id>|logs [service] [since]|task <task-id>|run <run-id>" >&2; exit 2 ;;
 esac

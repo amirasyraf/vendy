@@ -600,15 +600,21 @@ type ObservedVm = {
 - EC2: Ubuntu 26.04 **arm64** (t4g.medium). Cloud-init installs Docker Engine + compose plugin, puts
   `ubuntu` in the `docker` group, and creates `/opt/idp` owned by `ubuntu`. IMDSv2 has hop limit 2.
 - SSH: `ssh -i ~/.ssh/id_ed25519 ubuntu@<ip>` (EC2 key pair from that key).
-- `compute-factory-idp/deploy/deploy.sh <host> <env-file>`:
-  - builds image `compute-factory-idp:latest` for `linux/arm64` locally;
-  - copies `docker-compose.yml`, `Caddyfile` and `<env-file>` (as `.env`) to `/opt/idp`;
+- `compute-factory-idp/deploy/build.sh` builds and type-checks a local `linux/arm64` image, tags it
+  `compute-factory-idp:latest`, and prints the full `sha256:` image ID on stdout (logs and timings on
+  stderr). `IDP_IMAGE=<image-id>` pins the local smoke check to that image.
+- `compute-factory-idp/deploy/deploy.sh <host> <env-file> [<image-id>]`:
+  - ships a supplied local IDP image directly; if omitted, builds first using `deploy/build.sh`;
+  - copies the image's packaged `docker-compose.yml` and `Caddyfile`, plus `<env-file>` as `.env`, to `/opt/idp`;
   - starts the host-local `registry` service (`127.0.0.1:15000` on the host only) and pushes the
     image to it through an SSH tunnel (only missing layers transfer);
-  - runs `docker compose pull backstage` and `docker compose up -d`, reloads Caddy, then
-    garbage-collects the registry and prunes unused host images.
+  - verifies the pulled and deployed Backstage image IDs match the local image, brings the stack up,
+    and reloads Caddy. Garbage collection is explicit via `./poc prune-idp-images`
+    (`deploy/deploy.sh --prune <host>`), not part of rollout.
   It must be idempotent and must not prompt.
-- `.env` keys, produced by `./poc up`. Agent C must use exactly these:
+- `./poc up` configures DNS and restores TLS storage as needed for bootstrap. `./poc deploy-idp
+  [<image-id>]` reads the existing host and environment values from local Terraform state, leaves
+  DNS and TLS storage alone, and verifies readiness. Both generate these `.env` keys:
 
 | Key | Source |
 |---|---|
