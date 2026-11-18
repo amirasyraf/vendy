@@ -31,6 +31,7 @@ PARALLEL_DESTROYS="${PARALLEL_DESTROYS:-5}"
 export AWS_PROFILE="${AWS_PROFILE:-amirasyraf}"
 export AWS_REGION="ap-southeast-2" AWS_DEFAULT_REGION="ap-southeast-2"
 export AWS_PAGER=""
+AZURE_SUBSCRIPTION="74b39a79-f79d-4adb-8ae0-fe9118fc564a"
 export TF_IN_AUTOMATION=1 TF_INPUT=0
 export TF_PLUGIN_CACHE_DIR="$GEN/tf-plugin-cache"
 mkdir -p "$GEN/logs" "$TF_PLUGIN_CACHE_DIR"
@@ -48,13 +49,16 @@ infra_has_state() { [[ -n "$(tf_infra state list 2>/dev/null || true)" ]]; }
 
 require_tools() {
   local t
-  for t in terraform gh aws jq ssh git curl "$@"; do
+  for t in terraform gh aws az jq ssh git curl "$@"; do
     command -v "$t" >/dev/null || die "missing tool: $t"
   done
   local acct
   acct="$(aws sts get-caller-identity --query Account --output text 2>/dev/null)" || die "AWS profile $AWS_PROFILE not usable (aws sso login?)"
   [[ "$acct" == "134584031874" ]] || die "AWS profile $AWS_PROFILE points at $acct, expected 134584031874"
   gh auth status >/dev/null 2>&1 || die "gh is not authenticated"
+  # Terraform azurerm (infra, Azure VMs) uses ARM_*; the sweeps use the az CLI. See DESIGN.md §9.
+  [[ -n "${ARM_CLIENT_ID:-}" && -f "${ARM_CLIENT_CERTIFICATE_PATH:-}" ]] || die "ARM_CLIENT_ID/ARM_CLIENT_CERTIFICATE_PATH not set (cf-admin-local; see ~/.zshrc)"
+  [[ "$(az account show --query id -o tsv 2>/dev/null)" == "$AZURE_SUBSCRIPTION" ]] || die "az CLI not logged in to subscription $AZURE_SUBSCRIPTION (run azsp)"
 }
 
 ensure_repos() {
@@ -117,6 +121,7 @@ POSTGRES_PASSWORD=$(tf_infra output -raw postgres_password)
 BACKSTAGE_TOKEN=$(tf_infra output -raw backstage_token)
 AWS_REGION=$AWS_REGION
 SSH_CA_SECRET_ID=$(infra_out ssh_ca_secret_id)
+AZURE_READER_SECRET_ID=$(infra_out azure_reader_secret_id)
 EOF
 }
 
@@ -181,6 +186,7 @@ run_bake() {
   aws ec2 describe-images --owners self \
     --filters Name=tag:cf:managed,Values=true Name=tag:cf:os,Values=ubuntu \
     --query 'sort_by(Images,&CreationDate)[-1].[ImageId,Name]' --output text
+  az sig image-version list -g cf-images -r cfimages -i ubuntu --query "[-1].name" -o tsv | sed 's/^/azure cfimages\/ubuntu /'
 }
 
 # The catalog keeps entities in Postgres across redeploys; re-read every location now so changes to
@@ -405,6 +411,25 @@ sweep_tagged() {
   done
 }
 
+# Azure: every VM and Packer build has its own resource group tagged cf:poc=true; infra's is cf:module=infra.
+sweep_azure() {
+  local exclude_infra="$1" q groups g
+  q="[?tags.\"cf:poc\"=='true']"
+  [[ "$exclude_infra" == "1" ]] && q="[?tags.\"cf:poc\"=='true' && tags.\"cf:module\"!='infra']"
+  groups="$(az group list --query "$q.name" -o tsv)"
+  for g in $groups; do az group delete -n "$g" --yes --no-wait && info "deleting resource group $g"; done
+  for g in $groups; do az group wait -n "$g" --deleted --timeout 1800 2>/dev/null || true; done
+}
+
+# Packer publishes gallery image versions outside Terraform; the image definition cannot be deleted with them.
+delete_image_versions() {
+  local v
+  az group exists -n cf-images 2>/dev/null | grep -q true || return 0
+  for v in $(az sig image-version list -g cf-images -r cfimages -i ubuntu --query '[].name' -o tsv 2>/dev/null); do
+    az sig image-version delete -g cf-images -r cfimages -i ubuntu -e "$v" && info "deleted image version ubuntu/$v"
+  done
+}
+
 # Named singletons from infra/, in case local state was lost.
 sweep_infra_orphans() {
   local bucket="cf-tfstate-134584031874-apse2"
@@ -412,6 +437,8 @@ sweep_infra_orphans() {
   aws secretsmanager describe-secret --secret-id compute-factory/ssh-ca >/dev/null 2>&1 \
     && aws secretsmanager delete-secret --secret-id compute-factory/ssh-ca --force-delete-without-recovery >/dev/null && info "deleted CA secret"
   aws ssm delete-parameter --name /compute-factory/ssh-ca-pub >/dev/null 2>&1 && info "deleted CA public key parameter" || true
+  aws secretsmanager describe-secret --secret-id compute-factory/azure-reader >/dev/null 2>&1 \
+    && aws secretsmanager delete-secret --secret-id compute-factory/azure-reader --force-delete-without-recovery >/dev/null && info "deleted Azure reader secret"
   for a in $(aws ec2 describe-addresses --filters Name=tag:cf:poc,Values=true --query 'Addresses[].AllocationId' --output text); do
     aws ec2 release-address --allocation-id "$a" >/dev/null && info "released EIP $a"
   done
@@ -443,6 +470,8 @@ verify_clean() {
   aws secretsmanager describe-secret --secret-id compute-factory/ssh-ca >/dev/null 2>&1 && left+=("CA secret")
   aws ssm get-parameter --name /compute-factory/ssh-ca-pub >/dev/null 2>&1 && left+=("CA public key parameter")
   aws iam get-role --role-name cf-idp >/dev/null 2>&1 && left+=("IAM role cf-idp")
+  aws secretsmanager describe-secret --secret-id compute-factory/azure-reader >/dev/null 2>&1 && left+=("Azure reader secret")
+  x="$(az group list --query "[?tags.\"cf:poc\"=='true'].name" -o tsv)"; [[ -n "$x" ]] && left+=("Azure resource groups: $(echo $x)")
   [[ -n "$(dig +short "$DOMAIN" @1.1.1.1 2>/dev/null || true)" ]] && left+=("DNS $DOMAIN (may be cache; TTL 60s)")
 
   # Informational: anything else the tagging API still reports (can lag a few minutes behind deletes).
@@ -473,8 +502,10 @@ cmd_down() {
   [[ -d "$PLATFORM_DIR/.git" ]] || git clone -q "git@github.com:$PLATFORM_REPO.git" "$PLATFORM_DIR"
   destroy_vms "$bucket"
 
-  log "Sweep leftovers tagged cf:poc=true (VMs, AMIs, snapshots, Packer temp resources)"
+  log "Sweep leftovers tagged cf:poc=true (VMs, AMIs, snapshots, Packer temp resources; AWS and Azure)"
   sweep_tagged 1
+  sweep_azure 1
+  delete_image_versions
 
   log "DNS: remove $DOMAIN"
   dns_apply "" && info "removed" || warn "DNS removal failed (see $GEN/logs/dns.log)"
@@ -488,6 +519,7 @@ cmd_down() {
   fi
   sweep_infra_orphans
   sweep_tagged 0
+  sweep_azure 0
 
   log "GitHub cleanup"
   gh variable delete TF_STATE_BUCKET -R "$PLATFORM_REPO" >/dev/null 2>&1 || true
@@ -545,6 +577,10 @@ cmd_status() {
   log "Instances tagged cf:poc=true"
   aws ec2 describe-instances --filters Name=tag:cf:poc,Values=true Name=instance-state-name,Values=pending,running,stopping,stopped \
     --query 'Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress,Tags[?Key==`Name`]|[0].Value]' --output text | sed 's/^/    /'
+  log "Azure resource groups tagged cf:poc=true"
+  az group list --query "[?tags.\"cf:poc\"=='true'].[name,properties.provisioningState]" -o tsv | sed 's/^/    /'
+  log "Azure golden images"
+  az sig image-version list -g cf-images -r cfimages -i ubuntu --query '[].[name,provisioningState]' -o tsv 2>/dev/null | sed 's/^/    /' || info "no gallery"
   log "VM state files"
   aws s3 ls "s3://cf-tfstate-134584031874-apse2/vms/" --recursive 2>/dev/null | sed 's/^/    /' || info "no bucket"
   log "Active pipeline runs"

@@ -5,3 +5,4 @@ infra/.terraform.lock.hcl.bak
 .generated/
 .poc-users
 .poc-passwords*
+.poc-azure-reader.pem

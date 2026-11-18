@@ -14,11 +14,21 @@ Bake (golden image)  ->  Provision (Terraform)  ->  Fry (Ansible stages)  ->  Re
 | Dimension | Long-term target | POC |
 |---|---|---|
 | OS types | Linux, Windows | Ubuntu Server only |
-| Platforms | AWS, Azure, vSphere | AWS only |
+| Platforms | AWS, Azure, vSphere | AWS and Azure |
 | Fry stages | baseline, software, AD join, ... | baseline, software, AD join (mocked), access |
 
 Guiding rules: **KISS**. Every OS- or platform-specific piece sits behind a directory or
-variable boundary, so adding Windows/Azure/vSphere means **adding files, not refactoring**.
+variable boundary, so adding Windows/vSphere means **adding files, not refactoring**. A platform is
+its `terraform/platforms/<p>/` directory in the platform repo: `platform.json` (label, OSes with their
+login user, display name and versions, instance-type/ID patterns, reserved tag rules), `sizes.json`,
+the Terraform root, `adopt.sh` (recovery) and `power.sh` (start/stop/reboot). Scripts, `spec.py`,
+Terraform and the IDP read those files; outside them only a few places name a platform: the
+workflow's cloud login step, the bake's source selector, the IDP's per-cloud spec/health readers and
+`./poc` sweeps.
+
+The IDP is meant to offer any kind of product, not only VMs. **Launch** (top bar) lists products
+(Scaffolder templates tagged `product`), then, for VMs, platform cards and image cards, then the
+product's form (5.2).
 
 Out of scope for the POC: real AD, Vault, HA, production-grade security, cost controls,
 image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
@@ -41,6 +51,10 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
 | Software install | `winget` on Windows (future); `apt` on Ubuntu (POC). Same role interface. |
 | VM access | SSH for every OS and platform, authenticated with SSH user certificates signed by a mock CA |
 | Network | Default VPC in ap-southeast-2 (`vpc-23619045`, exists); VMs get public IPs; SG allows 22 from anywhere (POC) |
+| Azure | Subscription `amirasyraf` (`74b39a79-…`), tenant `c26545da-…`, region `australiaeast`. One resource group, VNet, NSG (22 from anywhere) and static public IP per VM |
+| Shared base for Azure | AWS stays the shared base: the SSH CA (Secrets Manager), Terraform state (S3) and the IDP host. Azure stages log in to both clouds |
+| GHA -> Azure | Entra app `cf-github-actions` with federated credentials for the builder and platform repos on `main` (immutable-subject format); Contributor on the subscription. No secrets |
+| IDP -> Azure | Reader service principal `cf-idp-azure-reader` (certificate, 2-year); its JSON credential is in Secrets Manager `compute-factory/azure-reader`, read by the IDP host role |
 
 ## 3. Architecture
 
@@ -133,8 +147,8 @@ Trade-off: concurrent stage commits for different VMs can race, so the commit st
 packer/
   ubuntu/                      # one dir per OS image
     ubuntu.pkr.hcl             # shared variables, build block, ansible provisioner
-    source.aws.pkr.hcl         # amazon-ebs source (POC)
-    # source.azure.pkr.hcl     # azure-arm  (future)
+    source.aws.pkr.hcl         # amazon-ebs source
+    source.azure.pkr.hcl       # azure-arm source -> Azure Compute Gallery cf-images/cfimages/ubuntu
     # source.vsphere.pkr.hcl   # vsphere-iso/clone (future)
   # windows-2022/              # future
 ansible/
@@ -144,13 +158,14 @@ ansible/
     ssh_ca/                    # installs CA pubkey + sshd TrustedUserCAKeys + AuthorizedPrincipalsFile
                                # CA PUBLIC key is NOT committed: bake reads it from SSM parameter
                                # /compute-factory/ssh-ca-pub (a fresh CA is created on every `poc up`)
-images.yaml                    # build matrix: [{os: ubuntu, platform: aws, version: "26.04"}]
+images.yaml                    # build matrix: ubuntu 26.04 on aws and on azure
 .github/workflows/bake.yml     # on push to main + workflow_dispatch (used by `poc up`):
                                # matrix from images.yaml -> packer build -only=<platform>
 ```
 
 Bake does:
-1. Starts from the latest official Ubuntu AMI (SSM parameter above).
+1. Starts from the latest official Ubuntu image: the AMI from the SSM parameter above on AWS,
+   Canonical's Marketplace image `ubuntu-26_04-lts/server` (Gen2, x64) on Azure.
 2. Ansible `common`:
    - `apt` full upgrade, plus base packages `curl`, `jq`, `unzip` (nothing from the software catalog,
      so the `software` fry stage visibly does work);
@@ -161,13 +176,17 @@ Bake does:
    - `/etc/ssh/trusted_user_ca_keys` is set to the CA pubkey.
    - An sshd drop-in sets `TrustedUserCAKeys`, `AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u`
      and `PasswordAuthentication no`.
-   - `/etc/ssh/auth_principals/ubuntu` contains `cf-automation` (the pipeline) and `team-platform-admins`.
+   - `/etc/ssh/auth_principals/<login user>` (`ubuntu`) contains `cf-automation` (the pipeline) and
+     `team-platform-admins`.
    - The config is checked with `sshd -t` before reloading.
 4. Produces an AMI named `cf-ubuntu-26.04-<timestamp>` with tags
    `cf:os=ubuntu`, `cf:os-family=linux`, `cf:os-version=26.04`, `cf:managed=true`, `cf:git-sha=<sha>`.
+   On Azure, after `waagent -deprovision+user`, a gallery image version `1.<YYYYMMDD>.<hhmmss>` of
+   definition `ubuntu` (NVMe-capable: the sizes with quota in the region are NVMe-only), with the same
+   tags; Terraform launches the definition's latest version.
 
-Platform agnosticism: Packer `-only=amazon-ebs.*` comes from the matrix. Adding Azure means adding a
-source file and a matrix row. Ansible roles branch on `ansible_os_family` (Windows tasks go in
+Platform agnosticism: Packer `-only=<source>.<os>` comes from the matrix. Adding a platform means
+adding a source file, a matrix row and its case in the workflow's source selector. Ansible roles branch on `ansible_os_family` (Windows tasks go in
 `tasks/windows.yml`).
 
 ### 4.2 `compute-factory-platform` (Provision + Fry)
@@ -175,9 +194,11 @@ source file and a matrix row. Ansible roles branch on `ansible_os_family` (Windo
 ```
 terraform/
   platforms/
-    aws/                       # root module for one VM on AWS (POC)
-      main.tf variables.tf outputs.tf sizes.tf sizes.json
-    # azure/  vsphere/         # future, same variable/output contract
+    aws/                       # root module for one VM on AWS
+      main.tf variables.tf outputs.tf sizes.tf sizes.json platform.json adopt.sh power.sh
+    azure/                     # same contract on Azure (resource group cf-vm-<name> per VM)
+      main.tf variables.tf outputs.tf sizes.json platform.json adopt.sh power.sh
+    # vsphere/                 # future
 ansible/
   fry/
     baseline.yml               # hostname, timezone, motd, banner
@@ -203,7 +224,7 @@ vms/                           # inventory (written by stage runs only)
 | `baseline` | always | Hostname set to the VM name, `/etc/hosts`, login banner (VM, team, requester, platform), `/etc/compute-factory/vm-info.json` |
 | `software` | if any software picked | Installs the picks using `software-catalog.yml`; in a Modify run also removes unchecked catalog packages |
 | `ad-join` | if picked (mock) | Writes `/etc/compute-factory/ad-join.json` (domain `corp.example.local`, OU, timestamp), adds a banner line, logs "joined CORP.EXAMPLE.LOCAL". No real AD. When Modify turns AD join off, removes them again. |
-| `access` | always, last | Adds `team-<owning team>` to `/etc/ssh/auth_principals/ubuntu`, then `sshd -t` and reload |
+| `access` | always, last | Writes `team-<owning team>` into `/etc/ssh/auth_principals/<login user>` and turns off `authorized_keys` logins (Azure requires an admin key at launch; only CA certs log in afterwards), then `sshd -t` and reload |
 
 `ansible/maintain/os-update.yml` (stage `os-update`, the "Apply OS updates" action) is maintenance,
 not a fry stage: a full `apt` upgrade, then a reboot only if `/var/run/reboot-required` exists.
@@ -239,15 +260,19 @@ docker: { linux: docker.io, windows: null }
 | `name`, `os`, `size` (XS/S/M/L) or `instance_type`, `owner`, `tags` | `public_ip`, `ssh_user`, `instance_id`, `instance_type` |
 
 - Each platform maps sizes in one data file. AWS: `sizes.json` (XS=`t3.micro`, S=`t3.small`,
-  M=`t3.medium`, L=`t3.large`; all 2 vCPU, 1/2/4/8 GiB), read by `sizes.tf`. Regular users pick a size
-  card showing the instance type and live AWS specs. A collapsed **Advanced** picker lists every x86_64
-  instance type offered in the region, segmented by family type (general purpose, compute, memory,
-  storage, accelerated, HPC) and grouped by family, with search, family/vCPU/memory filters, a
-  current-generation toggle and sortable columns; the choice is stored as `compute.instanceType`.
-  Demo mode greys out everything except `t3.micro`–`t3.large` and the IDP backend enforces it.
-  VM pages show the launched type (`cf/instance-type`).
-- Image lookup uses tags: `data "aws_ami"` with `cf:os=<os>`, `cf:managed=true`, `most_recent`.
-- `ssh_user` comes from the OS: `ubuntu` for Ubuntu, `Administrator` for Windows later.
+  M=`t3.medium`, L=`t3.large`; all 2 vCPU, 1/2/4/8 GiB). Azure: `Standard_D2ls_v6`, `D2s_v6`,
+  `D4ls_v6`, `D4s_v6` (B-series has no quota in this subscription; the region allows 10 vCPUs).
+  Regular users pick a size card showing the instance type and live specs from the VM's cloud. A
+  collapsed **Advanced** picker lists every x86_64 instance type the platform offers in its region
+  (AWS: EC2 offerings; Azure: Resource SKUs without a location restriction that boot the Gen2 image),
+  segmented by family type and grouped by family, with search, family/vCPU/memory filters and
+  sortable columns (AWS also a current-generation toggle; Azure has no such flag). On Azure, sizes
+  without enough free vCPU quota (family and regional) are greyed out as "Over vCPU quota". The choice
+  is stored as `compute.instanceType`. Demo mode greys out everything except the types some platform's
+  `sizes.json` maps a size to, and the IDP backend enforces it. VM pages show the launched type.
+- Image lookup: AWS `data "aws_ami"` with `cf:os=<os>`, `cf:managed=true`, `most_recent`; Azure the
+  gallery definition `cf-images/cfimages/<os>` (latest version). Both ignore image changes after launch.
+- `ssh_user` comes from the OS entry in `platform.json`: `ubuntu` for Ubuntu, `Administrator` for Windows later.
 - State: S3 bucket `cf-tfstate-134584031874-apse2`, key `vms/<platform>/<name>/terraform.tfstate`, S3 native
   locking (`use_lockfile = true`). The workflow passes the key through `-backend-config`.
 
@@ -339,11 +364,17 @@ Form fields:
 |---|---|---|
 | Name | `^[a-z][a-z0-9-]{2,20}$` | Must be unique; the workflow validates |
 | Team | one of the user's teams | Becomes `spec.owner`; preselected if the user is in exactly one team |
-| Platform | `aws` (Azure/vSphere shown disabled or hidden) | Picks `terraform/platforms/<p>` |
-| OS | `ubuntu` (Windows hidden) | Picks the image tag and fry task files |
-| Size | S / M / L | Mapped per platform |
+| Platform | `aws`, `azure` (chosen on a Launch card; vSphere shown as "Coming soon") | Picks `terraform/platforms/<p>`; shown on the form with a "Change" link |
+| OS | `ubuntu` (chosen on a Launch image card, with a version dropdown; only 26.04, not stored) | Picks the image and fry task files |
+| Size | XS / S / M / L or an Advanced instance type | Mapped per platform |
 | Software | checkboxes: git, htop, nginx, docker (from the software catalog, filtered by OS) | None picked = `software` stage skipped |
 | AD join | checkbox (mock) | baseline + access always run |
+
+How users get there: **Launch** (top bar; Home and Resources' Request VM buttons open its platform
+step) shows product cards (Scaffolder templates tagged `product`; name from `cf/product`), then for a
+template with `cf/launch-flow: platform-image` platform cards (`GET /api/vm-sizes/platforms`) and
+image cards, then opens the template with `?formData={"compute":{"platform","os"}}`. Other products
+would open their template directly. The stock template list stays at `/create` but is not in the bar.
 
 Steps:
 1. The form has one step, `cf:vm:dispatch` (below). The mock ServiceNow request is no longer a
@@ -374,7 +405,7 @@ dispatches workflows and reads catalog files. Users therefore **don't need any a
 ### 5.3 Status and stages: run page and `vm-status` card
 
 - The VM entity page header shows the VM's live state (latest run while active or failed, else the
-  health check: Running, Stopped, Not found in AWS) and the day-2 actions (5.4). The body has
+  health check: Running, Stopped, Instance not found) and the day-2 actions (5.4). The body has
   **Connect** (copyable SSH command, Get SSH certificate), **Activity** (the active or failed run with
   its stage line and Retry/Skip, then the last 10 runs), **Configuration** (size, software, AD join,
   tags; Modify) and **Details** (health check, instance, IP, provenance, inventory source).
@@ -402,13 +433,14 @@ to one VM's run, and would expose runs through a shared token regardless of team
 
 ### 5.4 Manage / destroy
 
-- The Create page lists only `vm-request` (`sub-page:scaffolder/templates` `templateFilter` in the IDP
+- The stock template list (`/create`, no longer in the top bar; Launch replaces it) lists only `vm-request` (`sub-page:scaffolder/templates` `templateFilter` in the IDP
   `app-config.yaml`). Modify and SSH certificate are reached from the VM page (and Home for the
   certificate); their direct template URLs still work, and the listing filter is not an authorization
   boundary.
 - Day-2 actions, all on the VM page header. Each creates an orchestrator run (`POST /api/vms/runs`):
-  - **Start / Stop / Reboot** (confirm dialog). Stop releases the public IP; start gets a new one,
-    which the stage records in inventory. Reboot keeps the IP.
+  - **Start / Stop / Reboot** (confirm dialog). On AWS stop releases the public IP and start gets a
+    new one, which the stage records in inventory. On Azure stop deallocates the VM (no compute
+    billing) and its static IP is kept. Reboot keeps the IP.
   - **Modify** opens the `vm-modify` form prefilled with the VM's current size, software and AD join.
     Only what changed is applied: a size change re-runs `provision` (Terraform updates the instance
     type in place: stop, change, start; new IP), software changes install checked and uninstall
@@ -427,9 +459,10 @@ to one VM's run, and would expose runs through a shared token regardless of team
   retried, skipped or destroyed first; any new action supersedes a failed day-2 run. Modify, Reboot,
   OS updates and Re-apply need a running VM; the backend refuses them (and a redundant start/stop) when
   the health check says otherwise.
-- **Health check**: the IDP polls EC2 every 30 seconds (`DescribeInstances`/`DescribeInstanceStatus`,
-  read-only, tag `cf:poc=true`), so a VM stopped or terminated outside the IDP shows as Stopped or
-  Not found in AWS. `CONTRACTS.md` §8.3.
+- **Health check**: the IDP polls each cloud every 30 seconds (EC2 `DescribeInstances`/
+  `DescribeInstanceStatus`; Azure VM power state, Resource Health and public IPs with the Reader
+  principal; read-only, tag `cf:poc=true`), so a VM stopped or deleted outside the IDP shows as
+  Stopped or "Instance not found". One cloud failing keeps the other's results. `CONTRACTS.md` §8.3.
 - Team guard: see 5.1a.
 
 ## 6. Pipelines
@@ -497,8 +530,9 @@ Server is baked into the Windows image.
 
 ### 6.5 `bake.yml` (builder repo)
 
-On push to `main` (paths `packer/**`, `ansible/**`, `images.yaml`): matrix over `images.yaml`, then OIDC,
-then `packer init` and `packer build -only=amazon-ebs.ubuntu packer/ubuntu`. Packer's `ansible` provisioner
+On push to `main` (paths `packer/**`, `ansible/**`, `images.yaml`): matrix over `images.yaml`, then AWS
+OIDC (always: the CA public key is in SSM) and Azure OIDC for Azure rows, then `packer init` and
+`packer build -only=<amazon-ebs|azure-arm>.ubuntu packer/ubuntu`. Packer's `ansible` provisioner
 runs from the runner over SSH to the temporary build instance.
 
 ## 7. SSH CA (mock)
@@ -558,18 +592,21 @@ signed. The difference is that the pipeline's key is throwaway.
    ```
 4. **On the VM**, `sshd` checks three things:
    - the cert is signed by the baked CA (`TrustedUserCAKeys`);
-   - one of its principals is listed in `/etc/ssh/auth_principals/ubuntu`;
+   - one of its principals is listed in `/etc/ssh/auth_principals/<login user>`;
    - it hasn't expired.
 
 Check a cert with `ssh-keygen -L -f ~/.ssh/id_ed25519-cert.pub` (shows principals and expiry).
 
-## 8. Adding Windows / Azure / vSphere later (no refactor)
+## 8. Adding Windows / vSphere later
 
 | To add | Add |
 |---|---|
-| Windows OS | `packer/windows-2022/`, Windows task files in roles (OpenSSH Server + CA config, winget), OS row in `images.yaml`, `ssh_user` mapping, form option |
-| Azure | `source.azure.pkr.hcl`, matrix row, `terraform/platforms/azure/` with the same contract, OIDC login step for Azure in `stage.yml` keyed on platform, form option |
-| vSphere | Same pattern; needs a self-hosted GHA runner with network reach to vCenter |
+| Windows OS | `packer/windows-2022/`, Windows task files in roles (OpenSSH Server + CA config, winget), OS row in `images.yaml`, an `os` entry (login user, family, label, versions) in each platform's `platform.json`, a gallery image definition on Azure, the template OS enum |
+| A platform (vSphere) | `terraform/platforms/<p>/` with the same contract plus `platform.json`, `sizes.json`, `adopt.sh`, `power.sh`; a Packer source and matrix row; its login step in `stage.yml`/`bake.yml`; the IDP's spec/health readers for that cloud (`vmSizes.ts`, `observed.ts`) and `PLATFORMS`; `./poc` sweeps; template enum. vSphere also needs a self-hosted runner that reaches vCenter |
+| A product | A Scaffolder template tagged `product` (and `cf/product` name); it appears on Launch |
+
+Azure was added this way. It also exposed what the first version had hardcoded (the SSH user, the
+cloud login, EC2-only validation and health checks), now read from `platform.json`.
 | New fry stage | `ansible/fry/<stage>.yml` + role, one entry in the orchestrator's stage list and `stage.yml`'s stage enum, one form checkbox |
 
 ## 9. One-time manual steps (outside `./poc`)
@@ -578,6 +615,13 @@ Check a cert with `ssh-keygen -L -f ~/.ssh/id_ed25519-cert.pub` (shows principal
    in `compute-factory/.poc.env` (gitignored). It persists across up/down cycles.
    Set user passwords with `./poc set-password <user>`; they're kept in `compute-factory/.poc-users`.
 2. Create the 4 private repos and push the code (done once, during the build).
+3. Azure identities (done once, kept across up/down like the AWS OIDC role; need an interactive
+   `az login` with Entra rights): the GitHub OIDC app `cf-github-actions` (Contributor, federated
+   credentials for builder/platform `main`), the repo variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
+   `AZURE_SUBSCRIPTION_ID`, `AZURE_LOCATION`, and the IDP's Reader principal `cf-idp-azure-reader`
+   whose certificate is the gitignored `compute-factory/.poc-azure-reader.pem` (expires 2028-11-18).
+   Laptop Terraform/`az` use the `cf-admin-local` service principal (`~/.zshrc` `ARM_*`, alias `azsp`).
+   Resource providers Microsoft.Compute, Microsoft.Network and Microsoft.ResourceHealth are registered.
 
 Everything else is done by `./poc up` (section 12).
 
@@ -587,7 +631,9 @@ can't see it or SSH in → destroy → `./poc down` → check that nothing is le
 ## 10. Rough cost (running 24/7)
 
 IDP t4g.medium about $30/mo plus EIP/EBS. Each test VM (t3.small) costs about $0.03/hr. AMI snapshots
-cost cents. After `./poc down` the cost is $0: no AWS resources remain.
+cost cents. An Azure test VM (2 vCPU v6) is roughly $0.10/hr plus a static IP and disk while it
+exists; a deallocated one pays only those. Gallery storage costs cents. After `./poc down` the cost is
+$0: no AWS or Azure resources remain.
 
 ## 11. Open questions
 
@@ -644,6 +690,8 @@ compute-factory/                 # 4th repo: the "home" of the POC
     ssh-ca.tf                    #   tls_private_key (ed25519) -> Secrets Manager secret (recovery_window_in_days = 0)
                                  #   + SSM parameter /compute-factory/ssh-ca-pub
     idp.tf                       #   IDP EC2 (t4g.medium), EIP, SG, instance role (read the CA secret; read-only EC2 describe for sizes and the VM health check)
+    azure.tf                     #   Azure gallery cf-images/cfimages + image definition ubuntu; Azure reader
+                                 #   secret compute-factory/azure-reader (from .poc-azure-reader.pem) + host-role read
     tokens.tf                    #   random_password: backend secret, PG password, BACKSTAGE_TOKEN
     outputs.tf
   ../compute-factory-idp, ../compute-factory-builder, ../compute-factory-platform   # sibling clones
@@ -658,10 +706,11 @@ compute-factory/                 # 4th repo: the "home" of the POC
 ### 12.2 `./poc up` (about 15–20 min; bake dominates)
 
 1. **Preflight**:
-   - check the tools (`terraform`, `gh`, `aws`, `docker`, `jq`), the `amirasyraf` AWS profile, `gh` auth
-     and `.poc.env`;
+   - check the tools (`terraform`, `gh`, `aws`, `az`, `docker`, `jq`), the `amirasyraf` AWS profile, `gh`
+     auth, the `ARM_*` service-principal variables, the `az` subscription and `.poc.env`;
    - fail fast if `infra` state already exists (the run assumes a clean slate; run `down` first).
-2. **`terraform -chdir=infra apply`**: state bucket, CA secret + public key parameter, IDP EC2 + EIP, tokens.
+2. **`terraform -chdir=infra apply`**: state bucket, CA secret + public key parameter, IDP EC2 + EIP, tokens,
+   the Azure image gallery and the Azure reader secret.
 3. **GitHub wiring** (`gh variable set` / `gh secret set` on the builder and platform repos): `AWS_ROLE_ARN`,
    `TF_STATE_BUCKET`, `BACKSTAGE_URL`, `BACKSTAGE_TOKEN`. Reset `vms/` in the platform repo to empty.
 4. **Run in parallel**:
@@ -670,7 +719,7 @@ compute-factory/                 # 4th repo: the "home" of the POC
      10 consecutive errors); monitoring has a one-hour limit. Only `completed` + `success` counts
      as success; other completed conclusions fail. Exhausted monitoring or unconfirmed dispatch/run
      discovery reports an unknown outcome, not a failed workflow. After confirmed success, query AWS
-     for the latest managed Ubuntu AMI.
+     for the latest managed Ubuntu AMI and Azure for the latest gallery version.
    - B. **IDP**:
      - DNS: targeted apply of the `idp` record in `~/projects/cloudflare/amirasyraf.dev`, with the EIP passed in;
      - write `.env` from Terraform outputs and `.poc.env`;
@@ -704,14 +753,18 @@ then sweep anything else, then verify.
 3. **Sweep leftovers by tag** (catches failed provisions, interrupted bakes, missing state):
    - deregister AMIs tagged `cf:poc=true` and delete their snapshots;
    - terminate instances tagged `cf:poc=true`, including Packer build instances (Packer `run_tags`);
-   - delete leftover `packer_*` key pairs and security groups.
+   - delete leftover `packer_*` key pairs and security groups;
+   - delete Azure resource groups tagged `cf:poc=true` except infra's (VMs, Packer build groups), then
+     the gallery's image versions (Packer-published, outside Terraform; the definition can't be
+     deleted while they exist).
 4. **DNS**: targeted apply removing the `idp` record.
-5. **`terraform -chdir=infra destroy`**: IDP EC2/EIP, CA secret, state bucket (force-destroy), tokens.
+5. **`terraform -chdir=infra destroy`**: IDP EC2/EIP, CA secret, state bucket (force-destroy), tokens,
+   Azure gallery and reader secret; then a final sweep of anything tagged `cf:poc=true` on both clouds.
 6. **GitHub cleanup**: delete the repo variables and secrets set in `up`, and commit an empty `vms/`.
 7. **Verify**:
    - the Resource Groups Tagging API (`get-resources --tag-filters Key=cf:poc,Values=true`) returns nothing in
      ap-southeast-2;
-   - no instances, AMIs or snapshots tagged `cf:poc` remain;
+   - no instances, AMIs or snapshots tagged `cf:poc` remain, and no Azure resource group tagged `cf:poc=true`;
    - print CLEAN, or list what's left and exit non-zero.
 
 `down` tolerates partial state: every step continues if its target is already gone, so it also cleans up
@@ -726,7 +779,10 @@ pipelines), so you can check before or after `up`/`down`.
 
 - Every Terraform AWS provider (infra and `terraform/platforms/aws`) sets `default_tags { cf:poc = "true" }`.
   Packer sets `tags`, `run_tags`, `run_volume_tags` and `snapshot_tags` with `cf:poc = "true"`.
+  Azure has no provider default tags: every Azure resource and resource group sets the `cf:*` tags
+  itself (Packer `azure_tags` tags its temporary build group).
 - No resource may be created outside Terraform or Packer, apart from Packer's temporary key pairs and
   security groups, which the sweep handles.
-- Nothing outside AWS, the Cloudflare `idp` record and the GitHub variables, secrets and `vms/` is touched,
-  so those are the only things `down` has to clean.
+- Nothing outside AWS, the Azure subscription's `cf:poc` resource groups, the Cloudflare `idp` record and
+  the GitHub variables, secrets and `vms/` is touched, so those are the only things `down` has to clean.
+  The Azure identities and `AZURE_*` variables (9) persist like the AWS OIDC role.

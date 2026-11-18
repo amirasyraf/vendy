@@ -24,16 +24,31 @@ Default branch: `main`. Commit directly to `main`, with no PRs (POC). Use `git p
 | Local AWS profile | `amirasyraf` |
 | GHA role (OIDC) | repo variable `AWS_ROLE_ARN` = `arn:aws:iam::134584031874:role/github-aws-role` (already set on builder + platform) |
 | GHA region | repo variable `AWS_REGION` = `ap-southeast-2` (already set on builder + platform) |
-| Mandatory tag | `cf:poc = "true"` on **every** AWS resource (Terraform `default_tags`; Packer `tags`, `run_tags`, `run_volume_tags`, `snapshot_tags`) |
+| Mandatory tag | `cf:poc = "true"` on **every** AWS and Azure resource (AWS Terraform `default_tags`; Packer `tags`, `run_tags`, `run_volume_tags`, `snapshot_tags`, `azure_tags`; Azure Terraform per resource) |
 | TF state bucket | `cf-tfstate-134584031874-apse2` (repo variable `TF_STATE_BUCKET` on platform) |
 | VM state key | `vms/<platform>/<name>/terraform.tfstate`, e.g. `vms/aws/demo-1/terraform.tfstate` |
 | CA private key | Secrets Manager secret id `compute-factory/ssh-ca`; `SecretString` = OpenSSH-format ed25519 private key |
 | CA public key | SSM parameter `/compute-factory/ssh-ca-pub` (String; one OpenSSH public key line) |
 | Network | default VPC; public IPs; SG ingress tcp/22 from `0.0.0.0/0` |
 
+### 1a. Azure constants
+
+AWS remains the shared base (SSH CA, Terraform state bucket, IDP host); Azure holds only VMs and images.
+
+| Name | Value |
+|---|---|
+| Tenant / subscription | `c26545da-80fa-4c31-9a8f-a4ae475bd17e` / `74b39a79-f79d-4adb-8ae0-fe9118fc564a` |
+| Location | `australiaeast` |
+| GHA identity (OIDC) | Entra app `cf-github-actions` (`2e6cce7d-…`), Contributor on the subscription; federated subjects `repo:amirasyraf@15522007/compute-factory-{builder@1458285691,platform@1458285776}:ref:refs/heads/main` |
+| GHA repo variables (builder + platform) | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_LOCATION` |
+| Image gallery | resource group `cf-images`, gallery `cfimages`, definition per OS (`ubuntu`: Linux, Gen2, x64, NVMe + SCSI); created by `infra/azure.tf` |
+| Per-VM resources | resource group `cf-vm-<name>`; VNet, subnet, NSG (tcp/22 from anywhere), static Standard public IP, NIC and VM all named `cf-<name>` |
+| IDP reader | service principal `cf-idp-azure-reader` (Reader, certificate); Secrets Manager `compute-factory/azure-reader`, `SecretString` JSON `{tenantId, clientId, subscriptionId, location, certificatePem}` |
+| Laptop admin | service principal `cf-admin-local` (Owner, certificate; `ARM_*` in `~/.zshrc`) for `infra/` and `./poc` |
+
 Tooling versions (pin these):
 - Terraform `>= 1.10` (S3 `use_lockfile`), AWS provider `~> 6.0`.
-- Packer latest 1.x with plugins `amazon` + `ansible`.
+- Packer latest 1.x with plugins `amazon`, `azure` (`>= 2.6, < 3`) + `ansible`. azurerm provider `~> 4.0`.
 - `ansible-core`: one exact pinned version, chosen by Agent A, recorded in both repos' `requirements-ansible.txt`.
 - Node 24 for Backstage.
 
@@ -52,6 +67,12 @@ Tooling versions (pin these):
   - `/etc/compute-factory/image-info.json` holds image name, build date and git SHA.
   - Base packages are `curl`, `jq`, `unzip` only. Do **not** bake anything from the software catalog.
 - The bake workflow reads the CA pub key from SSM `/compute-factory/ssh-ca-pub` at build time. It is never committed.
+- Azure: base is Canonical's Marketplace image `Canonical:ubuntu-26_04-lts:server:latest` (Gen2, x64,
+  no plan). Packer publishes gallery version `1.<YYYYMMDD>.<hhmmss>` of `cfimages/ubuntu` (shallow
+  replication) with the same `cf:*` tags, after `waagent -force -deprovision+user`. The build VM is
+  `Standard_D2ls_v6` with the NVMe disk controller. Terraform launches the definition's latest version.
+- The principals file is named after the OS login user (`platform.json` `os.<os>.sshUser`; Packer passes
+  `cf_ssh_user`).
 
 ## 3. SSH identity
 
@@ -66,9 +87,12 @@ Tooling versions (pin these):
   `team-platform-admins`), validity 5 minutes (only the SSH handshake needs it). The private key never
   leaves the IDP and is deleted when the session ends.
 
-- OS login user on Ubuntu: `ubuntu`.
-- The fry stage `access` writes the **whole** `/etc/ssh/auth_principals/ubuntu` file with exactly three
-  lines: `cf-automation`, `team-platform-admins` and `team-<owning team>`. Then it runs `sshd -t` and reloads.
+- OS login user: `platform.json` `os.<os>.sshUser` of the VM's platform (`ubuntu` for Ubuntu on AWS and
+  Azure); recorded as `cf/ssh-user`.
+- The fry stage `access` writes the **whole** `/etc/ssh/auth_principals/<login user>` file with exactly
+  three lines: `cf-automation`, `team-platform-admins` and `team-<owning team>`, and the drop-in
+  `/etc/ssh/sshd_config.d/01-compute-factory-certificates-only.conf` (`AuthorizedKeysFile none`), so
+  the admin key Azure requires at launch stops working. Then it runs `sshd -t` and reloads.
 - User certs (Backstage `cf:ssh:sign`):
   - validity 12h;
   - key ID = Backstage username;
@@ -118,6 +142,10 @@ All inputs are strings and required unless noted.
   dispatch response by this exact `[<run_key>]` suffix, so it must stay the end of the title.
 - `concurrency: { group: vm-<name>, cancel-in-progress: false }`. The orchestrator dispatches at most one
   stage at a time per VM (destroy may be queued behind a still-running stage of a superseded run).
+- Azure: job env `ARM_USE_OIDC=true` and `ARM_CLIENT_ID`/`ARM_TENANT_ID`/`ARM_SUBSCRIPTION_ID` from the
+  `AZURE_*` variables (Terraform azurerm); `azure/login@v3` (OIDC) runs after AWS credentials when the
+  validated platform is `azure` and the stage is `provision`, an eligible `destroy`, `start`, `stop` or
+  `reboot`. `Validate inputs` outputs `platform` and `ssh_user` (from `platform.json`) for the later steps.
 - `permissions: { contents: write, id-token: write }`. Executor code (scripts, Ansible, Terraform) comes
   from the dispatched commit (`github.sha`). Inventory is read from, and committed to, a separate
   checkout of current `main` taken when the job starts, because a stage queued behind another one must
@@ -146,12 +174,12 @@ first checks that `vms/<name>/catalog-info.yaml` exists with `cf/request-id == r
 | Stage | Behaviour |
 |---|---|
 | `register` | Validate `params_json.spec` with `scripts/spec.py`; team guard on the desired owner. Inventory with the same `cf/request-id` → success, no change. Inventory with a different request ID → permanent failure. Otherwise create the entity (§7) with `cf/status: provisioning`. |
-| `provision` | `cf/status: provisioning`; `terraform apply`; record outputs; `cf/status: frying`. In a Modify run it applies a size change in place (EC2 stops and starts the instance; the public IP changes). Never a second instance for the same incarnation: the AMI is ignored after creation, an untracked instance tagged `cf:vm=<name>` and `cf:request-id=<request_id>` is adopted into state, and a stale state lock cannot block retries indefinitely. |
+| `provision` | `cf/status: provisioning`; `terraform apply`; record outputs; `cf/status: frying`. In a Modify run it applies a size change in place (EC2 stops and starts the instance and the public IP changes; Azure resizes, keeping its static IP). Never a second instance for the same incarnation: the image is ignored after creation, untracked resources of this incarnation are adopted into state by the platform's `adopt.sh` (AWS: instance/SG tagged `cf:vm=<name>` and `cf:request-id=<request_id>`; Azure: the fixed-name resources in `cf-vm-<name>`, whose tags must match), and a stale state lock cannot block retries indefinitely. |
 | `baseline`, `software`, `ad-join`, `access` | `cf/status: frying`; read host and SSH user from inventory (an empty `cf/public-ip`, i.e. a stopped VM, fails validation); run the stage playbook (§6.3) with variables derived from the persisted spec. |
 | `configure` | Replace `spec.compute` and `spec.configuration` with `params_json` (platform/OS unchanged) through `spec.py`; other spec sections and provenance are kept. No VM contact. |
 | `software` (removal) | Besides installing `cf_software`, removes `params_json.remove` minus anything still desired (`apt` `state: absent`; data and configuration files are kept). |
 | `ad-join` (leave) | With `adJoin: false` in the persisted spec (Modify turned it off) the mock join record and banner line are removed. |
-| `start`, `stop`, `reboot` | Instance from `cf/instance-id`; it must carry `cf:vm=<name>`, `cf:request-id=<request_id>`, `cf:poc=true`. `stop`: stop and wait, then `cf/public-ip: ""`. `start`: start and wait, record the new `cf/public-ip`, wait for SSH. `reboot`: requires `running`; EC2 reboot, then wait until the guest's boot ID changes (10 min). Already in the target state → success. `cf/status` is not changed. |
+| `start`, `stop`, `reboot` | Instance from `cf/instance-id` (matching the platform's `instanceIdPattern`); it must carry `cf:vm=<name>`, `cf:request-id=<request_id>`, `cf:poc=true`. Cloud calls come from `terraform/platforms/<p>/power.sh`. `stop`: stop and wait (Azure: deallocate, also for a guest-stopped VM that is still allocated), then `cf/public-ip: ""`. `start`: start and wait, record the current `cf/public-ip`, wait for SSH. `reboot`: requires `running`; cloud reboot, then wait until the guest's boot ID changes (10 min). Already in the target state → success. `cf/status` is not changed. |
 | `os-update` | Requires a public IP. Runs `ansible/maintain/os-update.yml` (full `apt` upgrade; reboot only if `/var/run/reboot-required`). `cf/status` is not changed. |
 | `destroy` | Inventory missing → success (already destroyed). With `demoGeneration`: the existing fail-closed cleanup check (`GET $BACKSTAGE_URL/api/vms/cleanup-check/<name>?generation=…&request_id=…`); ineligible → success without changes. Otherwise identity check, `cf/status: destroying`, `terraform destroy`, delete the state object, delete the inventory directory. A retry after partial completion converges. |
 | `finalize` | Inventory missing or a different request ID → success without changes. `ready` → `cf/status: ready`, `cf/ready-at` (first time only). `failed` → `cf/status: failed`, `cf/failed-at` (first time only). |
@@ -194,13 +222,13 @@ kind: Resource
 metadata:
   name: demo-1
   title: demo-1
-  description: ubuntu VM on aws (S) for team alpha
+  description: ubuntu VM on aws (S) for team alpha   # e.g. "ubuntu VM on azure (S) …"
   annotations:
     cf/status: provisioning        # provisioning | frying | ready | failed | destroying
     cf/public-ip: ""               # filled after provision and start; "" while stopped
-    cf/ssh-user: ubuntu
-    cf/instance-id: ""
-    cf/instance-type: ""   # launched EC2 type, set with cf/instance-id after apply
+    cf/ssh-user: ubuntu            # platform.json os.<os>.sshUser, written at register
+    cf/instance-id: ""             # EC2 instance ID, or the Azure VM's ARM resource ID
+    cf/instance-type: ""   # launched instance type / Azure size, set with cf/instance-id after apply
     cf/requested-by: amirasyraf
     cf/requested-at: "2026-11-15T12:00:00Z"
     cf/request-id: "scaffolder-task-id" # VM incarnation; equals the stage.yml request_id input
@@ -213,9 +241,9 @@ spec:
   owner: group:default/alpha
   lifecycle: poc
   compute:
-    platform: aws
-    os: ubuntu
-    size: S                # or, instead of size: instanceType: m7i.large (IDP Advanced picker)
+    platform: aws          # a terraform/platforms/<p> directory: aws | azure
+    os: ubuntu             # a key of that platform's platform.json os
+    size: S                # or, instead of size: instanceType: m7i.large / Standard_D2s_v6 (Advanced picker)
   configuration:
     software: [git, nginx]
     adJoin: false
@@ -229,22 +257,32 @@ spec:
 - `spec` is desired state, annotations are observed results/provenance. No duplicated desired
   `cf/platform`, `cf/os`, `cf/size`, `cf/team`, `cf/software` annotations are written or consumed.
 - `scripts/spec.py` is the workflow-boundary validator/normalizer. Required: `type: vm`, `owner`, and
-  `compute.{platform,os}` plus exactly one of `compute.size` (a `sizes.json` key: XS/S/M/L) or
-  `compute.instanceType` (EC2 type such as `m7i.large`; `mac*` rejected). Owner normalizes to
-  `group:default/<team>`; other namespaces/kinds are rejected. Only AWS/Ubuntu are supported. Optional `lifecycle` defaults to `poc` (bounded
+  `compute.{platform,os}` plus exactly one of `compute.size` (a key of that platform's `sizes.json`:
+  XS/S/M/L) or `compute.instanceType` (matching the platform's `instanceTypePattern` and not its
+  `excludedInstanceTypePattern`: AWS `m7i.large`, `mac*` rejected; Azure `Standard_*`). Supported
+  platforms are the `terraform/platforms/<p>` directories with `platform.json` and `sizes.json`;
+  supported OSes are the keys of that file's `os`. Owner normalizes to
+  `group:default/<team>`; other namespaces/kinds are rejected. Optional `lifecycle` defaults to `poc` (bounded
   nonempty string); `configuration` defaults to `{software: [], adJoin: false}`; billing/tags to `{}`.
   Software is a unique list of software-catalog keys; AD join is a boolean, not an encoded string.
   Unknown section fields, invalid types and control characters are rejected. Custom fields are not
   automatically schema-validated by the stock Backstage catalog.
 - Billing supports only nonempty `costCenter` and `projectCode` strings up to 256 characters,
-  projected as AWS `cost_center` and `project_code` tags (VMs launched before this change carry
+  projected as cloud tags `cost_center` and `project_code` (VMs launched before this change carry
   `billing:cost-center`/`billing:project-code`). The vm-request form (`tags` parameter, `ui:field:
   VmTagsEditor`: one table with fixed `cost_center`/`project_code` rows plus optional tags) and the IDP
   dispatch endpoint require both for new requests; `spec.py` keeps them optional so older specs still
   load. Values are self-reported, not trusted billing authorization. `cloudTags` is at most 40 string
   entries (keys 1–128 characters, values 0–256); `Name`, `cost_center`, `project_code` and prefixes
-  `cf:`, `aws:`, `billing:` are reserved, case-insensitively.
+  `cf:`, `billing:` plus the platform's `reservedTagPrefixes` (AWS `aws:`; Azure `azure`, `microsoft`,
+  `windows`) are reserved, case-insensitively, and keys may not contain the platform's
+  `forbiddenTagKeyCharacters` (Azure `<>%&\?/`).
   Mandatory platform tags cannot be overridden. Never store secrets in catalog data or tags.
+- `terraform/platforms/<p>/platform.json` (read by `spec.py`, `validate.sh`, `inventory.sh`, Terraform
+  and the IDP from `main`): `label`, `os` (`{<os>: {label, versions, sshUser, family}}`),
+  `instanceTypePattern`, `excludedInstanceTypePattern` (`""` = none), `instanceIdPattern`,
+  `reservedTagPrefixes`, `forbiddenTagKeyCharacters`. `os.<os>.versions` is display-only (Launch
+  image cards); the spec does not store a version yet. `family` selects the software catalog column.
 - Terraform loads persisted spec and maps it to temporary `.tfvars.json` (`name`, `os`, `size`,
   `team`, original `requested_by`, `cloud_tags` including billing). It deletes that file on exit.
   Each stage derives Ansible variables and applicability from the committed entity.
@@ -281,6 +319,13 @@ spec:
   - templates: `https://github.com/amirasyraf/compute-factory-platform/blob/main/catalog/templates/*/template.yaml`;
   - org and the ssh-cert template come from the idp repo itself.
 - `catalog.orphanStrategy: delete`. Catalog processing interval should be short (POC).
+- **Launch** (IDP `/launch`, top bar; replaces "Create" there, `/create` still works): product cards are
+  Scaffolder templates with tag `product` (card name `cf/product`, else the title). A template with
+  annotation `cf/launch-flow: platform-image` gets platform cards (`/launch/<template>`, from
+  `GET /api/vm-sizes/platforms`; unavailable ones disabled as "Coming soon") and image cards
+  (`/launch/<template>/<platform>`: radio, name, version dropdown), then opens
+  `/create/templates/default/<template>?formData={"compute":{"platform":…,"os":…}}`. `vm-request` has
+  that tag and annotation (`cf/product: Virtual machine`).
 - Template names (`metadata.name`): `vm-request`, `vm-modify` (platform repo) and
   `ssh-cert` (idp repo). VM templates only **create an orchestrator run** and then finish. The whole
   pipeline, including non-VM steps such as the mock ServiceNow request, is an orchestrator run (§8.2):
@@ -296,7 +341,11 @@ spec:
     software, adJoin}`. Outputs `{runId, runUrl}`; link `Follow run` → `runUrl`. The VM page opens it
     with `?formData=` holding the VM ref and its current `compute` and `configuration`; the VM field is
     read-only (`EntityPicker`, `catalogFilter: { kind: Resource, spec.type: vm }`), `compute` uses
-    `ui:field: VmComputePicker`, software is the catalog checkboxes, AD join a boolean.
+    `ui:field: VmComputePicker` with `ui:options: { locked: true }` (platform and image shown without a
+    "Change" link), software is the catalog checkboxes, AD join a boolean.
+  - `VmComputePicker` shows the chosen platform and image (no dropdowns) with a "Change" link back to
+    Launch, then size cards and the Advanced picker for that platform. Platform/OS enums are
+    `[aws, azure]` / `[ubuntu]`; `instanceType` pattern is the union of the platforms' patterns.
   - `cf:vm:run` input `operation` is one of `modify | reapply | start | stop | reboot | update | destroy`.
     It calls `POST /api/vms/runs` (§8.2) with the task ID as request key. Start, stop, reboot, OS updates,
     re-apply and destroy are started from the VM page directly (same endpoint), not from templates.
@@ -409,9 +458,9 @@ one of their groups.
 |---|---|
 | `GET /runs/:id` | `RunView` |
 | `GET /runs?name=<vm>&limit=<1-20>` | `{ runs: RunView[] }`, newest first (default limit 10) |
-| `GET /summary` | `{ observedAt, observedError, vms: [{ name, latest: RunView, observed: ObservedVm \| null }] }`: the newest run per VM name visible to the caller, with the health check of that VM incarnation (§8.3) |
-| `POST /runs` | `{operation, vm, requestKey, compute?, software?, adJoin?}` → `{runId, runUrl}`. 400 invalid or (Modify) nothing to change, 403 other team or demo-disallowed instance type, 404 unknown VM, 409 conflict, 503 automation off |
-| `GET /observed/:name` | `{ enabled, checkedAt, error, vm: ObservedVm \| null }` (§8.3) |
+| `GET /summary` | `{ observedAt, observedError, vms: [{ name, latest: RunView, observed?: ObservedVm \| null }] }`: the newest run per VM name visible to the caller, with the health check of that VM incarnation (§8.3). `observed` is absent until the VM's platform has completed a scan; `observedAt` is the oldest configured platform's last scan |
+| `POST /runs` | `{operation, vm, requestKey, compute?, software?, adJoin?}` → `{runId, runUrl}`. 400 invalid, not the platform's instance type, or (Modify) nothing to change, 403 other team or demo-disallowed instance type, 404 unknown VM, 409 conflict, 503 automation off or platform/size files unreadable |
+| `GET /observed/:name?platform=<p>` | `{ enabled, checkedAt, error, vm: ObservedVm \| null }` (§8.3); `checkedAt`/`error` are that platform's (all platforms without `platform`) |
 | `POST /terminal` | `{vm, cols, rows}` → `{id, host, user}` (§8.4); 409 not running / no IP, 429 two sessions already open, 503 automation off |
 | `GET /terminal/:id/output?after=<seq>` | `{seq, data, closed: string \| null}`; waits up to 25 s for output after `seq` |
 | `POST /terminal/:id/input` | `{data}` (≤ 16 KiB keystrokes) or `{cols, rows}` (resize) → `{}` |
@@ -425,7 +474,7 @@ the run's request ID and its owner group the run's team. `requestKey` (`^[a-zA-Z
 Scaffolder task ID or a browser UUID) makes a repeated submit return the first run. Modify sends the
 complete new `compute` (`{platform, os, size | instanceType}`, platform/OS unchanged), `software`
 (catalog keys) and `adJoin`; the backend diffs them against the entity spec to plan the run, and
-computes the packages to remove. While the health check is fresh (under 2 minutes), it refuses (409)
+computes the packages to remove. While the VM platform's health check is fresh (under 2 minutes), it refuses (409)
 what cannot work: any operation but destroy when no instance of this incarnation exists, `start` on a
 running VM, `stop` on a stopped one, and everything else unless the VM is running.
 
@@ -477,18 +526,29 @@ type StageView = {
 ### 8.3 VM health check (`vms` backend plugin)
 
 Power state is observed, not desired: it is never stored in spec or inventory annotations (only
-`cf/public-ip` follows start/stop). Where `computeFactory.demoAutomation` is on, the plugin scans EC2
-every 30 seconds and right after any non-provision run finishes: `ec2:DescribeInstances` (filter
-`tag:cf:poc=true`, states pending/running/stopping/stopped/shutting-down) and `ec2:DescribeInstanceStatus`
-for running instances. The IDP host role (`infra/idp.tf`, policy `observe-vms`) allows only these two
-read-only calls. The result is kept in memory, keyed by the `cf:vm` tag (the live instance wins over
-one still shutting down).
+`cf/public-ip` follows start/stop). Where `computeFactory.demoAutomation` is on, the plugin scans every
+platform every 30 seconds and right after any non-provision run finishes, keeping each platform's
+result separately (one failing keeps its previous result and never affects the others):
+- AWS: `ec2:DescribeInstances` (filter `tag:cf:poc=true`, states pending/running/stopping/stopped/
+  shutting-down) and `ec2:DescribeInstanceStatus` for running instances. The IDP host role
+  (`infra/idp.tf`, policy `observe-vms`) allows only these two read-only calls.
+- Azure (only when `AZURE_READER_SECRET_ID` is set; otherwise its status error is "Azure health check
+  not configured" and Azure VMs are never refused on its account): with the Reader principal, ARM
+  list VMs (Compute `2026-04-01`, plus `statusOnly=true`), public IPs (Network `2026-01-01`) and
+  Resource Health availability statuses (`2026-07-01`) of the subscription. Power state `starting` →
+  pending, `running`, `stopping`/`deallocating` → stopping, `stopped`/`deallocated` → stopped;
+  provisioning `Deleting` → shutting-down. Health (running only): `Available` → ok,
+  `Unavailable`/`Degraded` → impaired, `Unknown` → unknown, none yet → initializing. The public IP
+  is the one tagged with the same `cf:vm` and `cf:request-id`.
+The result is kept in memory, keyed by the `cf:vm` tag (the live instance wins over one still
+shutting down).
 
 ```ts
 type ObservedVm = {
-  instanceId: string;
+  platform: string;            // aws | azure
+  instanceId: string;          // EC2 instance ID or Azure VM ARM ID
   state: string;               // pending | running | stopping | stopped | shutting-down
-  health: 'ok' | 'impaired' | 'initializing' | 'unknown' | null; // EC2 status checks; null unless running
+  health: 'ok' | 'impaired' | 'initializing' | 'unknown' | null; // cloud status checks; null unless running
   instanceType: string | null;
   publicIp: string | null;
   requestId: string | null;    // cf:request-id tag; consumers ignore another incarnation
@@ -499,8 +559,8 @@ type ObservedVm = {
 
 - `checkedAt: null` means no scan has completed yet; `error` is the last scan's failure (the previous
   result is kept). `enabled: false` (local development) means no health check runs.
-- A VM whose catalog status is `ready` but whose incarnation has no instance is shown as "Not found in
-  AWS"; a stopped one as "Stopped". A console stop or start is picked up within 30 seconds; the
+- A VM whose catalog status is `ready` but whose incarnation has no instance is shown as "Instance not
+  found" ("No instance … found in <platform>" in messages); a stopped one as "Stopped". A console stop or start is picked up within 30 seconds; the
   inventory `cf/public-ip` is then stale until the next start/stop run, so the UI prefers the observed
   address.
 ### 8.4 Browser terminal (`vms` backend plugin)
@@ -508,8 +568,9 @@ type ObservedVm = {
 - "Open terminal" on the VM page opens an SSH session from the IDP host to the VM: the backend checks
   access exactly like `POST /runs` (team or admin; entity read with the user's credentials), refuses a VM
   the fresh health check does not show running, and connects to the observed public IP (else
-  `cf/public-ip`). It signs a per-session key (§3) and runs the system `ssh -tt ubuntu@<ip>` in a PTY
-  (`node-pty`); host keys are not pinned (POC, same as the fry stages).
+  `cf/public-ip`). It signs a per-session key (§3) and runs the system `ssh -tt <cf/ssh-user>@<ip>` in a PTY
+  (`node-pty`); 409 when `cf/ssh-user` is missing or not a valid user name. Host keys are not pinned
+  (POC, same as the fry stages).
 - Transport is plain HTTP, not WebSocket (TLS-inspecting proxies hold back long-lived streams): the
   browser (xterm.js) posts keystrokes in order and long-polls output (25 s). Sessions belong to the user
   who opened them; other users get 404.
@@ -545,39 +606,61 @@ type ObservedVm = {
 | `BACKSTAGE_TOKEN` | random (static external access token) |
 | `AWS_REGION` | `ap-southeast-2` |
 | `SSH_CA_SECRET_ID` | `compute-factory/ssh-ca` |
+| `AZURE_READER_SECRET_ID` | `compute-factory/azure-reader` (unset: Azure specs, picker and health check report "not configured") |
 
 - Caddy terminates TLS for `IDP_DOMAIN` and proxies to the backstage container on port 7007.
   It rewrites only `/mock-rest/servicenow` to the authenticated `/api/mock-rest/servicenow` plugin route;
   other paths are unchanged. No new environment variable or external-access token is introduced.
 - Health URL used by `./poc up`: `https://idp.amirasyraf.dev/.backstage/health/v1/readiness` must return 200.
 
-## 10. Terraform platform contract (`terraform/platforms/aws`, Agent B)
+## 10. Terraform platform contract (`terraform/platforms/<p>`: `aws`, `azure`)
 
-- Backend: `backend "s3" {}` with partial config passed at init:
-  `-backend-config=bucket=$TF_STATE_BUCKET -backend-config=key=vms/aws/<name>/terraform.tfstate -backend-config=region=ap-southeast-2 -backend-config=use_lockfile=true`.
+- Each platform directory has the Terraform root, `platform.json` (§7), `sizes.json`, `adopt.sh <vars-file>
+  <tracked-addresses>` (adopt untracked resources of this incarnation; fail on ambiguity) and
+  `power.sh` (sourced; `vm_describe` → `{state, ip, tags}`, `vm_start`, `vm_stop`, `vm_reboot`).
+- Backend: `backend "s3" {}` with partial config passed at init (also for Azure: state stays in AWS):
+  `-backend-config=bucket=$TF_STATE_BUCKET -backend-config=key=vms/<p>/<name>/terraform.tfstate -backend-config=region=ap-southeast-2 -backend-config=use_lockfile=true`.
 - Variables: `name` (required), `os` (default `ubuntu`), `size` (default `S`), `instance_type` (default
   `""`; overrides `size`), `team` (default `""`),
-  `requested_by` (default `""`), `request_id` (default `""`; VM incarnation, tagged as `cf:request-id`).
+  `requested_by` (default `""`), `request_id` (default `""`; VM incarnation, tagged as `cf:request-id`),
+  `cloud_tags`; Azure also `location` (default `australiaeast`).
   **`terraform destroy -var name=<name>` must work with nothing else**,
   because `./poc down` uses that.
-- Outputs: `public_ip`, `ssh_user`, `instance_id`, `instance_type`.
-- Size map: `terraform/platforms/aws/sizes.json` in the platform repo, a JSON object of size
-  (`XS`/`S`/`M`/`L` = `t3.micro`/`small`/`medium`/`large`) to EC2 instance type. `spec.py` and Terraform
-  read it; the IDP `vm-sizes` backend reads the same file from `main` via the GitHub API for the request
-  form's size cards (`ui:field: VmComputePicker` on `compute`) and adds live specs from
-  `ec2:DescribeInstanceTypes`. Its Advanced picker lists every x86_64, EBS-backed type offered in the
-  region (`ec2:DescribeInstanceTypeOfferings`; IDP host role, read-only). Modify uses the same field. Terraform rejects types that
-  cannot boot x86_64 and launches into a default subnet whose AZ offers the type.
-- Demo mode: while on, the IDP accepts `compute.instanceType` only from `t3.micro`, `t3.small`,
-  `t3.medium`, `t3.large` (`/api/vms/demo/state` returns them as `instanceTypes`), for requests and
-  Modify; sizes are allowed.
+- Outputs: `public_ip`, `ssh_user` (from `platform.json`), `instance_id`, `instance_type`.
+- Size map: `terraform/platforms/<p>/sizes.json`, size (`XS`/`S`/`M`/`L`) to instance type. AWS:
+  `t3.micro`/`small`/`medium`/`large`. Azure: `Standard_D2ls_v6`/`D2s_v6`/`D4ls_v6`/`D4s_v6`. `spec.py`
+  and Terraform read it; the IDP reads the same files from `main` (§10a). Modify uses the same field.
+  AWS Terraform rejects types that cannot boot x86_64 and launches into a default subnet whose AZ offers
+  the type. Azure: an admin key (`tls_private_key`, only in state) is required at launch and disabled by
+  the `access` stage; the VM ignores image and admin-key changes; the disk controller is Azure's default
+  for the size and image (NVMe on v6).
+- Demo mode: while on, the IDP accepts `compute.instanceType` only from the union of every platform's
+  `sizes.json` values (`/api/vms/demo/state` returns them as `instanceTypes`; empty, and explicit types
+  refused with 503, when the files cannot be read), for requests and Modify; sizes are allowed.
 - A changed `size`/`instance_type` is an in-place update (stop, modify, start); the provision plan still
   refuses any delete or replacement.
 - Resources are tagged `cf:poc=true`, `cf:vm=<name>`, `cf:team=<team>`, and `cf:request-id=<request_id>`
   when set. No key pair (the CA is used). The instance ignores AMI changes after creation, so a retry after
   a newer bake never replaces it.
-- `./poc down` runs, for each key under `vms/aws/*/terraform.tfstate`:
-  `terraform -chdir=~/projects/compute-factory-platform/terraform/platforms/aws init -reconfigure <backend-config…> && terraform … destroy -auto-approve -var name=<name>`.
+- `./poc down` runs, for each key under `vms/<p>/*/terraform.tfstate`:
+  `terraform -chdir=~/projects/compute-factory-platform/terraform/platforms/<p> init -reconfigure <backend-config…> && terraform … destroy -auto-approve -var name=<name>`
+  (Azure with the laptop's `ARM_*` service principal).
+
+### 10a. IDP `vm-sizes` API (signed-in users)
+
+- `GET /api/vm-sizes/platforms` → `{platforms: [{id, label, available, os: [{id, label, versions}],
+  reservedTagPrefixes, forbiddenTagKeyCharacters, error}]}`: `aws`, `azure` from `platform.json` on
+  `main` (cached 5 minutes), plus `{id: vsphere, label: vSphere, available: false}` ("Coming soon").
+- `GET /api/vm-sizes/sizes?platform=<p>` (default `aws`) → `{platform, label, reservedTagPrefixes,
+  sizes: [{size, instanceType, specs}], error}`. Specs: AWS `ec2:DescribeInstanceTypes`; Azure the
+  Resource SKUs API (`2021-07-01`, location filter) with `quotaOk`.
+- `GET /api/vm-sizes/instance-types?platform=<p>` → `{region, types}`; each type `{type, family,
+  category, currentGeneration, bareMetal, gpus, vcpus, memoryMiB, architectures, network, burstable,
+  quotaOk}`. AWS: every x86_64, EBS-backed type offered in the region (`quotaOk: null`). Azure: VM SKUs
+  without a `Location` restriction, `CpuArchitectureType=x64`, `HyperVGenerations` containing `V2`;
+  category from the series letter; `currentGeneration` always true; `quotaOk` = free family and regional
+  `cores` usage (Compute usages, cached 5 minutes) ≥ vCPUs, null when usages are unavailable. 503 when
+  the list is unavailable.
 
 ## 11. Ground rules for all agents
 

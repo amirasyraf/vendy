@@ -1,6 +1,9 @@
 # Compute Factory (POC)
 
-An IDP (Backstage) and a compute platform (Packer + Terraform + Ansible on GitHub Actions) for self-service VMs.
+An IDP (Backstage) and a compute platform (Packer + Terraform + Ansible on GitHub Actions) for self-service VMs
+on **AWS and Azure** (Ubuntu 26.04). Users start from **Launch**: product, platform and image cards, then
+the VM form. AWS is the shared base (SSH CA, Terraform state, IDP host); each platform is a
+`terraform/platforms/<p>/` directory in the platform repo.
 
 Each VM's `catalog-info.yaml` is its single desired-configuration source: structured `spec.compute`,
 `spec.configuration`, optional `spec.billing` and `spec.cloudTags`. Workflows read that file for
@@ -13,7 +16,7 @@ and no automatic reconciliation on Git edits. See `CONTRACTS.md` §7 for the val
 
 | Repo | Purpose |
 |---|---|
-| `compute-factory` (this) | design, `./poc` lifecycle, shared AWS infra (`infra/`) |
+| `compute-factory` (this) | design, `./poc` lifecycle, shared AWS + Azure infra (`infra/`) |
 | `compute-factory-idp` | Backstage app + deployment |
 | `compute-factory-builder` | bake: golden images (Packer + Ansible) |
 | `compute-factory-platform` | provision + fry: Terraform, Ansible, GHA workflows, VM inventory, templates |
@@ -48,18 +51,22 @@ page first; dispatch is never automatically retried. `watch-bake` only checks th
 or AMI existence. Do not rerun `up` just to reconnect the watcher: it is not a resume command and resets
 VM inventory. Use `./poc down` only for intentional teardown of the POC **and all requested VMs**.
 
-After a VM request, the Scaffolder task streams the complete workflow process graph. The VM's catalog page
-shows the same live, team-scoped view: validation, inventory registration, Terraform provisioning, every fry
-job, finalization and failure handling, plus request details, refresh time and the full Actions run link.
+After a VM request, the browser goes to the run page: every stage of the run (ServiceNow mock,
+registration, Terraform provisioning, every fry stage, finalization) with retries, errors and GitHub
+runs. The VM page shows the same live, team-scoped view.
 
 VM requests first demonstrate a real REST POST to the IDP's authenticated mock ServiceNow endpoint
 (`/mock-rest/servicenow`), returning HTTP 201 and a fake request number before GHA dispatch. It creates
 no real ticket and performs no approval. See `CONTRACTS.md` §8 and the IDP README for details.
 
-Requirements: `terraform`, `gh` (authenticated), `aws` (profile `amirasyraf`), `docker` (buildx, for the arm64 IDP image), `jq`, `ssh` with `~/.ssh/id_ed25519`.
+Requirements: `terraform`, `gh` (authenticated), `aws` (profile `amirasyraf`), `az` (logged in to
+subscription `74b39a79-…`, e.g. `azsp`), the `cf-admin-local` service principal's `ARM_*` variables
+(`~/.zshrc`; Terraform azurerm needs the `.pfx` certificate), the gitignored Azure reader certificate
+`.poc-azure-reader.pem`, `docker` (buildx, for the arm64 IDP image), `jq`, `ssh` with `~/.ssh/id_ed25519`.
+The Azure identities and `AZURE_*` repo variables are one-time setup that survives `down` (DESIGN.md §9).
 
-`down` is safe to run repeatedly and after a failed `up`. Everything in AWS is tagged `cf:poc=true`;
-`down` ends by checking that nothing with that tag remains.
+`down` is safe to run repeatedly and after a failed `up`. Everything in AWS and Azure is tagged
+`cf:poc=true`; `down` ends by checking that nothing with that tag remains on either cloud.
 
 The `idp.amirasyraf.dev` DNS record lives in `~/projects/cloudflare/amirasyraf.dev/idp.tf` and is only
 applied with `-target` by `./poc`.
