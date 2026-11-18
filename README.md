@@ -25,12 +25,13 @@ and no automatic reconciliation on Git edits. See `CONTRACTS.md` §7 for the val
 
 ## Lifecycle
 
-Sibling clones live in the same parent directory as this repo (`./poc up` clones any that are missing).
+Sibling clones live in the same parent directory as this repo (`./poc up` clones any that are missing
+without changing existing checkouts). Bootstrap and teardown use temporary clones of canonical `main`.
 
 ```bash
 cp poc.env.example .poc.env   # once: Backstage PAT
 ./poc set-password amirasyraf  # once per user: IDP login (hash kept in .poc-users)
-./poc up                      # ~15-20 min: infra, GitHub wiring, bake, IDP deploy
+./poc up                      # shared infra, exact AWS/Azure bake verification, then IDP deploy
 ./poc status                  # what exists right now
 ./poc watch-bake <run-id>      # monitor an existing bake; never dispatches another
 ./poc deploy-idp              # build and deploy Backstage on the existing host
@@ -39,7 +40,7 @@ cp poc.env.example .poc.env   # once: Backstage PAT
 ./poc logs [backstage|caddy|postgres|all] [since]   # IDP container logs (default backstage, 30m)
 ./poc task <task-id>          # Scaffolder task status + stored events from Postgres
 ./poc run <run-id>            # VM orchestrator run + stage state (attempts, GitHub run IDs, errors)
-./poc down                    # ~5-10 min: cancels runs, destroys all VMs, sweeps, destroys infra, verifies CLEAN
+./poc down                    # freeze workflows, destroy VMs and infra, sweep owned orphans, verify CLEAN
 ```
 
 For an application change, [build and smoke-check one local image](../compute-factory-idp/README.md#checks)
@@ -53,12 +54,13 @@ reporting an **unknown outcome**, not a failed bake. Only a completed run with c
 counts as a successful bake. `watch-bake` exits 0 for success, 1 for a completed non-success conclusion,
 or 2 when monitoring cannot determine the outcome.
 
-If `up` cannot finish, it leaves resources and workflows in place. Check `./poc status` and
-`.generated/logs/{bake,idp}.log`; resume monitoring with `./poc watch-bake <run-id>` using the logged
-run ID. If dispatch/run discovery could not be confirmed, find the run in the builder repo's Actions
-page first; dispatch is never automatically retried. `watch-bake` only checks the bake, not IDP health
-or AMI existence. Do not rerun `up` just to reconnect the watcher: it is not a resume command and resets
-VM inventory. Use `./poc down` only for intentional teardown of the POC **and all requested VMs**.
+If `up` cannot finish, it leaves resources in place. Check `./poc status` and `.generated/logs/`;
+`./poc watch-bake <run-id>` resumes monitoring without dispatching. An identified run ID is also saved to
+`.generated/bake-run-id`. If the response did not identify a run, inspect the builder repo's Actions page;
+`up` never guesses or automatically dispatches again. The platform workflow stays gated and the IDP
+unpublished until both artifacts are verified. `up` is not a resume command: it refuses nonempty state
+or VM inventory and never resets the inventory. Use `./poc down` only for intentional teardown of the POC
+**and all requested VMs**. `up` and `down` reject all arguments; there is no dry-run or force-up option.
 
 After a VM request, the browser goes to the run page: every stage of the run (ServiceNow mock,
 registration, Terraform provisioning, every fry stage, finalization) with retries, errors and GitHub
@@ -72,19 +74,24 @@ Requirements: `terraform`, `gh` (authenticated), `aws` (profile `amirasyraf`), `
 subscription `74b39a79-…`, e.g. `azsp`), plus the `cf-admin-local` `.pfx` certificate at
 `~/.config/azure/cf-admin-local.pfx` (the POC script supplies its fixed `ARM_*` defaults and accepts
 explicit environment overrides). The gitignored Azure reader certificate `.poc-azure-reader.pem`,
-`docker` (buildx, for the arm64 IDP image), `jq`, `ssh` with `~/.ssh/id_ed25519`, and `dig` for
-teardown DNS verification are also needed.
+`docker` (buildx, for the arm64 IDP image), `jq`, `python3`, `ssh` with `~/.ssh/id_ed25519`, and `dig`
+are also needed. A per-user host lock covers lifecycle and IDP deploy/maintenance commands across
+checkouts, including their active workers. Do not run POC mutations from another host or directly
+against its Terraform state. Lifecycle commands use the default Terraform workspace and reject
+`TF_CLI_ARGS*`/`TF_VAR_*` overrides.
 The Azure identities and `AZURE_*` repo variables are one-time setup that survives `down` (DESIGN.md §9).
 
-`down` is safe to rerun after a failed teardown or `up`. Azure gallery image deletion can take
-several minutes; teardown prints the image version before it waits. Teardown first stops the IDP,
-disables the builder/platform resource workflows, cancels all active runs, and refuses to sweep if
-workflow quiescence cannot be proven. The final multi-region AWS, Azure and DNS checks must all
-confirm absence across stable repeated passes before `down` prints `CLEAN`. If a resource remains
-or a lookup fails, it reports the affected check and exits nonzero. It removes `NetworkWatcherRG`,
-which Azure creates untagged with the first VNet, only while it holds only automatic watchers.
-The two workflows remain disabled after teardown; `up` re-enables them after shared infrastructure
-is ready and clears the shared `CF_POC_MAINTENANCE` gate.
+`down` is safe to rerun after a partial `up` or `down`. It gates and disables both resource workflows,
+cancels runs until they are quiescent, then stops the owned IDP. A failed VM destroy retains the state
+bucket and golden images for recovery; independent owned compute cleanup still runs when lock safety
+and quiescence can be proven. The retained state or images can still incur charges. Check the named
+logs and leftover checks, fix the reported blocker, and rerun; do not empty the bucket manually.
+Azure gallery deletion can take several minutes. Untagged/shared resources such as `NetworkWatcherRG`
+are not removed, and possible legacy AWS Packer leftovers are reported rather than deleted by name.
+
+`CLEAN` requires repeated AWS, Azure and DNS absence checks, empty local Terraform state, cleared
+GitHub wiring, an empty `vms/` inventory, and workflows verified disabled and idle. The manual Azure
+identities, repository credentials and Caddy TLS backup remain by design.
 
 The `idp.amirasyraf.dev` DNS record lives in `~/projects/cloudflare/amirasyraf.dev/idp.tf` and is only
 applied with `-target` by `./poc`.

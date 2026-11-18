@@ -608,8 +608,9 @@ type ObservedVm = {
   - copies the image's packaged `docker-compose.yml` and `Caddyfile`, plus `<env-file>` as `.env`, to `/opt/idp`;
   - starts the host-local `registry` service (`127.0.0.1:15000` on the host only) and pushes the
     image to it through an SSH tunnel (only missing layers transfer);
-  - verifies the pulled and deployed Backstage image IDs match the local image, brings the stack up,
-    and reloads Caddy. Garbage collection is explicit via `./poc prune-idp-images`
+   - verifies the pulled and deployed Backstage image IDs match the local image and brings the stack
+     up. Fresh Caddy reads its config at startup; a reused running Caddy reloads it with bounded
+     retries. Garbage collection is explicit via `./poc prune-idp-images`
     (`deploy/deploy.sh --prune <host>`), not part of rollout.
   It must be idempotent and must not prompt.
 - `./poc up` configures DNS and restores TLS storage as needed for bootstrap. `./poc deploy-idp
@@ -631,6 +632,7 @@ type ObservedVm = {
   It rewrites only `/mock-rest/servicenow` to the authenticated `/api/mock-rest/servicenow` plugin route;
   other paths are unchanged. No new environment variable or external-access token is introduced.
 - Health URL used by `./poc up`: `https://idp.amirasyraf.dev/.backstage/health/v1/readiness` must return 200.
+  The deployment also confirms it can read catalog locations and submit authenticated refresh requests.
 
 ## 10. Terraform platform contract (`terraform/platforms/<p>`: `aws`, `azure`)
 
@@ -663,8 +665,10 @@ type ObservedVm = {
   when set. No key pair (the CA is used). The instance ignores AMI changes after creation, so a retry after
   a newer bake never replaces it.
 - `./poc down` runs, for each key under `vms/<p>/*/terraform.tfstate`:
-  `terraform -chdir=~/projects/compute-factory-platform/terraform/platforms/<p> init -reconfigure <backend-config…> && terraform … destroy -auto-approve -var name=<name>`
-  (Azure with the laptop's `ARM_*` service principal).
+  initializes the S3 backend from the canonical platform `main` checkout and runs
+  `terraform destroy -auto-approve -var name=<name>` (Azure with the laptop's `ARM_*` service principal).
+  Only successful destroys remove the corresponding S3 state object. Outstanding or unverified VM
+  state keeps the bucket and golden images available for recovery.
 
 ### 10a. IDP `vm-sizes` API (signed-in users)
 

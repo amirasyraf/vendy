@@ -1,7 +1,7 @@
-# Holds per-VM Terraform state (vms/<platform>/<name>/terraform.tfstate). Emptied and deleted by `./poc down`.
+# Holds per-VM Terraform state. `./poc down` deletes state only after a successful VM destroy.
 resource "aws_s3_bucket" "tfstate" {
   bucket        = local.state_bucket
-  force_destroy = true
+  force_destroy = false
 }
 
 resource "aws_s3_bucket_public_access_block" "tfstate" {

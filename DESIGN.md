@@ -690,7 +690,7 @@ compute-factory/                 # 4th repo: the "home" of the POC
   .poc-users                     # gitignored: username:scrypt-hash lines (./poc set-password)
   infra/                         # ONE Terraform root, LOCAL state (gitignored), applied only by ./poc
     main.tf                      #   default_tags { cf:poc = "true" } on the AWS provider
-    state-bucket.tf              #   S3 bucket for VM Terraform state, force_destroy = true
+    state-bucket.tf              #   S3 bucket for VM Terraform state; never force-empty
     ssh-ca.tf                    #   tls_private_key (ed25519) -> Secrets Manager secret (recovery_window_in_days = 0)
                                  #   + SSM parameter /compute-factory/ssh-ca-pub
     idp.tf                       #   IDP EC2 (t4g.medium), EIP, SG, instance role (read the CA secret; read-only EC2 describe for sizes and the VM health check)
@@ -703,45 +703,38 @@ compute-factory/                 # 4th repo: the "home" of the POC
 
 - The CA key is created by Terraform, so it exists only in local state and Secrets Manager. A new CA is
   made on every `up`, and old certs stop working, which is the expected result for a clean slate.
-- `recovery_window_in_days = 0` deletes the secret immediately, so the next `up` can reuse the same name.
+- `recovery_window_in_days = 0` requests permanent deletion. AWS still processes it asynchronously;
+  teardown verifies absence rather than assuming a successful delete request frees the name.
 - The infra state stays local because a remote state bucket would have to survive `down`. It's
   disposable like everything else.
 
-### 12.2 `./poc up` (about 15–20 min; bake dominates)
+`up`, `down`, IDP deploy and registry maintenance share a per-user host lock across checkouts. An
+inherited OS file descriptor keeps the lock held until surviving workers exit. Other hosts are not
+covered: never run competing lifecycle or Terraform operations from a different machine. Lifecycle
+commands use the default workspace and reject ambient `TF_CLI_ARGS*` / `TF_VAR_*` overrides.
 
-1. **Preflight**:
-   - check the tools (`terraform`, `gh`, `aws`, `az`, `docker`, `jq`), the `amirasyraf` AWS profile, `gh`
-      auth, the `az` subscription and `.poc.env`; `up` supplies the fixed `cf-admin-local`
-      `ARM_*` defaults and requires its local `.pfx` certificate;
-   - check the one-time Azure setup (section 9): `.poc-azure-reader.pem` and the `AZURE_*` variables on
-     the builder and platform repos;
-   - fail fast if `infra` state already exists (the run assumes a clean slate; run `down` first).
-2. **`terraform -chdir=infra apply`**: state bucket, CA secret + public key parameter, IDP EC2 + EIP, tokens,
-   the Azure image gallery and the Azure reader secret.
-3. **GitHub wiring** (`gh variable set` / `gh secret set` on the builder and platform repos): `AWS_ROLE_ARN`,
-   `TF_STATE_BUCKET`, `BACKSTAGE_URL`, `BACKSTAGE_TOKEN`. Reset `vms/` in the platform repo to empty.
-4. **Enable the builder `bake.yml` and platform `stage.yml` workflows**, then run in parallel:
-   - A. **Bake**: dispatch `bake.yml` once, retry run discovery without redispatching, then poll
-     `gh run view --json status,conclusion` every 30 seconds. Status-read errors are retried (up to
-     10 consecutive errors); monitoring has a one-hour limit. Only `completed` + `success` counts
-     as success; other completed conclusions fail. Exhausted monitoring or unconfirmed dispatch/run
-     discovery reports an unknown outcome, not a failed workflow. After confirmed success, query AWS
-     for the latest managed Ubuntu AMI and Azure for the latest gallery version.
-   - B. **IDP**:
-      - DNS: targeted apply of the `idp` record in `~/projects/cloudflare/amirasyraf.dev`, with the EIP passed in; restore saved Caddy TLS storage if present;
-     - write `.env` from Terraform outputs and `.poc.env`;
-     - run `compute-factory-idp/deploy/deploy.sh`: build the image locally, ship it, `docker compose up -d`;
-       - wait for `https://idp.amirasyraf.dev/.backstage/health/v1/readiness` to return 200, which proves
-         the Backstage runtime and Caddy/TLS path are healthy.
-5. **Done**: print the URL and a summary of what was created.
+### 12.2 `./poc up`
 
-On failure or an unknown bake outcome, `up` leaves resources and workflows in place and still waits
-for the parallel IDP deployment. Check `./poc status` and `.generated/logs/{bake,idp}.log`.
-`./poc watch-bake <run-id>` resumes the same read-only bake monitor without dispatching a workflow,
-changing GitHub wiring or resetting inventory. It exits 0 for success, 1 for a completed non-success
-conclusion, and 2 for an unknown outcome. It does not check IDP health or AMI existence. If the run ID
-was not discovered, find it in the builder's Actions page first. Do not rerun `up` to reconnect a
-watcher; it is not a resume command. `down` is intentional teardown, not a monitoring recovery step.
+1. **Preflight**: check Docker/buildx, CLI tools, the AWS account, Azure subscription, certificate,
+   SSH key, Cloudflare configuration, `.poc.env`, and repository AWS/Azure wiring. Refuse to apply
+   if local state is unreadable/nonempty or platform `main` does not have an empty inventory.
+   Gate and disable resource workflows; verify they are quiescent and the POC cloud/DNS scope is clean.
+2. **Shared infra**: apply the local Terraform root using the pinned AWS account and Azure subscription;
+   wire `TF_STATE_BUCKET`, `BACKSTAGE_URL` and `BACKSTAGE_TOKEN` in the platform repo. Existing sibling
+   checkouts are not rebased or used as bootstrap sources.
+3. **Bake**: open only `bake.yml`, request a run ID in the dispatch response, and never retry an
+   ambiguous dispatch. Poll that exact run. After `completed` + `success`, download its two Packer
+   manifests and require the named AMI and Azure version to be usable in the expected cloud scope.
+4. **IDP**: only then open `stage.yml`. Wait for host initialization, apply the targeted Cloudflare DNS
+   record, restore any TLS backup, and deploy from a temporary clone of IDP `main`. Require HTTP 200
+   and authenticated catalog access/refresh requests before declaring success.
+
+`up` never clears inventory and has no force/recovery switch. Failed bootstrap retains resources; check
+`./poc status` and `.generated/logs/{infra-apply,bake,idp}.log`. An exact dispatch ID is saved in
+`.generated/bake-run-id`. `./poc watch-bake <run-id>` only monitors the run: it returns 0 for success,
+1 for a completed non-success conclusion, and 2 if the outcome is unknown. The monitor polls every
+30 seconds with a one-hour limit and stops after 10 consecutive failed status reads. It does not
+verify artifacts, publish DNS, or deploy the IDP. `down` is intentional teardown, not a watcher recovery step.
 
 Routine `./poc deploy-idp [<image-id>]` skips infrastructure setup and image cleanup. Build with
 `compute-factory-idp/deploy/build.sh`, smoke-test that local image ID, and pass the same ID to deploy
@@ -749,61 +742,43 @@ without rebuilding. The existing host runs the packaged Compose/Caddy config and
 Run `./poc prune-idp-images` separately when the dedicated host needs disk space; the registry pauses
 for garbage collection but the running application stays up.
 
-### 12.3 `./poc down` (about 5–10 min)
+### 12.3 `./poc down`
 
-`down` requires an Azure CLI login but does not fail preflight when the Terraform-only `ARM_*`
-variables are absent; it still runs the independent Azure sweep. If local `infra` state exists,
-Terraform destroy also uses those variables when available and any remaining resources are handled
-by the named/tagged sweeps.
+1. **Freeze**: set `CF_POC_MAINTENANCE=1` in both repos, manually disable the two resource workflows,
+   and verify the freeze. Cancel outstanding runs from those workflows, including runs that become
+   visible on a later poll. Require two empty polls and verify quiescence before sweeping. Save TLS
+   from the tagged IDP when reachable, and stop it at EC2; the tagged sweep can still terminate it
+   if stopping fails and the workflow freeze is proven.
+2. **Protect VM recovery state**: inspect the POC-tagged S3 bucket and validate state and lock keys.
+   A recent/unreadable lock blocks sweeping. After the freeze, a lock older than the platform's
+   20-minute runner limit may be unlocked through Terraform by its recorded ID. From a temporary clone
+   of platform `main`, populate a provider mirror serially, then run the workers in parallel (default
+   5, `PARALLEL_DESTROYS` supports 1–20). Delete a VM's state object only after successful Terraform
+   destroy. Keep the bucket, gallery/AMIs and inventory on a VM failure or if objects/versions
+   remain; independent owned compute cleanup still runs once quiescence and lock safety are proven.
+   Delete an empty bucket without force before shared Terraform destroy, including for old state
+   that recorded `force_destroy = true`.
+3. **Sweep owned resources**: terminate tagged AWS instances, sweep tagged detached disks, ENIs, EIPs,
+   groups and key pairs across every enabled region. When VM state is resolved, deregister tagged AMIs
+   including disabled ones before deleting independently tagged snapshots. Delete tagged Azure VM and
+   build groups; remove gallery versions only from the verified POC-owned gallery resource group.
+   `NetworkWatcherRG` is unowned and left alone. AWS named fallbacks require ownership tags, and
+   untagged Packer-name candidates are reported, never deleted.
+4. **Shared infra and DNS**: remove the targeted Cloudflare record. Destroy shared Terraform resources
+   only when the VM bucket can safely be removed and gallery versions are resolved. Use the Azure
+   certificate defaults when available. Independent AWS/Azure sweeps still apply when Terraform
+   cannot complete; do not force-empty the state bucket. Retry shared Terraform state reconciliation
+   after fallback cleanup when possible.
+5. **Verify before GitHub cleanup**: require empty local Terraform state and consecutive successful
+   workflow, multi-region AWS, Azure POC-tag and DNS checks. Retry transient cloud/DNS results inside
+   a bounded window. Check both service-specific inventories and the AWS Resource Groups Tagging API;
+   a denied or failed lookup is not proof of absence.
+6. **GitHub cleanup**: verify deletion of platform wiring and reset `vms/` on platform `main` with a
+   normal non-force push. Verify the published inventory and workflow freeze before printing `CLEAN`.
 
-Order matters: stop anything that could create resources, then destroy what Terraform knows about,
-then sweep anything else, then verify.
-
-1. **Freeze**:
-    - stop the IDP host at the EC2 layer, so no new requests can dispatch work;
-    - set the shared `CF_POC_MAINTENANCE=1` gate (both workflows honor it), disable the builder `bake.yml`
-      and platform `stage.yml` workflows, then cancel every queued or
-      in-progress run discovered through paginated GitHub API results;
-    - wait until both repositories report zero active runs. If workflow disabling, cancellation,
-      enumeration or quiescence verification fails, stop without sweeping and do not claim `CLEAN`.
-      The workflows remain disabled until a later `up` re-enables them;
-2. **Destroy user VMs**:
-   - for every `vms/*/*/terraform.tfstate` in the state bucket, run `terraform destroy` locally from the platform
-     repo checkout with that state key;
-   - run them in parallel (`xargs -P 5`), so time doesn't grow with the number of VMs;
-   - this uses the same platform root module as provisioning, so it works for any platform added later.
-3. **Sweep leftovers by tag** (catches failed provisions, interrupted bakes, missing state; AWS regions
-   are processed in bounded parallel workers):
-   - deregister AMIs tagged `cf:poc=true` and delete their snapshots;
-   - terminate instances tagged `cf:poc=true`, including Packer build instances (Packer `run_tags`);
-   - delete tagged detached volumes, available network interfaces and EIPs;
-   - remove the exact-name `cf-idp` instance, EIP, security group and `cf-idp-admin` key pair as a fallback when a partial apply created them before tags/state were recorded;
-   - do not delete untagged `packer_*` resources by name; report them and fail closed instead of risking unrelated-resource deletion;
-   - delete Azure resource groups tagged `cf:poc=true` except infra's (VMs, Packer build groups), then
-     every gallery image definition's versions (Packer-published, outside Terraform; a definition can't be
-      deleted while it has versions). Log each version before waiting for Azure to delete it. A
-      missing gallery is fine; a failed gallery lookup or version deletion stops teardown.
-4. **DNS**: targeted apply removing the `idp` record.
-5. **`terraform -chdir=infra destroy`**: IDP EC2/EIP, CA secret, state bucket (force-destroy), tokens,
-   Azure gallery and reader secret; then a final sweep of anything tagged `cf:poc=true` on both clouds,
-   and `NetworkWatcherRG` (Azure creates it, untagged, with the first VNet in a region; deleted only while
-   it holds nothing but those automatic network watchers).
-6. **GitHub cleanup**: delete the repo variables and secrets set in `up`, and commit an empty `vms/`.
-7. **Verify**:
-    - check the tagged EC2 resources, available network interfaces and EIPs across every enabled AWS region,
-      account-owned state bucket,
-      named AWS secrets, SSM parameter, IAM role/profile, and exact-name `cf-idp` security group/key pair;
-      AWS point lookups must explicitly report not found to count as absent;
-    - check for an empty Azure resource-group/resource inventory and the IDP DNS record;
-    - repeat the full workflow/cloud/DNS verification for stable passes. If a required lookup fails or reports a remaining resource, report the affected check and exit
-      nonzero instead of printing `CLEAN`. The AWS Resource Groups Tagging API is required to
-      report no tagged resources; eventual-consistency records therefore fail closed rather than
-      being treated as proof of absence.
-
-`down` tolerates partial cloud state: every cleanup target continues if it is already gone, so it also
-cleans up after a failed `up`. The freeze and verification gates are fail-closed; a run that cannot
-prove workflow quiescence or absence must be rerun after the reported blocker is resolved. Running a
-successful `down` twice is harmless.
+`NOT CLEAN` means teardown could not prove completion. Check `.generated/logs/` and the reported
+resource IDs; fix the blocker and rerun. A retained bucket/image or a resource outside automated
+ownership rules may still incur charges. Never clear state just to obtain `CLEAN`.
 
 ### 12.4 `./poc status`
 
@@ -819,6 +794,6 @@ pipelines), so you can check before or after `up`/`down`.
 - No resource may be created outside Terraform or Packer, apart from Packer's temporary key pairs and
   security groups. Teardown detects any remaining named Packer temporary resources and fails closed
   rather than deleting by an unowned name prefix.
-- Nothing outside AWS, the Azure subscription's `cf:poc` resource groups, the Cloudflare `idp` record and
-  the GitHub variables, secrets and `vms/` is touched, so those are the only things `down` has to clean.
+- `down` removes only Terraform-tracked or POC-owned AWS/Azure resources, the targeted Cloudflare
+  `idp` record, and the POC's GitHub wiring and `vms/`. Unrelated Azure groups may remain.
   The Azure identities and `AZURE_*` variables (9) persist like the AWS OIDC role.
