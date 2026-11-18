@@ -794,7 +794,8 @@ for garbage collection but the running application stays up.
    Delete an empty bucket without force before shared Terraform destroy, including for old state
    that recorded `force_destroy = true`.
 3. **Sweep owned resources**: terminate tagged AWS instances, sweep tagged detached disks, ENIs, EIPs,
-   groups and key pairs across every enabled region. When VM state is resolved and `--keep-images` was
+   groups and key pairs in `ap-southeast-2` only. The POC does not discover or touch other AWS regions;
+   check those separately if a manual run used one. When VM state is resolved and `--keep-images` was
    not given, deregister tagged AMIs including disabled ones before deleting independently tagged
    snapshots. Delete tagged Azure VM and build groups; then, unless images are kept, remove gallery
    versions only from the verified POC-owned (`cf:module=images`) gallery resource group.
@@ -807,15 +808,13 @@ for garbage collection but the running application stays up.
    CA fallback runs only when the image tier is being removed. Do not force-empty the state bucket.
    Retry Terraform state reconciliation of both roots after fallback cleanup when possible.
 5. **Verify before GitHub cleanup**: require empty local `infra/` state (and `infra/images` state unless
-   images are kept) and consecutive successful
-   workflow, multi-region AWS, Azure POC-tag and DNS checks. Require three consecutive passes in at
-   most six attempts, with starts at least 30 seconds apart. An already-slow pass does not add a
-   further pause or run down a shared deadline. Check both service-specific inventories and the AWS
-   Resource Groups Tagging API. With `--keep-images` the checks allow exactly the image tier (see
-   12.2 step 1) and fail on anything else.
-   A stale EC2 instance tag entry is accepted only when the exact instance lookup confirms it is
-   absent or terminated. CLI diagnostics are kept separate from successful response data. A denied
-   or failed lookup is not proof of absence.
+   images are kept). Run Sydney AWS, Azure POC-tag and DNS checks with workflow quiescence checked
+   before and after. The first complete successful pass is enough; retry failures up to six attempts
+   total, with starts at least 30 seconds apart. Check both service inventories and the AWS Resource
+   Groups Tagging API. Batch exact ID lookups per supported EC2 resource type and ignore stale tag
+   entries only when EC2 confirms the resource is absent or the instance is terminated. Live matches,
+   unsupported entries and failed lookups still block `CLEAN`. With `--keep-images` the checks allow
+   the image tier (see 12.2 step 1).
 6. **GitHub cleanup**: verify deletion of platform wiring and reset `vms/` on platform `main` with a
    normal non-force push. Verify the published inventory and workflow freeze before printing `CLEAN`,
    or `CLEAN (images retained)` with the kept CA fingerprint and images for `--keep-images`.

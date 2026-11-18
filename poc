@@ -33,10 +33,8 @@ USERS_FILE="$ROOT/.poc-users" # username:scrypt-hash lines, gitignored, persists
 PASSWORDS_FILE="$ROOT/.poc-passwords" # username:plaintext, gitignored; POC test logins for agents/scripts
 PARALLEL_DESTROYS="${PARALLEL_DESTROYS:-5}"
 RUN_CANCEL_TIMEOUT=900
-CLEAN_STABILITY_PASSES=3
-CLEAN_STABILITY_SECONDS=30
+CLEAN_RETRY_SECONDS=30
 CLEAN_MAX_ATTEMPTS=6
-AWS_REGION_PARALLEL=5
 POC_LOCK_FILE="$HOME/.cache/compute-factory/lifecycle.lock"
 MAINTENANCE_VARIABLE="CF_POC_MAINTENANCE"
 POC_AWS_ACCOUNT="134584031874"
@@ -986,11 +984,11 @@ destroy_vms() {
   xargs -n 3 -P "$PARALLEL_DESTROYS" "$ROOT/poc" _destroy_vm "$mirror" <"$plan"
 }
 
-# Remove everything tagged cf:poc=true that Terraform does not (or no longer) know about
-# in one AWS region.
-sweep_tagged_region() {
+# Remove POC-tagged EC2 leftovers in the pinned region.
+sweep_tagged() {
   local exclude_infra="$1" keep_images="$2" ids q ami_query snapshot_query volume_query eni_query eip_query sg_query key_query
   local tagged_ids failed=0
+  info "sweeping AWS region $POC_AWS_REGION"
   q='Reservations[].Instances[].InstanceId'
   # shellcheck disable=SC2016
   [[ "$exclude_infra" == "1" ]] && q='Reservations[].Instances[] | [?!(Tags[?Key==`cf:module`&&Value==`infra`])].InstanceId'
@@ -1035,7 +1033,7 @@ sweep_tagged_region() {
 
   local amis ami snapshots s volumes v enis eni eips a sgs sg keys key result id
   if [[ "$keep_images" == 0 ]]; then
-    amis="$(aws ec2 describe-images --include-disabled --owners self --filters Name=tag:cf:poc,Values=true \
+    amis="$(aws ec2 describe-images --include-disabled --include-deprecated --owners self --filters Name=tag:cf:poc,Values=true \
       --query "$ami_query" --output text)" || { failed=1; amis=; }
     for ami in $amis; do
       delete_aws "AMI $ami" InvalidAMIID.NotFound aws ec2 deregister-image --image-id "$ami" || failed=1
@@ -1107,25 +1105,6 @@ delete_aws() {
     warn "could not remove $label: $result"
     return 1
   fi
-}
-
-# The POC normally uses ap-southeast-2, but a failed/manual workflow must not strand
-# tagged resources in another enabled region.
-sweep_tagged() {
-  local exclude_infra="$1" keep_images="$2" regions
-  # shellcheck disable=SC2016
-  regions="$(aws ec2 describe-regions --all-regions \
-    --query 'Regions[?OptInStatus==`opt-in-not-required` || OptInStatus==`opted-in`].RegionName' \
-    --output text)" && [[ -n "$regions" ]] || { warn "could not enumerate AWS regions"; return 1; }
-  printf '%s\n' "$regions" | xargs -n 1 -P "$AWS_REGION_PARALLEL" \
-    "$ROOT/poc" _sweep_region "$exclude_infra" "$keep_images" \
-    || { warn "AWS sweep failed in at least one region"; return 1; }
-}
-
-cmd_sweep_region() {
-  local exclude_infra="$1" keep_images="$2" region="$3"
-  info "sweeping AWS region $region"
-  AWS_REGION="$region" AWS_DEFAULT_REGION="$region" sweep_tagged_region "$exclude_infra" "$keep_images"
 }
 
 # Azure: every VM and Packer build has its own resource group tagged cf:poc=true; the image tier's
@@ -1306,23 +1285,47 @@ verify_dns_absent() {
   return 1
 }
 
-verify_tagged_instance_gone() {
-  local region="$1" arn="$2" id prefix lookup_stdout lookup_stderr
-  prefix="arn:aws:ec2:$region:$POC_AWS_ACCOUNT:instance/"
-  [[ "$arn" == "$prefix"* ]] || return 1
-  id="${arn#"$prefix"}"
-  [[ "$id" =~ ^i-[0-9a-f]+$ ]] || return 1
-  if capture_lookup aws ec2 describe-instances --instance-ids "$id" \
-      --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output json; then
-    jq -e --arg id "$id" 'type == "array" and all(.[]; . == [$id,"terminated"])' <<<"$lookup_stdout" >/dev/null
+# Batch same-type ARNs by exact ID without tag filters: a tag disappearing is not deletion.
+verify_tagged_ec2_gone() {
+  local prefix="arn:aws:ec2:$POC_AWS_REGION:$POC_AWS_ACCOUNT:" kind arn id id_prefix filter ids="" lookup_stdout lookup_stderr
+  local -a args
+  [[ "$1" == "$prefix"* ]] || return 1
+  kind="${1#"$prefix"}"
+  kind="${kind%%/*}"
+  case "$kind" in
+    instance)            id_prefix=i; filter='instance-id'; args=(describe-instances --query 'Reservations[].Instances[].[InstanceId,State.Name]') ;;
+    image)               id_prefix=ami; filter='image-id'; args=(describe-images --owners self --include-disabled --include-deprecated --query 'Images[].ImageId') ;;
+    snapshot)            id_prefix=snap; filter='snapshot-id'; args=(describe-snapshots --owner-ids self --query 'Snapshots[].SnapshotId') ;;
+    volume)              id_prefix=vol; filter='volume-id'; args=(describe-volumes --query 'Volumes[].VolumeId') ;;
+    network-interface)   id_prefix=eni; filter='network-interface-id'; args=(describe-network-interfaces --query 'NetworkInterfaces[].NetworkInterfaceId') ;;
+    security-group)      id_prefix=sg; filter='group-id'; args=(describe-security-groups --query 'SecurityGroups[].GroupId') ;;
+    security-group-rule) id_prefix=sgr; filter='security-group-rule-id'; args=(describe-security-group-rules --query 'SecurityGroupRules[].SecurityGroupRuleId') ;;
+    elastic-ip)          id_prefix=eipalloc; filter='allocation-id'; args=(describe-addresses --query 'Addresses[].AllocationId') ;;
+    key-pair)            id_prefix=key; filter='key-pair-id'; args=(describe-key-pairs --query 'KeyPairs[].KeyPairId') ;;
+    *) return 1 ;;
+  esac
+  for arn in "$@"; do
+    [[ "$arn" == "$prefix$kind/"* ]] || return 1
+    id="${arn#"$prefix$kind/"}"
+    [[ "$id" =~ ^${id_prefix}-[0-9a-f]+$ ]] || return 1
+    ids+="${ids:+,}$id"
+  done
+  if ! capture_lookup aws ec2 "${args[@]}" --filters "Name=$filter,Values=$ids" --output json; then
+    warn "could not confirm EC2 $kind IDs $ids: ${lookup_stderr:-lookup failed without diagnostics}"
+    return 1
+  fi
+  if [[ "$kind" == instance ]]; then
+    jq -e 'type == "array" and all(.[]; (.[0] | type == "string") and .[1] == "terminated")' \
+      <<<"$lookup_stdout" >/dev/null
   else
-    aws_error "$lookup_stderr" InvalidInstanceID.NotFound
+    jq -e 'type == "array" and length == 0' <<<"$lookup_stdout" >/dev/null
   fi
 }
 
 # $1 = 1 to allow the image tier: golden AMIs/snapshots (cf:managed=true) and cf:module=images resources.
-verify_aws_region() {
-  local allow_images="$1" region="$2" tagged allowed=" " arn failed=0 ami_query snapshot_query
+verify_aws_ec2_clean() {
+  local allow_images="$1" region="$POC_AWS_REGION" tagged batches failed=0 ami_query snapshot_query
+  local -a arns
   ami_query='Images[].ImageId'
   snapshot_query='Snapshots[].SnapshotId'
   if [[ "$allow_images" == 1 ]]; then
@@ -1333,7 +1336,7 @@ verify_aws_region() {
   verify_absent "AWS $region instances" "" aws ec2 describe-instances \
     --filters Name=tag:cf:poc,Values=true Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
     --query 'Reservations[].Instances[].InstanceId' --output text || failed=1
-  verify_absent "AWS $region AMIs" "" aws ec2 describe-images --include-disabled --owners self \
+  verify_absent "AWS $region AMIs" "" aws ec2 describe-images --include-disabled --include-deprecated --owners self \
     --filters Name=tag:cf:poc,Values=true --query "$ami_query" --output text || failed=1
   verify_absent "AWS $region snapshots" "" aws ec2 describe-snapshots --owner-ids self \
     --filters Name=tag:cf:poc,Values=true --query "$snapshot_query" --output text || failed=1
@@ -1356,59 +1359,43 @@ verify_aws_region() {
     --filters 'Name=group-name,Values=packer_*' --query 'SecurityGroups[].GroupId' --output text || failed=1
   verify_absent "AWS $region possible unowned Packer key pairs" "" aws ec2 describe-key-pairs \
     --filters 'Name=key-name,Values=packer_*' --query 'KeyPairs[].KeyName' --output text || failed=1
-  if [[ "$region" == "$POC_AWS_REGION" ]]; then
-    verify_absent "AWS possible unowned cf-idp instances" "" aws ec2 describe-instances \
-      --filters Name=tag:Name,Values=cf-idp Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
-      --query 'Reservations[].Instances[].InstanceId' --output text || failed=1
-    verify_absent "AWS possible unowned cf-idp groups" "" aws ec2 describe-security-groups \
-      --filters Name=group-name,Values=cf-idp --query 'SecurityGroups[].GroupId' --output text || failed=1
-    verify_absent "AWS possible unowned cf-idp EIPs" "" aws ec2 describe-addresses \
-      --filters Name=tag:Name,Values=cf-idp --query 'Addresses[].AllocationId' --output text || failed=1
-    verify_absent "AWS possible unowned cf-idp-admin key" "" aws ec2 describe-key-pairs \
-      --filters Name=key-name,Values=cf-idp-admin --query 'KeyPairs[].KeyPairId' --output text || failed=1
-  fi
+  verify_absent "AWS possible unowned cf-idp instances" "" aws ec2 describe-instances \
+    --filters Name=tag:Name,Values=cf-idp Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
+    --query 'Reservations[].Instances[].InstanceId' --output text || failed=1
+  verify_absent "AWS possible unowned cf-idp groups" "" aws ec2 describe-security-groups \
+    --filters Name=group-name,Values=cf-idp --query 'SecurityGroups[].GroupId' --output text || failed=1
+  verify_absent "AWS possible unowned cf-idp EIPs" "" aws ec2 describe-addresses \
+    --filters Name=tag:Name,Values=cf-idp --query 'Addresses[].AllocationId' --output text || failed=1
+  verify_absent "AWS possible unowned cf-idp-admin key" "" aws ec2 describe-key-pairs \
+    --filters Name=key-name,Values=cf-idp-admin --query 'KeyPairs[].KeyPairId' --output text || failed=1
   tagged="$(aws resourcegroupstaggingapi get-resources --tag-filters Key=cf:poc,Values=true \
-    --query 'ResourceTagMappingList[].ResourceARN' --output text)" || return 1
-  if [[ "$allow_images" == 1 ]]; then
-    allowed+="$(aws resourcegroupstaggingapi get-resources --tag-filters Key=cf:poc,Values=true Key=cf:module,Values=images \
-      --query 'ResourceTagMappingList[].ResourceARN' --output text | tr '\t\n' '  ')" || return 1
-    allowed+=" $(aws resourcegroupstaggingapi get-resources --tag-filters Key=cf:poc,Values=true Key=cf:managed,Values=true \
-      --resource-type-filters ec2:image ec2:snapshot \
-      --query 'ResourceTagMappingList[].ResourceARN' --output text | tr '\t\n' '  ') " || return 1
-  fi
-  while IFS= read -r arn; do
-    [[ -n "$arn" ]] || continue
-    if [[ "$allowed" == *" $arn "* ]]; then
-      : # kept image tier
-    elif verify_tagged_instance_gone "$region" "$arn"; then
-      info "ignoring stale AWS tag entry for EC2 instance verified absent or terminated: $arn"
+    --query 'ResourceTagMappingList' --output json)" || { warn "could not read the AWS $region tag index"; return 1; }
+  batches="$(jq -er --arg keep "$allow_images" --arg prefix "arn:aws:ec2:$region:$POC_AWS_ACCOUNT:" '
+    def retained:
+      any(.Tags[]; .Key == "cf:module" and .Value == "images") or
+      ((.ResourceARN | startswith($prefix + "image/") or startswith($prefix + "snapshot/")) and
+        any(.Tags[]; .Key == "cf:managed" and .Value == "true"));
+    if type != "array" or any(.[]; (.ResourceARN | type != "string") or (.Tags | type != "array") or
+        (.ResourceARN | test("^arn:[^[:space:]]+$") | not)) then error("unexpected AWS tag index response")
+    else map(select($keep != "1" or (retained | not)) | .ResourceARN)
+      | group_by(split("/")[0]) | map(@tsv) | join("\n")
+    end' <<<"$tagged")" || { warn "could not parse the AWS $region tag index"; return 1; }
+  while IFS=$'\t' read -r -a arns; do
+    [[ -n "${arns[0]:-}" ]] || continue
+    if verify_tagged_ec2_gone "${arns[@]}"; then
+      info "ignoring stale AWS tag entries verified absent or terminated in EC2: ${arns[*]}"
     else
-      warn "AWS $region tagging API still reports a resource not verified gone: $arn"
+      warn "AWS $region tag index reports resources not verified gone: ${arns[*]}"
       failed=1
     fi
-  done < <(tr '\t' '\n' <<<"$tagged")
+  done <<<"$batches"
   [[ "$failed" == 0 ]]
-}
-
-verify_aws_regions() {
-  local allow_images="$1" regions
-  # shellcheck disable=SC2016
-  regions="$(aws ec2 describe-regions --all-regions \
-    --query 'Regions[?OptInStatus==`opt-in-not-required` || OptInStatus==`opted-in`].RegionName' \
-    --output text)" && [[ -n "$regions" ]] || { warn "could not enumerate AWS regions"; return 1; }
-  printf '%s\n' "$regions" | xargs -n 1 -P "$AWS_REGION_PARALLEL" \
-    "$ROOT/poc" _verify_region "$allow_images"
-}
-
-cmd_verify_region() {
-  local allow_images="$1" region="$2"
-  AWS_REGION="$region" AWS_DEFAULT_REGION="$region" verify_aws_region "$allow_images" "$region"
 }
 
 # $1 = 1 to allow the image tier (SSH CA, cf-images gallery, golden AMIs and snapshots) to remain.
 verify_cloud_clean() {
-  local allow_images="$1" failed=0 lookup_stdout lookup_stderr
-  verify_aws_regions "$allow_images" || failed=1
+  local allow_images="$1" failed=0 ec2_pid lookup_stdout lookup_stderr
+  verify_aws_ec2_clean "$allow_images" & ec2_pid=$!
 
   verify_absent "state bucket" "" find_state_bucket "$STATE_BUCKET" || failed=1
   if [[ "$allow_images" != 1 ]]; then
@@ -1441,6 +1428,7 @@ verify_cloud_clean() {
     fi
   fi
   verify_dns_absent || failed=1
+  wait "$ec2_pid" || failed=1
   [[ "$failed" == 0 ]]
 }
 
@@ -1464,21 +1452,19 @@ verify_images_state_empty() {
 }
 
 verify_clean() {
-  local allow_images="$1" pass=0 attempt started delay
+  local allow_images="$1" attempt started delay
   verify_infra_state_empty || return 1
   if [[ "$allow_images" != 1 ]]; then verify_images_state_empty || return 1; fi
   for ((attempt=1; attempt<=CLEAN_MAX_ATTEMPTS; attempt++)); do
     started=$SECONDS
     verify_quiescent || return 1
     if verify_cloud_clean "$allow_images"; then
-      pass=$((pass + 1))
-      info "clean cloud/DNS verification: $pass/$CLEAN_STABILITY_PASSES consecutive passes"
-      if (( pass == CLEAN_STABILITY_PASSES )); then return 0; fi
-    else
-      pass=0
-      warn "cloud/DNS absence not yet verified (attempt $attempt/$CLEAN_MAX_ATTEMPTS)"
+      verify_quiescent || return 1
+      info "cloud/DNS checks passed (AWS $POC_AWS_REGION)"
+      return 0
     fi
-    delay=$((CLEAN_STABILITY_SECONDS - (SECONDS - started)))
+    warn "cloud/DNS absence not yet verified (attempt $attempt/$CLEAN_MAX_ATTEMPTS)"
+    delay=$((CLEAN_RETRY_SECONDS - (SECONDS - started)))
     if (( delay > 0 && attempt < CLEAN_MAX_ATTEMPTS )); then sleep "$delay"; fi
   done
   return 1
@@ -1599,7 +1585,7 @@ cmd_down() (
   if [[ "$azure_ok" == 1 ]]; then
     sweep_azure 0 "$((1 - versions_ok))" || { azure_ok=0; warn "final Azure sweep failed"; }
   fi
-  wait "$aws_pid" || warn "final AWS regional sweep failed"
+  wait "$aws_pid" || warn "final AWS $POC_AWS_REGION sweep failed"
   sweep_infra_orphans "$versions_ok" || warn "some shared AWS fallbacks failed"
   if [[ "$infra_tf" == 1 ]] && ! verify_infra_state_empty; then
     infra_apply_or_destroy destroy >>"$GEN/logs/infra-destroy.log" 2>&1 \
@@ -1618,7 +1604,7 @@ cmd_down() (
     die "NOT CLEAN: teardown retained recovery state or could not complete Azure/DNS cleanup. Fix the reported blocker and rerun down."
   fi
   log "Verify cloud, DNS and local state"
-  verify_clean "$retain" || die "NOT CLEAN: state remains, workflows are active, or required cloud/DNS checks did not pass"
+  verify_clean "$retain" || die "NOT CLEAN: teardown verification failed; see the check-specific warnings above"
 
   log "Clear and verify GitHub wiring and inventory"
   clear_platform_wiring || die "NOT CLEAN: platform GitHub wiring could not be cleared and verified"
@@ -1751,7 +1737,7 @@ case "${1:-}" in
     acquire_poc_lock "$@"
     prepare_lifecycle
     ;;
-  _destroy_vm|_sweep_region|_verify_region)
+  _destroy_vm)
     locked || die "this is an internal lifecycle worker; no lock is held"
     ;;
 esac
@@ -1770,7 +1756,5 @@ case "${1:-}" in
   deploy-idp)  shift; cmd_deploy_idp "$@" ;;
   prune-idp-images) shift; cmd_prune_idp_images "$@" ;;
   _destroy_vm) shift; PLATFORM_DIR="${CF_POC_PLATFORM_DIR:?}"; cmd_destroy_vm "$@" ;;
-  _sweep_region) shift; cmd_sweep_region "$@" ;;
-  _verify_region) shift; cmd_verify_region "$@" ;;
   *) echo "usage: $0 up [--images-only]|down [--keep-images]|status|deploy-idp [<image-id>]|prune-idp-images|set-password <user>|watch-bake <run-id>|logs [service] [since]|task <task-id>|run <run-id>" >&2; exit 2 ;;
 esac

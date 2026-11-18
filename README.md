@@ -100,8 +100,11 @@ logs and leftover checks, fix the reported blocker, and rerun; do not empty the 
 Azure gallery deletion can take several minutes. Untagged/shared resources such as `NetworkWatcherRG`
 are not removed, and possible legacy AWS Packer leftovers are reported rather than deleted by name.
 
-`CLEAN` requires repeated AWS, Azure and DNS absence checks, empty local Terraform state, cleared
-GitHub wiring, an empty `vms/` inventory, and workflows verified disabled and idle. With
+AWS regional cleanup and verification are limited to Sydney (`ap-southeast-2`). Check any other
+region separately if a manual run used it. `CLEAN` requires a successful AWS, Azure and DNS check,
+empty local Terraform state, cleared GitHub wiring, an empty `vms/` inventory, and workflows verified
+disabled and idle. Stale AWS tag entries for EC2 resources are ignored only when EC2 confirms the
+resource is gone or its instance is terminated. With
 `--keep-images` the same checks allow exactly the image tier (CA secret and parameter, the `cf-images`
 gallery and AMIs/snapshots tagged `cf:managed=true`) and report `CLEAN (images retained)`; it costs
 cents a month plus about $0.40 for the CA secret. A later plain `down` removes it. The manual Azure
