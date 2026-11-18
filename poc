@@ -31,7 +31,7 @@ PARALLEL_DESTROYS="${PARALLEL_DESTROYS:-5}"
 RUN_CANCEL_TIMEOUT=900
 CLEAN_STABILITY_PASSES=3
 CLEAN_STABILITY_SECONDS=30
-CLEAN_TIMEOUT=240
+CLEAN_MAX_ATTEMPTS=6
 AWS_REGION_PARALLEL=5
 POC_LOCK_FILE="$HOME/.cache/compute-factory/lifecycle.lock"
 MAINTENANCE_VARIABLE="CF_POC_MAINTENANCE"
@@ -41,7 +41,8 @@ POC_AWS_PROFILE="${AWS_PROFILE:-amirasyraf}"
 export AWS_PROFILE="$POC_AWS_PROFILE"
 POC_AWS_REGION="ap-southeast-2"
 export AWS_REGION="$POC_AWS_REGION" AWS_DEFAULT_REGION="$POC_AWS_REGION"
-export AWS_PAGER="" AWS_CLI_TELEMETRY=0
+export AWS_PAGER="" AWS_CLI_SESSION_ID_DISABLED=true
+export AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-3}"
 AZURE_SUBSCRIPTION="74b39a79-f79d-4adb-8ae0-fe9118fc564a"
 AZURE_TENANT="c26545da-80fa-4c31-9a8f-a4ae475bd17e"
 STATE_BUCKET="cf-tfstate-${POC_AWS_ACCOUNT}-apse2"
@@ -112,12 +113,13 @@ infra_state() {
   [[ -e "$INFRA_DIR/terraform.tfstate" ]] || return 0
   tf_infra state list
 }
+aws() { command aws --cli-connect-timeout 10 --cli-read-timeout 20 "$@"; }
 az_poc() { az "$@" --subscription "$AZURE_SUBSCRIPTION" --only-show-errors; }
 
 require_tools() {
   local t
   for t in terraform gh aws az jq ssh git curl xargs "$@"; do
-    command -v "$t" >/dev/null || die "missing tool: $t"
+    type -P "$t" >/dev/null || die "missing tool: $t"
   done
   local acct
   acct="$(aws sts get-caller-identity --query Account --output text 2>/dev/null)" || die "AWS profile $AWS_PROFILE not usable (aws sso login?)"
@@ -392,7 +394,7 @@ cmd_deploy_idp() {
   fi
   local tool ip
   for tool in terraform aws docker curl jq ssh scp; do
-    command -v "$tool" >/dev/null || die "missing tool: $tool"
+    type -P "$tool" >/dev/null || die "missing tool: $tool"
   done
   [[ -s "$USERS_FILE" ]] || die "no IDP users; run ./poc set-password <user> first"
   [[ -s "$ROOT/.poc.env" ]] || die "missing $ROOT/.poc.env"
@@ -998,18 +1000,31 @@ sweep_infra_orphans() {
   [[ "$failed" == 0 ]]
 }
 
+capture_lookup() {
+  # Set the caller's local lookup variables. CLI diagnostics can be emitted
+  # even after a successful request; they are not part of the result payload.
+  local diagnostics status=0
+  lookup_stdout=
+  lookup_stderr=
+  diagnostics="$(mktemp "${TMPDIR:-/tmp}/cf-poc-lookup.XXXXXX")" || return 1
+  lookup_stdout="$("$@" 2>"$diagnostics")" || status=$?
+  lookup_stderr="$(<"$diagnostics")"
+  rm -f "$diagnostics" || return 1
+  return "$status"
+}
+
 # List queries must succeed and return no matches. Point lookups must return their specific
 # not-found error; permission, credential, and network failures are not evidence of absence.
 verify_absent() {
-  local label="$1" not_found="$2" result
+  local label="$1" not_found="$2" lookup_stdout lookup_stderr
   shift 2
-  if result="$("$@" 2>&1)"; then
-    [[ -z "$result" ]] && return 0
-    warn "$label still present (or lookup returned unexpected output): $result"
-  elif [[ -n "$not_found" ]] && aws_error "$result" "$not_found"; then
+  if capture_lookup "$@"; then
+    [[ -z "$lookup_stdout" ]] && return 0
+    warn "$label still present (or lookup returned unexpected output): $lookup_stdout"
+  elif [[ -n "$not_found" ]] && aws_error "$lookup_stderr" "$not_found"; then
     return 0
   else
-    warn "could not verify $label: $result"
+    warn "could not verify $label: ${lookup_stderr:-lookup failed without diagnostics}"
   fi
   return 1
 }
@@ -1029,16 +1044,16 @@ verify_dns_absent() {
 }
 
 verify_tagged_instance_gone() {
-  local region="$1" arn="$2" id result prefix
+  local region="$1" arn="$2" id prefix lookup_stdout lookup_stderr
   prefix="arn:aws:ec2:$region:$POC_AWS_ACCOUNT:instance/"
   [[ "$arn" == "$prefix"* ]] || return 1
   id="${arn#"$prefix"}"
   [[ "$id" =~ ^i-[0-9a-f]+$ ]] || return 1
-  if result="$(aws ec2 describe-instances --instance-ids "$id" \
-      --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output json 2>&1)"; then
-    jq -e --arg id "$id" 'type == "array" and all(.[]; . == [$id,"terminated"])' <<<"$result" >/dev/null
+  if capture_lookup aws ec2 describe-instances --instance-ids "$id" \
+      --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output json; then
+    jq -e --arg id "$id" 'type == "array" and all(.[]; . == [$id,"terminated"])' <<<"$lookup_stdout" >/dev/null
   else
-    aws_error "$result" InvalidInstanceID.NotFound
+    aws_error "$lookup_stderr" InvalidInstanceID.NotFound
   fi
 }
 
@@ -1147,9 +1162,10 @@ verify_infra_state_empty() {
 }
 
 verify_clean() {
-  local pass=0 deadline=$((SECONDS + CLEAN_TIMEOUT))
+  local pass=0 attempt started delay
   verify_infra_state_empty || return 1
-  while (( SECONDS < deadline )); do
+  for ((attempt=1; attempt<=CLEAN_MAX_ATTEMPTS; attempt++)); do
+    started=$SECONDS
     verify_quiescent || return 1
     if verify_cloud_clean; then
       pass=$((pass + 1))
@@ -1157,9 +1173,10 @@ verify_clean() {
       if (( pass == CLEAN_STABILITY_PASSES )); then return 0; fi
     else
       pass=0
-      warn "cloud/DNS absence not yet verified; retrying within the verification window"
+      warn "cloud/DNS absence not yet verified (attempt $attempt/$CLEAN_MAX_ATTEMPTS)"
     fi
-    sleep "$CLEAN_STABILITY_SECONDS"
+    delay=$((CLEAN_STABILITY_SECONDS - (SECONDS - started)))
+    if (( delay > 0 && attempt < CLEAN_MAX_ATTEMPTS )); then sleep "$delay"; fi
   done
   return 1
 }
