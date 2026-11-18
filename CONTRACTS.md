@@ -58,7 +58,8 @@ Tooling versions (pin these):
 - AMI name `cf-ubuntu-26.04-<YYYYMMDDhhmmss>`.
 - AMI tags: `cf:os=ubuntu`, `cf:os-family=linux`, `cf:os-version=26.04`, `cf:managed=true`, `cf:poc=true`, `cf:git-sha=<sha>`.
   Snapshots get the same tags.
-- Terraform selects the AMI with `most_recent = true`, `owners = ["self"]` and filters `tag:cf:os=<os>` and `tag:cf:managed=true`.
+- Terraform selects the latest bake within the chosen release: `most_recent = true`, `owners = ["self"]`,
+  and tags `cf:os=<os>`, `cf:os-version=<imageVersion>`, `cf:managed=true`.
 - Baked on the image:
   - `/etc/ssh/trusted_user_ca_keys` contains the CA pub key.
   - An sshd drop-in sets `TrustedUserCAKeys /etc/ssh/trusted_user_ca_keys`,
@@ -70,7 +71,8 @@ Tooling versions (pin these):
 - Azure: base is Canonical's Marketplace image `Canonical:ubuntu-26_04-lts:server:latest` (Gen2, x64,
   no plan). Packer publishes gallery version `1.<YYYYMMDD>.<hhmmss>` of `cfimages/ubuntu` (shallow
   replication) with the same `cf:*` tags, after `waagent -force -deprovision+user`. The build VM is
-  `Standard_D2ls_v6` with the NVMe disk controller. Terraform launches the definition's latest version.
+  `Standard_D2ls_v6` with the NVMe disk controller. `ubuntu` is the definition for Ubuntu 26.04 only.
+  Terraform launches the latest bake in the definition mapped to the chosen release (§7).
 - The principals file is named after the OS login user (`platform.json` `os.<os>.sshUser`; Packer passes
   `cf_ssh_user`).
 
@@ -152,8 +154,8 @@ All inputs are strings and required unless noted.
   see that stage's inventory commits. Inventory commits keep the `pull --rebase` retry loop.
 - `params_json` per stage:
   - `register`: `{"spec": <Resource spec, §7>}`;
-  - `configure`: `{"compute": {platform, os, size | instanceType}, "configuration": {"software": [...], "adJoin": bool}}`
-    (Modify: the complete new desired compute and configuration; platform and OS must not change);
+   - `configure`: `{"compute": {platform, os, imageVersion?, size | instanceType}, "configuration": {"software": [...], "adJoin": bool}}`
+     (Modify: the complete new desired compute and configuration; platform, OS and image version must not change);
   - `software`: `{}` or `{"remove": ["nginx", ...]}` (catalog packages deselected by Modify, at most 20);
   - `destroy`: `{"demoGeneration": "<uuid>"}` for automatic demo cleanup, `{}` for a user destroy;
   - `finalize`: `{"outcome": "ready"}` or `{"outcome": "failed"}`;
@@ -243,6 +245,7 @@ spec:
   compute:
     platform: aws          # a terraform/platforms/<p> directory: aws | azure
     os: ubuntu             # a key of that platform's platform.json os
+    imageVersion: "26.04"  # chosen release; absent only for legacy inventory/queued requests
     size: S                # or, instead of size: instanceType: m7i.large / Standard_D2s_v6 (Advanced picker)
   configuration:
     software: [git, nginx]
@@ -283,14 +286,18 @@ spec:
   `instanceTypePattern`, `excludedInstanceTypePattern` (`""` = none), `instanceIdPattern`,
   `reservedTagPrefixes`, `forbiddenTagKeyCharacters`, `staticPublicIp` (AWS `false`: stop releases the
   address and resize/start gives a new one; Azure `true`: kept; the IDP's stop/start wording uses it).
-  `os.<os>.versions` is display-only (Launch
-  image cards); the spec does not store a version yet. `family` selects the software catalog column.
-- Terraform loads persisted spec and maps it to temporary `.tfvars.json` (`name`, `os`, `size`,
+   `os.<os>.versions` lists launchable release strings (`^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`).
+   Publish the bake before advertising a release. On Azure `os.<os>.galleryImages` maps each release to a
+   distinct gallery definition; retain mappings for existing VMs even after a release is no longer
+   advertised. Keep the AWS golden image available for Terraform to resolve during existing VM operations.
+   `family` selects the software catalog column. The register stage rejects explicit releases not offered
+   on the platform. Legacy inventory and queued requests without a release retain the Ubuntu 26.04 fallback.
+- Terraform loads persisted spec and maps it to temporary `.tfvars.json` (`name`, `os`, `image_version`, `size`,
   `team`, original `requested_by`, `cloud_tags` including billing). It deletes that file on exit.
   Each stage derives Ansible variables and applicability from the committed entity.
 - Modify persists the new desired compute and configuration (`configure`) before applying it: the
   software list is replaced (unchecked catalog software is uninstalled), `adJoin` can be turned on or
-  off, and size/instance type can change. Platform, OS, owner, billing, tags and original request
+  off, and size/instance type can change. Platform, OS, image release, owner, billing, tags and original request
   provenance are preserved. Power state is not desired state: it is observed (§8.3), never stored in
   spec.
 - Status updates never rewrite spec. Direct Git edits do not trigger reconciliation or a Terraform
@@ -321,13 +328,17 @@ spec:
   - templates: `https://github.com/amirasyraf/compute-factory-platform/blob/main/catalog/templates/*/template.yaml`;
   - org and the ssh-cert template come from the idp repo itself.
 - `catalog.orphanStrategy: delete`. Catalog processing interval should be short (POC).
-- **Launch** (IDP `/launch`, top bar; replaces "Create" there, `/create` still works): product cards are
-  Scaffolder templates with tag `product` (card name `cf/product`, else the title). A template with
-  annotation `cf/launch-flow: platform-image` gets platform cards (`/launch/<template>`, from
-  `GET /api/vm-sizes/platforms`; unavailable ones disabled as "Coming soon") and image cards
-  (`/launch/<template>/<platform>`: radio, name, version dropdown), then opens
-  `/create/templates/default/<template>?formData={"compute":{"platform":…,"os":…}}`. `vm-request` has
-  that tag and annotation (`cf/product: Virtual machine`).
+- **Launch** (IDP `/launch`; `/create` still works): the IDP product registry groups registered products
+  into categories and maps each product to its catalog resource type and a tagged Scaffolder template.
+  **Compute → Virtual Machines** maps to `Resource` / `spec.type: vm` and `template:default/vm-request`
+  (`product` tag, `cf/product: Virtual Machines`, `cf/launch-flow: platform-image`). VM platform cards
+  (`/launch/compute/virtual-machines`, from `GET /api/vm-sizes/platforms`) lead to image release cards
+  (`/launch/compute/virtual-machines/<platform>`). Continue opens
+  `/create/templates/default/vm-request?formData={"compute":{"platform":…,"os":…,"imageVersion":…}}`.
+  Admission requires a release. For a client that omitted it, the IDP may infer the only
+  configured release for that OS/platform; ambiguous input is rejected. Old `/launch/vm-request[/<platform>]`
+  links redirect. Home groups visible catalog Resources by category/product; the VM product page is
+  `/products/compute/virtual-machines`, and `/catalog` remains the full inventory.
 - Template names (`metadata.name`): `vm-request`, `vm-modify` (platform repo) and
   `ssh-cert` (idp repo). VM templates only **create an orchestrator run** and then finish. The whole
   pipeline, including non-VM steps such as the mock ServiceNow request, is an orchestrator run (§8.2):
@@ -337,8 +348,8 @@ spec:
     spec JSON construction); outputs `{runId: number, runUrl: string}`. It calls `POST /api/vms/requests`
     with the initiating user's credentials; admission reserves demo quota and creates the provision run.
     `request_id` is the task ID, so a Scaffolder retry or recovery returns the same run.
-    Template output links: `Follow provisioning` → `${{ steps.dispatch.output.runUrl }}`, and
-    `Open VM in catalog` → `resource:default/<name>`.
+    Template output links: `Follow Provisioning` → `${{ steps.dispatch.output.runUrl }}`, and
+    `Open VM in Catalog` → `resource:default/<name>`.
   - `vm-modify` step `run`, action `cf:vm:run`, inputs `{operation: modify, vm: <entity ref>, compute,
     software, adJoin}`. Outputs `{runId, runUrl}`; link `Follow run` → `runUrl`. The VM page opens it
     with `?formData=` holding the VM ref and its current `compute` and `configuration`; the VM field is
@@ -346,8 +357,8 @@ spec:
     `ui:field: VmComputePicker` with `ui:options: { locked: true }` (platform and image shown without a
     "Change" link), software is the catalog checkboxes, AD join a boolean.
   - `VmComputePicker` shows the chosen platform and image (no dropdowns) with a "Change" link back to
-    Launch, then size cards and the Advanced picker for that platform. Platform/OS enums are
-    `[aws, azure]` / `[ubuntu]`; `instanceType` pattern is the union of the platforms' patterns.
+    Launch, then size cards and the Advanced picker for that platform. Platform enum is `[aws, azure]`;
+    the platform definition validates OS/release; `instanceType` pattern is the union of the platforms' patterns.
   - `cf:vm:run` input `operation` is one of `modify | reapply | start | stop | reboot | update | destroy`.
     It calls `POST /api/vms/runs` (§8.2) with the task ID as request key. Start, stop, reboot, OS updates,
     re-apply and destroy are started from the VM page directly (same endpoint), not from templates.
@@ -474,7 +485,7 @@ one of their groups.
 otherwise the same name). The VM entity is read with the caller's credentials; its `cf/request-id` is
 the run's request ID and its owner group the run's team. `requestKey` (`^[a-zA-Z0-9_-]{1,100}$`; a
 Scaffolder task ID or a browser UUID) makes a repeated submit return the first run. Modify sends the
-complete new `compute` (`{platform, os, size | instanceType}`, platform/OS unchanged), `software`
+  complete new `compute` (`{platform, os, imageVersion?, size | instanceType}`, platform/image unchanged), `software`
 (catalog keys) and `adJoin`; the backend diffs them against the entity spec to plan the run, and
 computes the packages to remove. While the VM platform's health check is fresh (under 2 minutes), it refuses (409)
 what cannot work: any operation but destroy when no instance of this incarnation exists, `start` on a
@@ -622,7 +633,8 @@ type ObservedVm = {
   `power.sh` (sourced; `vm_describe` → `{state, ip, tags}`, `vm_start`, `vm_stop`, `vm_reboot`).
 - Backend: `backend "s3" {}` with partial config passed at init (also for Azure: state stays in AWS):
   `-backend-config=bucket=$TF_STATE_BUCKET -backend-config=key=vms/<p>/<name>/terraform.tfstate -backend-config=region=ap-southeast-2 -backend-config=use_lockfile=true`.
-- Variables: `name` (required), `os` (default `ubuntu`), `size` (default `S`), `instance_type` (default
+- Variables: `name` (required), `os` (default `ubuntu`), `image_version` (null defaults to the legacy
+  release `26.04`), `size` (default `S`), `instance_type` (default
   `""`; overrides `size`), `team` (default `""`),
   `requested_by` (default `""`), `request_id` (default `""`; VM incarnation, tagged as `cf:request-id`),
   `cloud_tags`; Azure also `location` (default `australiaeast`).

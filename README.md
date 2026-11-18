@@ -1,8 +1,10 @@
 # Compute Factory (POC)
 
-An IDP (Backstage) and a compute platform (Packer + Terraform + Ansible on GitHub Actions) for self-service VMs
-on **AWS and Azure** (Ubuntu 26.04). Users start from **Launch**: product, platform and image cards, then
-the VM form. AWS is the shared base (SSH CA, Terraform state, IDP host); each platform is a
+An IDP (Backstage) for self-service products across platforms. Home groups visible resources by product.
+The first product, **Compute → Virtual Machines**, runs on **AWS and Azure** (Ubuntu 26.04) with
+Packer, Terraform and Ansible on GitHub Actions. Users choose a platform and an image release before
+configuring the VM. The dedicated **Virtual Machines** page shows live state and pipelines across clouds.
+AWS is the shared base (SSH CA, Terraform state, IDP host); each platform is a
 `terraform/platforms/<p>/` directory in the platform repo.
 
 Each VM's `catalog-info.yaml` is its single desired-configuration source: structured `spec.compute`,

@@ -26,9 +26,9 @@ Terraform and the IDP read those files; outside them only a few places name a pl
 workflow's cloud login step, the bake's source selector, the IDP's per-cloud spec/health readers and
 `./poc` sweeps.
 
-The IDP is meant to offer any kind of product, not only VMs. **Launch** (top bar) lists products
-(Scaffolder templates tagged `product`), then, for VMs, platform cards and image cards, then the
-product's form (5.2).
+The IDP organizes products independently of the cloud where they run. Home groups visible resources
+by category and product; Resources stays a searchable inventory. **Launch** starts at product
+categories. **Compute → Virtual Machines** leads to platform and image release cards, then the VM form (5.2).
 
 Out of scope for the POC: real AD, Vault, HA, production-grade security, cost controls,
 image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
@@ -364,17 +364,15 @@ Form fields:
 |---|---|---|
 | Name | `^[a-z][a-z0-9-]{2,20}$` | Must be unique; the workflow validates |
 | Team | one of the user's teams | Becomes `spec.owner`; preselected if the user is in exactly one team |
-| Platform | `aws`, `azure` (chosen on a Launch card; vSphere shown as "Coming soon") | Picks `terraform/platforms/<p>`; shown on the form with a "Change" link |
-| OS | `ubuntu` (chosen on a Launch image card, with a version dropdown; only 26.04, not stored) | Picks the image and fry task files |
+| Platform | `aws`, `azure` (chosen on a Launch card; vSphere marked "Coming Soon") | Picks `terraform/platforms/<p>`; shown on the form with a "Change" link |
+| Image | Ubuntu 26.04 (one card per offered OS/release) | Persists OS and `imageVersion`; selects the latest bake of the chosen release, not a newer release |
 | Size | XS / S / M / L or an Advanced instance type | Mapped per platform |
 | Software | checkboxes: git, htop, nginx, docker (from the software catalog, filtered by OS) | None picked = `software` stage skipped |
 | AD join | checkbox (mock) | baseline + access always run |
 
-How users get there: **Launch** (top bar, and the Launch buttons on Home and Resources; the form's
-submit button also reads Launch) shows product cards (Scaffolder templates tagged `product`; name from `cf/product`), then for a
-template with `cf/launch-flow: platform-image` platform cards (`GET /api/vm-sizes/platforms`) and
-image cards, then opens the template with `?formData={"compute":{"platform","os"}}`. Other products
-would open their template directly. The stock template list stays at `/create` but is not in the bar.
+How users get there: **Launch → Compute → Virtual Machines → Platform → Image**. The product page can
+start at Platform. Images come from `GET /api/vm-sizes/platforms`; Continue prefills the template with
+`compute.{platform,os,imageVersion}`. The stock template list at `/create` is not in the bar.
 
 Steps:
 1. The form has one step, `cf:vm:dispatch` (below). The mock ServiceNow request is no longer a
@@ -395,7 +393,7 @@ Steps:
    Open tabs check for a newer deployed frontend and show a reload banner. Browser-side failures are
    reported to the backend log (`client-log` plugin), and Caddy keeps a JSON access log; see the IDP
    README "Logging and troubleshooting" and `./poc logs` / `./poc task`.
-4. Output links: "Follow provisioning" (the run page) and "Open VM in catalog" (`resource:default/<name>`).
+4. Output links: "Follow Provisioning" (the run page) and "Open VM in Catalog" (`resource:default/<name>`).
 
 Backstage uses a **backend integration token** (a fine-grained PAT you create, scoped to
 `compute-factory-platform`: Actions read/write, Contents read, **Commit statuses read**, which Backstage's
@@ -409,8 +407,9 @@ dispatches workflows and reads catalog files. Users therefore **don't need any a
   **Connect** (copyable SSH command, Get SSH certificate), **Activity** (the active or failed run with
   its stage line and Retry/Skip, then the last 10 runs), **Configuration** (size, software, AD join,
   tags; Modify) and **Details** (health check, instance, IP, provenance, inventory source).
-  Home and the Resources list show each VM's latest run as a pipeline line and its state from one
-  `/api/vms/summary` call, falling back to `cf/status`.
+  The Virtual Machines product page and VM-only Resources results show each VM's latest run as a pipeline
+  line. Home shows compact platform/state rows. All derive VM state from `/api/vms/summary`, falling
+  back to `cf/status`.
 - Run state comes from the `vms` plugin API, which applies the same team rule as the catalog (5.1a):
   members of the run's team and admins only. No GitHub token reaches the browser; the plugin polls
   GitHub server-side and stores job steps per attempt.
@@ -434,7 +433,7 @@ to one VM's run, and would expose runs through a shared token regardless of team
 ### 5.4 Manage / destroy
 
 - The stock template list (`/create`, no longer in the top bar; Launch replaces it) lists only `vm-request` (`sub-page:scaffolder/templates` `templateFilter` in the IDP
-  `app-config.yaml`). Modify and SSH certificate are reached from the VM page (and Home for the
+  `app-config.yaml`). Modify and SSH certificate are reached from the VM page (and the VM product page for the
   certificate); their direct template URLs still work, and the listing filter is not an authorization
   boundary.
 - Day-2 actions, all on the VM page header. Each creates an orchestrator run (`POST /api/vms/runs`):
@@ -602,9 +601,10 @@ Check a cert with `ssh-keygen -L -f ~/.ssh/id_ed25519-cert.pub` (shows principal
 
 | To add | Add |
 |---|---|
-| Windows OS | `packer/windows-2022/`, Windows task files in roles (OpenSSH Server + CA config, winget), OS row in `images.yaml`, an `os` entry (login user, family, label, versions) in each platform's `platform.json`, a gallery image definition on Azure, the template OS enum |
+| Windows OS | `packer/windows-2022/`, Windows task files in roles (OpenSSH Server + CA config, winget), OS row in `images.yaml`, an `os` entry (login user, family, label, versions) in each platform's `platform.json`, a gallery image definition for each release on Azure |
+| Another image release | Publish the tagged AWS bake and the Azure bake under a separate Azure gallery definition. Then advertise the release in each supported platform's `os.<os>.versions` and map the Azure definition in `galleryImages`. |
 | A platform (vSphere) | `terraform/platforms/<p>/` with the same contract plus `platform.json`, `sizes.json`, `adopt.sh`, `power.sh`; a Packer source and matrix row; its login step in `stage.yml`/`bake.yml`; the IDP's spec/health readers for that cloud (`vmSizes.ts`, `observed.ts`) and `PLATFORMS`; `./poc` sweeps; template enum. vSphere also needs a self-hosted runner that reaches vCenter |
-| A product | A Scaffolder template tagged `product` (and `cf/product` name); it appears on Launch |
+| A product | Register its category, product ID, resource type, product page and launch template in the IDP; tag the template `product` and define its authorization policy before exposing inventory |
 
 Azure was added this way. It also exposed what the first version had hardcoded (the SSH user, the
 cloud login, EC2-only validation and health checks), now read from `platform.json`.
