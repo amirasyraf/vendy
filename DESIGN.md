@@ -711,7 +711,8 @@ compute-factory/                 # 4th repo: the "home" of the POC
 
 1. **Preflight**:
    - check the tools (`terraform`, `gh`, `aws`, `az`, `docker`, `jq`), the `amirasyraf` AWS profile, `gh`
-     auth, the `ARM_*` service-principal variables, the `az` subscription and `.poc.env`;
+      auth, the `az` subscription and `.poc.env`; `up` supplies the fixed `cf-admin-local`
+      `ARM_*` defaults and requires its local `.pfx` certificate;
    - check the one-time Azure setup (section 9): `.poc-azure-reader.pem` and the `AZURE_*` variables on
      the builder and platform repos;
    - fail fast if `infra` state already exists (the run assumes a clean slate; run `down` first).

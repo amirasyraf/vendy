@@ -83,8 +83,13 @@ require_tools() {
 }
 
 require_terraform_azure_auth() {
-  [[ -n "${ARM_CLIENT_ID:-}" && -f "${ARM_CLIENT_CERTIFICATE_PATH:-}" ]] \
-    || die "ARM_CLIENT_ID/ARM_CLIENT_CERTIFICATE_PATH not set (cf-admin-local; see ~/.zshrc)"
+  export ARM_TENANT_ID="${ARM_TENANT_ID:-c26545da-80fa-4c31-9a8f-a4ae475bd17e}"
+  export ARM_SUBSCRIPTION_ID="${ARM_SUBSCRIPTION_ID:-$AZURE_SUBSCRIPTION}"
+  export ARM_CLIENT_ID="${ARM_CLIENT_ID:-b6a2750b-5b51-487a-8903-d01c0a00a4e2}"
+  export ARM_CLIENT_CERTIFICATE_PATH="${ARM_CLIENT_CERTIFICATE_PATH:-$HOME/.config/azure/cf-admin-local.pfx}"
+  export ARM_CLIENT_CERTIFICATE_PASSWORD="${ARM_CLIENT_CERTIFICATE_PASSWORD:-}"
+  [[ -f "$ARM_CLIENT_CERTIFICATE_PATH" ]] \
+    || die "Terraform Azure certificate not found at $ARM_CLIENT_CERTIFICATE_PATH (cf-admin-local)"
 }
 
 set_maintenance_gate() {

@@ -69,10 +69,11 @@ VM requests first demonstrate a real REST POST to the IDP's authenticated mock S
 no real ticket and performs no approval. See `CONTRACTS.md` §8 and the IDP README for details.
 
 Requirements: `terraform`, `gh` (authenticated), `aws` (profile `amirasyraf`), `az` (logged in to
-subscription `74b39a79-…`, e.g. `azsp`), and the `cf-admin-local` service principal's `ARM_*`
-variables (`~/.zshrc`; required by `./poc up` and Terraform destroy when local infra state exists).
-The gitignored Azure reader certificate `.poc-azure-reader.pem`, `docker` (buildx, for the arm64 IDP
-image), `jq`, `ssh` with `~/.ssh/id_ed25519`, and `dig` for teardown DNS verification are also needed.
+subscription `74b39a79-…`, e.g. `azsp`), plus the `cf-admin-local` `.pfx` certificate at
+`~/.config/azure/cf-admin-local.pfx` (the POC script supplies its fixed `ARM_*` defaults and accepts
+explicit environment overrides). The gitignored Azure reader certificate `.poc-azure-reader.pem`,
+`docker` (buildx, for the arm64 IDP image), `jq`, `ssh` with `~/.ssh/id_ed25519`, and `dig` for
+teardown DNS verification are also needed.
 The Azure identities and `AZURE_*` repo variables are one-time setup that survives `down` (DESIGN.md §9).
 
 `down` is safe to rerun after a failed teardown or `up`. Azure gallery image deletion can take
