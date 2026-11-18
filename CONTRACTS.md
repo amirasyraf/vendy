@@ -281,7 +281,9 @@ spec:
 - `terraform/platforms/<p>/platform.json` (read by `spec.py`, `validate.sh`, `inventory.sh`, Terraform
   and the IDP from `main`): `label`, `os` (`{<os>: {label, versions, sshUser, family}}`),
   `instanceTypePattern`, `excludedInstanceTypePattern` (`""` = none), `instanceIdPattern`,
-  `reservedTagPrefixes`, `forbiddenTagKeyCharacters`. `os.<os>.versions` is display-only (Launch
+  `reservedTagPrefixes`, `forbiddenTagKeyCharacters`, `staticPublicIp` (AWS `false`: stop releases the
+  address and resize/start gives a new one; Azure `true`: kept; the IDP's stop/start wording uses it).
+  `os.<os>.versions` is display-only (Launch
   image cards); the spec does not store a version yet. `family` selects the software catalog column.
 - Terraform loads persisted spec and maps it to temporary `.tfvars.json` (`name`, `os`, `size`,
   `team`, original `requested_by`, `cloud_tags` including billing). It deletes that file on exit.
@@ -649,7 +651,7 @@ type ObservedVm = {
 ### 10a. IDP `vm-sizes` API (signed-in users)
 
 - `GET /api/vm-sizes/platforms` → `{platforms: [{id, label, available, os: [{id, label, versions}],
-  reservedTagPrefixes, forbiddenTagKeyCharacters, error}]}`: `aws`, `azure` from `platform.json` on
+  reservedTagPrefixes, forbiddenTagKeyCharacters, staticPublicIp, error}]}`: `aws`, `azure` from `platform.json` on
   `main` (cached 5 minutes), plus `{id: vsphere, label: vSphere, available: false}` ("Coming soon").
 - `GET /api/vm-sizes/sizes?platform=<p>` (default `aws`) → `{platform, label, reservedTagPrefixes,
   sizes: [{size, instanceType, specs}], error}`. Specs: AWS `ec2:DescribeInstanceTypes`; Azure the
