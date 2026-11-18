@@ -231,6 +231,14 @@ cmd_up() {
   # shellcheck disable=SC1091
   ( set -a; source "$ROOT/.poc.env"; : "${GITHUB_TOKEN:?}" ) || die ".poc.env must set GITHUB_TOKEN"
   [[ -s "$USERS_FILE" ]] || die "no IDP users; run ./poc set-password <user> first"
+  # One-time Azure setup that survives down (DESIGN.md section 9).
+  [[ -s "$ROOT/.poc-azure-reader.pem" ]] || die "missing $ROOT/.poc-azure-reader.pem (IDP Azure reader certificate; DESIGN.md section 9)"
+  local repo var
+  for repo in "$BUILDER_REPO" "$PLATFORM_REPO"; do
+    for var in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_LOCATION; do
+      gh variable get "$var" -R "$repo" >/dev/null 2>&1 || die "$repo has no $var variable (one-time Azure setup; DESIGN.md section 9)"
+    done
+  done
   ensure_repos
   terraform -chdir="$INFRA_DIR" init -input=false >/dev/null
   if infra_has_state && [[ "${POC_FORCE_UP:-}" != "1" ]]; then
@@ -421,13 +429,28 @@ sweep_azure() {
   for g in $groups; do az group wait -n "$g" --deleted --timeout 1800 2>/dev/null || true; done
 }
 
-# Packer publishes gallery image versions outside Terraform; the image definition cannot be deleted with them.
+# Packer publishes gallery image versions outside Terraform; an image definition cannot be deleted with them.
 delete_image_versions() {
-  local v
+  local i v
   az group exists -n cf-images 2>/dev/null | grep -q true || return 0
-  for v in $(az sig image-version list -g cf-images -r cfimages -i ubuntu --query '[].name' -o tsv 2>/dev/null); do
-    az sig image-version delete -g cf-images -r cfimages -i ubuntu -e "$v" && info "deleted image version ubuntu/$v"
+  for i in $(az sig image-definition list -g cf-images -r cfimages --query '[].name' -o tsv 2>/dev/null); do
+    for v in $(az sig image-version list -g cf-images -r cfimages -i "$i" --query '[].name' -o tsv 2>/dev/null); do
+      az sig image-version delete -g cf-images -r cfimages -i "$i" -e "$v" && info "deleted image version $i/$v"
+    done
   done
+}
+
+# Azure creates NetworkWatcherRG (untagged) with the first VNet in a region. Delete it only while it holds
+# nothing but those automatic network watchers, so anything else in it is never touched.
+sweep_network_watchers() {
+  local other
+  az group exists -n NetworkWatcherRG 2>/dev/null | grep -q true || return 0
+  other="$(az resource list -g NetworkWatcherRG --query "[?type!='Microsoft.Network/networkWatchers'].id" -o tsv)"
+  if [[ -n "$other" ]]; then
+    warn "NetworkWatcherRG holds other resources; leaving it"
+    return 0
+  fi
+  az group delete -n NetworkWatcherRG --yes && info "deleted NetworkWatcherRG (Azure's automatic network watchers)"
 }
 
 # Named singletons from infra/, in case local state was lost.
@@ -472,6 +495,7 @@ verify_clean() {
   aws iam get-role --role-name cf-idp >/dev/null 2>&1 && left+=("IAM role cf-idp")
   aws secretsmanager describe-secret --secret-id compute-factory/azure-reader >/dev/null 2>&1 && left+=("Azure reader secret")
   x="$(az group list --query "[?tags.\"cf:poc\"=='true'].name" -o tsv)"; [[ -n "$x" ]] && left+=("Azure resource groups: $(echo $x)")
+  az group exists -n NetworkWatcherRG 2>/dev/null | grep -q true && left+=("Azure NetworkWatcherRG")
   [[ -n "$(dig +short "$DOMAIN" @1.1.1.1 2>/dev/null || true)" ]] && left+=("DNS $DOMAIN (may be cache; TTL 60s)")
 
   # Informational: anything else the tagging API still reports (can lag a few minutes behind deletes).
@@ -520,6 +544,7 @@ cmd_down() {
   sweep_infra_orphans
   sweep_tagged 0
   sweep_azure 0
+  sweep_network_watchers
 
   log "GitHub cleanup"
   gh variable delete TF_STATE_BUCKET -R "$PLATFORM_REPO" >/dev/null 2>&1 || true
@@ -580,7 +605,10 @@ cmd_status() {
   log "Azure resource groups tagged cf:poc=true"
   az group list --query "[?tags.\"cf:poc\"=='true'].[name,properties.provisioningState]" -o tsv | sed 's/^/    /'
   log "Azure golden images"
-  az sig image-version list -g cf-images -r cfimages -i ubuntu --query '[].[name,provisioningState]' -o tsv 2>/dev/null | sed 's/^/    /' || info "no gallery"
+  local def
+  for def in $(az sig image-definition list -g cf-images -r cfimages --query '[].name' -o tsv 2>/dev/null); do
+    az sig image-version list -g cf-images -r cfimages -i "$def" --query '[].[name,provisioningState]' -o tsv | sed "s/^/    $def /"
+  done
   log "VM state files"
   aws s3 ls "s3://cf-tfstate-134584031874-apse2/vms/" --recursive 2>/dev/null | sed 's/^/    /' || info "no bucket"
   log "Active pipeline runs"

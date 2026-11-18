@@ -37,7 +37,7 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
 
 | Item | Decision |
 |---|---|
-| AWS account | `amirasyraf` profile, `134584031874` (single account for everything) |
+| AWS account | `amirasyraf` profile, `134584031874` (one AWS account for all AWS resources; Azure is in section 2's Azure rows) |
 | Region | `ap-southeast-2` (Sydney) |
 | GHA -> AWS | Existing OIDC role `arn:aws:iam::134584031874:role/github-aws-role` (trusts `repo:amirasyraf/*`). No static keys. |
 | Repos (user `amirasyraf`; private except `compute-factory-platform`, public for free Actions minutes and checked for committed secrets first) | `compute-factory` (this doc, `./poc`, shared AWS infra), `compute-factory-idp`, `compute-factory-builder`, `compute-factory-platform` |
@@ -45,7 +45,7 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
 | Tagging | Every AWS resource, from Terraform, Packer or anywhere else, gets the tag `cf:poc=true`; `down` checks that none remain |
 | IDP | Backstage (latest, v1.56.x at time of writing) on a single EC2, Docker Compose, Caddy TLS, `idp.amirasyraf.dev` |
 | IDP deploy | Manual script from the laptop. No GHA. |
-| Base image | Canonical's official Ubuntu AMI, looked up through the public SSM parameter `/aws/service/canonical/ubuntu/server/<ver>/stable/current/amd64/hvm/ebs-gp3/ami-id`. These are the same official images the Marketplace lists, without needing a Marketplace subscription. |
+| Base image | Azure: Canonical's Marketplace image `ubuntu-26_04-lts/server` (section 4.1). AWS: Canonical's official Ubuntu AMI, looked up through the public SSM parameter `/aws/service/canonical/ubuntu/server/<ver>/stable/current/amd64/hvm/ebs-gp3/ami-id`. These are the same official images the Marketplace lists, without needing a Marketplace subscription. |
 | Bake trigger | GHA in the builder repo, on push to `main` |
 | Provision/Fry engine | GHA in the platform repo, triggered by Backstage |
 | Software install | `winget` on Windows (future); `apt` on Ubuntu (POC). Same role interface. |
@@ -62,19 +62,19 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
  User (browser)                                 User (terminal)
      |  0. "Get SSH certificate" -> cert (instant)    |  ssh ubuntu@<ip>   (key + user cert)
      v                                                v
- idp.amirasyraf.dev  (EC2: Caddy -> Backstage -> Postgres)        VM (EC2, golden AMI)
-     |  1. Software Template form -> cf:vm:dispatch (quota)          ^
+ idp.amirasyraf.dev  (EC2: Caddy -> Backstage -> Postgres)        VM (EC2 or Azure, golden image)
+     |  1. Launch cards -> template form -> cf:vm:dispatch (quota)   ^
      |  2. provision run in the `vms` orchestrator: ServiceNow mock  |
      |     (in the IDP), then one stage.yml dispatch at a time --+  |  terraform / ansible over SSH
      |     (retries, retry/skip, run state in its DB)            |  |  (pipeline uses its own short cert)
      |  5. reads catalog (vms/*/catalog-info.yaml)               |  |
      v                                                           v  |
- GitHub: compute-factory-platform                         GHA runner (OIDC -> AWS)
+ GitHub: compute-factory-platform                         GHA runner (OIDC -> AWS, + Azure)
    - workflow: stage.yml (one stage per dispatch)            3. terraform apply (S3 state)
    - vms/<name>/  (inventory, written by stages)             4. fry stages (ansible), commit status
                                                                 to vms/<name>/, ping Backstage refresh
  GitHub: compute-factory-builder
-   - push to main -> packer + ansible -> golden AMI (tagged) ---------------^ (Terraform looks it up)
+   - push to main -> packer + ansible -> golden AMI / gallery version -------^ (Terraform looks it up)
 ```
 
 ### Key design choice: Git is the VM inventory
@@ -443,7 +443,7 @@ to one VM's run, and would expose runs through a shared token regardless of team
     billing) and its static IP is kept. Reboot keeps the IP.
   - **Modify** opens the `vm-modify` form prefilled with the VM's current size, software and AD join.
     Only what changed is applied: a size change re-runs `provision` (Terraform updates the instance
-    type in place: stop, change, start; new IP), software changes install checked and uninstall
+    type in place: stop, change, start; a new IP on AWS, Azure keeps its static IP), software changes install checked and uninstall
     unchecked packages, AD join can be turned on or off.
   - **Apply OS updates** and **Re-apply configuration** (repair drift: baseline, software, AD join and
     access again) in the ⋯ menu, with a confirm dialog.
@@ -510,8 +510,9 @@ inventory (host, spec, provenance), so stages share no runner state and any one 
 ### 6.3 Idempotent stages
 
 A stage can be dispatched again after any partial completion. `register` is a no-op for the same
-request ID and refuses a different one. `provision` ignores AMI changes after creation, adopts an
-instance tagged with the VM's `cf:request-id` that is missing from state instead of creating another,
+request ID and refuses a different one. `provision` ignores image changes after creation, adopts
+resources of the VM's `cf:request-id` that are missing from state instead of creating more (the
+platform's `adopt.sh`: tagged EC2 instance/SG; the fixed-name resources of `cf-vm-<name>` on Azure),
 and clears stale state locks. Fry stages are Ansible (`state: present`/`absent`, templated files), so
 a re-run converges. Power stages succeed without changes when the instance is already in the target
 state. `destroy` and `finalize` succeed without changes when the inventory
@@ -557,7 +558,7 @@ store anyone's public key.
 | User | `team-<t>` for each team they're in, e.g. `team-a`, `team-b` | 12h | Backstage "Get SSH certificate" |
 | Admin | adds `team-platform-admins` | 12h | same |
 
-On each VM, `/etc/ssh/auth_principals/ubuntu` lists `cf-automation` and `team-platform-admins` (baked)
+On each VM, `/etc/ssh/auth_principals/<login user>` (`ubuntu`) lists `cf-automation` and `team-platform-admins` (baked)
 plus `team-<owning team>` (written by the `access` fry stage). A cert therefore opens exactly the VMs of
 the user's teams, which is the same rule as visibility in the IDP (5.1a).
 
@@ -625,8 +626,9 @@ cloud login, EC2-only validation and health checks), now read from `platform.jso
 
 Everything else is done by `./poc up` (section 12).
 
-End-to-end test after `up`: get cert → request a VM → watch stages → SSH in → teammate SSH in → other team
-can't see it or SSH in → destroy → `./poc down` → check that nothing is left.
+End-to-end test after `up`, on each platform (AWS, Azure): get cert → Launch a VM → watch stages → SSH in
+→ teammate SSH in → other team can't see it or SSH in → day-2 actions (stop/start/reboot, OS updates,
+Modify) → destroy → `./poc down` → check that nothing is left on either cloud.
 
 ## 10. Rough cost (running 24/7)
 
@@ -708,6 +710,8 @@ compute-factory/                 # 4th repo: the "home" of the POC
 1. **Preflight**:
    - check the tools (`terraform`, `gh`, `aws`, `az`, `docker`, `jq`), the `amirasyraf` AWS profile, `gh`
      auth, the `ARM_*` service-principal variables, the `az` subscription and `.poc.env`;
+   - check the one-time Azure setup (section 9): `.poc-azure-reader.pem` and the `AZURE_*` variables on
+     the builder and platform repos;
    - fail fast if `infra` state already exists (the run assumes a clean slate; run `down` first).
 2. **`terraform -chdir=infra apply`**: state bucket, CA secret + public key parameter, IDP EC2 + EIP, tokens,
    the Azure image gallery and the Azure reader secret.
@@ -755,11 +759,13 @@ then sweep anything else, then verify.
    - terminate instances tagged `cf:poc=true`, including Packer build instances (Packer `run_tags`);
    - delete leftover `packer_*` key pairs and security groups;
    - delete Azure resource groups tagged `cf:poc=true` except infra's (VMs, Packer build groups), then
-     the gallery's image versions (Packer-published, outside Terraform; the definition can't be
-     deleted while they exist).
+     every gallery image definition's versions (Packer-published, outside Terraform; a definition can't be
+     deleted while it has versions).
 4. **DNS**: targeted apply removing the `idp` record.
 5. **`terraform -chdir=infra destroy`**: IDP EC2/EIP, CA secret, state bucket (force-destroy), tokens,
-   Azure gallery and reader secret; then a final sweep of anything tagged `cf:poc=true` on both clouds.
+   Azure gallery and reader secret; then a final sweep of anything tagged `cf:poc=true` on both clouds,
+   and `NetworkWatcherRG` (Azure creates it, untagged, with the first VNet in a region; deleted only while
+   it holds nothing but those automatic network watchers).
 6. **GitHub cleanup**: delete the repo variables and secrets set in `up`, and commit an empty `vms/`.
 7. **Verify**:
    - the Resource Groups Tagging API (`get-resources --tag-filters Key=cf:poc,Values=true`) returns nothing in

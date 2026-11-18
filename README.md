@@ -66,7 +66,9 @@ subscription `74b39a79-…`, e.g. `azsp`), the `cf-admin-local` service principa
 The Azure identities and `AZURE_*` repo variables are one-time setup that survives `down` (DESIGN.md §9).
 
 `down` is safe to run repeatedly and after a failed `up`. Everything in AWS and Azure is tagged
-`cf:poc=true`; `down` ends by checking that nothing with that tag remains on either cloud.
+`cf:poc=true`; `down` ends by checking that nothing with that tag remains on either cloud. It also
+removes `NetworkWatcherRG`, which Azure creates untagged with the first VNet, while it holds only those
+automatic watchers. `up` checks the one-time Azure setup first and stops if it is missing.
 
 The `idp.amirasyraf.dev` DNS record lives in `~/projects/cloudflare/amirasyraf.dev/idp.tf` and is only
 applied with `-target` by `./poc`.

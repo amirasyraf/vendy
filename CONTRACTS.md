@@ -63,7 +63,7 @@ Tooling versions (pin these):
   - `/etc/ssh/trusted_user_ca_keys` contains the CA pub key.
   - An sshd drop-in sets `TrustedUserCAKeys /etc/ssh/trusted_user_ca_keys`,
     `AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u` and `PasswordAuthentication no`.
-  - `/etc/ssh/auth_principals/ubuntu` contains the lines `cf-automation` and `team-platform-admins`.
+  - `/etc/ssh/auth_principals/<login user>` (`ubuntu`) contains the lines `cf-automation` and `team-platform-admins`.
   - `/etc/compute-factory/image-info.json` holds image name, build date and git SHA.
   - Base packages are `curl`, `jq`, `unzip` only. Do **not** bake anything from the software catalog.
 - The bake workflow reads the CA pub key from SSM `/compute-factory/ssh-ca-pub` at build time. It is never committed.
