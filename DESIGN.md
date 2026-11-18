@@ -771,8 +771,9 @@ for garbage collection but the running application stays up.
    after fallback cleanup when possible.
 5. **Verify before GitHub cleanup**: require empty local Terraform state and consecutive successful
    workflow, multi-region AWS, Azure POC-tag and DNS checks. Retry transient cloud/DNS results inside
-   a bounded window. Check both service-specific inventories and the AWS Resource Groups Tagging API;
-   a denied or failed lookup is not proof of absence.
+   a bounded window. Check both service-specific inventories and the AWS Resource Groups Tagging API.
+   A stale EC2 instance tag entry is accepted only when the exact instance lookup confirms it is
+   absent or terminated. A denied or failed lookup is not proof of absence.
 6. **GitHub cleanup**: verify deletion of platform wiring and reset `vms/` on platform `main` with a
    normal non-force push. Verify the published inventory and workflow freeze before printing `CLEAN`.
 

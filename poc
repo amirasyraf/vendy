@@ -1028,8 +1028,22 @@ verify_dns_absent() {
   return 1
 }
 
+verify_tagged_instance_gone() {
+  local region="$1" arn="$2" id result prefix
+  prefix="arn:aws:ec2:$region:$POC_AWS_ACCOUNT:instance/"
+  [[ "$arn" == "$prefix"* ]] || return 1
+  id="${arn#"$prefix"}"
+  [[ "$id" =~ ^i-[0-9a-f]+$ ]] || return 1
+  if result="$(aws ec2 describe-instances --instance-ids "$id" \
+      --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output json 2>&1)"; then
+    jq -e --arg id "$id" 'type == "array" and all(.[]; . == [$id,"terminated"])' <<<"$result" >/dev/null
+  else
+    aws_error "$result" InvalidInstanceID.NotFound
+  fi
+}
+
 verify_aws_region() {
-  local region="$1" tagged failed=0
+  local region="$1" tagged arn failed=0
   verify_absent "AWS $region instances" "" aws ec2 describe-instances \
     --filters Name=tag:cf:poc,Values=true Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
     --query 'Reservations[].Instances[].InstanceId' --output text || failed=1
@@ -1069,11 +1083,15 @@ verify_aws_region() {
   fi
   tagged="$(aws resourcegroupstaggingapi get-resources --tag-filters Key=cf:poc,Values=true \
     --query 'ResourceTagMappingList[].ResourceARN' --output text)" || return 1
-  if [[ -n "$tagged" ]]; then
-    warn "AWS $region tagging API still reports POC resources:"
-    printf '%s\n' "$tagged" | tr '\t' '\n' | sed 's/^/      /' >&2
-    failed=1
-  fi
+  while IFS= read -r arn; do
+    [[ -n "$arn" ]] || continue
+    if verify_tagged_instance_gone "$region" "$arn"; then
+      info "ignoring stale AWS tag entry for EC2 instance verified absent or terminated: $arn"
+    else
+      warn "AWS $region tagging API still reports a resource not verified gone: $arn"
+      failed=1
+    fi
+  done < <(tr '\t' '\n' <<<"$tagged")
   [[ "$failed" == 0 ]]
 }
 
