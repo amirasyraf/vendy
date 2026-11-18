@@ -263,7 +263,8 @@ allows 40 minutes).
 | `7zip` | 7-Zip | — | `7zip.7zip` |
 
 - On Linux the stage installs the `linux` names with `apt`. On Windows it uses the
-  `Microsoft.WinGet.Client` PowerShell module as SYSTEM (`Install-WinGetPackage -MatchOption Equals
+  `Microsoft.WinGet.Client` PowerShell module as SYSTEM in PowerShell 7 (baked; Windows PowerShell 5.1 is
+  refused as SYSTEM) (`Install-WinGetPackage -MatchOption Equals
   -Mode Silent -Scope SystemOrUnknown`): the winget CLI is not supported as SYSTEM and fails in SSH/WinRM
   sessions. Chocolatey was rejected: from 2027-01-01 its terms forbid organisations from using the
   community repository directly.

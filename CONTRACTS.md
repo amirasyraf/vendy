@@ -102,7 +102,8 @@ Tooling versions (pin these):
   principals file for the login user (`Administrator` on AWS, `cfadmin` on Azure, which forbids
   `Administrator`); firewall rule `OpenSSH-Server-In-TCP`; UTC; Remote Desktop allowed
   (`fDenyTSConnections=0`; reached only through SSH, §8.5); `C:\ProgramData\ComputeFactory\image-info.json`;
-  the `Microsoft.WinGet.Client` PowerShell module for all users and `Repair-WinGetPackageManager -AllUsers`.
+  PowerShell 7.6.10 LTS (MSI, pinned SHA-256; as SYSTEM the WinGet module works only there), the
+  `Microsoft.WinGet.Client` PowerShell module for all users and `Repair-WinGetPackageManager -AllUsers`.
   No Windows updates are applied at bake time (the bases are patched monthly; OS Updates installs the rest).
   The build's WinRM listener and port-5986 firewall rule stay in the image; no security group opens it.
   On Azure the Packer build user (`packer`, random password) also survives sysprep; it has no principals
