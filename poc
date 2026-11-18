@@ -1195,6 +1195,17 @@ sweep_tagged() {
   for key in $keys; do
     delete_aws "key pair $key" InvalidKeyPair.NotFound aws ec2 delete-key-pair --key-pair-id "$key" || failed=1
   done
+
+  # Windows VM login passwords (platform scripts/vm-password.sh); a VM destroy normally removes its own.
+  local secrets secret
+  # shellcheck disable=SC2016
+  secrets="$(aws secretsmanager list-secrets --filters Key=name,Values=compute-factory/vm/ Key=tag-key,Values=cf:poc \
+    --query 'SecretList[?starts_with(Name, `compute-factory/vm/`) && Tags[?Key==`cf:poc`&&Value==`true`]].Name' \
+    --output text)" || { failed=1; secrets=; }
+  for secret in $secrets; do
+    delete_aws "VM password secret $secret" ResourceNotFoundException \
+      aws secretsmanager delete-secret --secret-id "$secret" --force-delete-without-recovery || failed=1
+  done
   [[ "$failed" == 0 ]]
 }
 
@@ -1428,6 +1439,19 @@ verify_tagged_ec2_gone() {
   fi
 }
 
+# Stale tag-index entries for deleted Windows VM password secrets (compute-factory/vm/<name>).
+verify_tagged_secrets_gone() {
+  local prefix="arn:aws:secretsmanager:$POC_AWS_REGION:$POC_AWS_ACCOUNT:secret:compute-factory/vm/" arn result
+  for arn in "$@"; do
+    [[ "$arn" == "$prefix"* ]] || return 1
+    if result="$(aws secretsmanager describe-secret --secret-id "$arn" --output json 2>&1)"; then
+      jq -e '.DeletedDate != null' <<<"$result" >/dev/null || return 1
+    elif ! aws_error "$result" ResourceNotFoundException; then
+      return 1
+    fi
+  done
+}
+
 # $1 = 1 to allow the image tier: golden AMIs/snapshots (cf:managed=true) and cf:module=images resources.
 verify_aws_ec2_clean() {
   local allow_images="$1" region="$POC_AWS_REGION" tagged batches failed=0 ami_query snapshot_query
@@ -1488,7 +1512,7 @@ verify_aws_ec2_clean() {
     end' <<<"$tagged")" || { warn "could not parse the AWS $region tag index"; return 1; }
   while IFS=$'\t' read -r -a arns; do
     [[ -n "${arns[0]:-}" ]] || continue
-    if verify_tagged_ec2_gone "${arns[@]}"; then
+    if verify_tagged_ec2_gone "${arns[@]}" || verify_tagged_secrets_gone "${arns[@]}"; then
       info "ignoring stale AWS tag entries verified absent or terminated in EC2: ${arns[*]}"
     else
       warn "AWS $region tag index reports resources not verified gone: ${arns[*]}"

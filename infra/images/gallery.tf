@@ -35,3 +35,21 @@ resource "azurerm_shared_image" "ubuntu" {
   }
   tags = local.azure_tags
 }
+
+# Windows Server 2025 (Desktop Experience, Gen2, x64). Azure creates the cfadmin login at launch.
+resource "azurerm_shared_image" "windows_2025" {
+  name                              = "windows-2025"
+  gallery_name                      = azurerm_shared_image_gallery.images.name
+  resource_group_name               = azurerm_resource_group.images.name
+  location                          = azurerm_resource_group.images.location
+  os_type                           = "Windows"
+  hyper_v_generation                = "V2"
+  architecture                      = "x64"
+  disk_controller_type_nvme_enabled = true
+  identifier {
+    publisher = "compute-factory"
+    offer     = "windows"
+    sku       = "2025"
+  }
+  tags = local.azure_tags
+}

@@ -1,7 +1,8 @@
 # Compute Factory (POC)
 
 An IDP (Backstage) for self-service products across platforms. Home groups visible resources by product.
-The first product, **Compute → Virtual Machines**, runs on **AWS and Azure** (Ubuntu 26.04) with
+The first product, **Compute → Virtual Machines**, runs on **AWS and Azure** (Ubuntu 26.04 and Windows
+Server 2025, the latter with browser Remote Desktop over SSH) with
 Packer, Terraform and Ansible on GitHub Actions. Users choose a platform and an image release before
 configuring the VM. The dedicated **Virtual Machines** page shows live state and pipelines across clouds.
 AWS is the shared base (SSH CA, Terraform state, IDP host); each platform is a

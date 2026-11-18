@@ -51,10 +51,15 @@ resource "aws_iam_role_policy" "idp_read_ca" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
-      Action   = "secretsmanager:GetSecretValue"
-      # The CA secret belongs to the images/ root; match its name plus Secrets Manager's 6-character suffix.
-      Resource = "arn:aws:secretsmanager:${var.region}:${local.account_id}:secret:${local.ssh_ca_secret}-??????"
+      Effect = "Allow"
+      Action = "secretsmanager:GetSecretValue"
+      Resource = [
+        # The CA secret belongs to the images/ root; match its name plus Secrets Manager's 6-character suffix.
+        "arn:aws:secretsmanager:${var.region}:${local.account_id}:secret:${local.ssh_ca_secret}-??????",
+        # Windows VM login passwords (platform scripts/vm-password.sh): shown to the owning team and
+        # used for browser RDP.
+        "arn:aws:secretsmanager:${var.region}:${local.account_id}:secret:compute-factory/vm/*",
+      ]
     }]
   })
 }

@@ -13,14 +13,15 @@ Bake (golden image)  ->  Provision (Terraform)  ->  Fry (Ansible stages)  ->  Re
 
 | Dimension | Long-term target | POC |
 |---|---|---|
-| OS types | Linux, Windows | Ubuntu Server only |
+| OS types | Linux, Windows | Ubuntu Server 26.04, Windows Server 2025 |
 | Platforms | AWS, Azure, vSphere | AWS and Azure |
 | Fry stages | baseline, software, AD join, ... | baseline, software, AD join (mocked), access |
 
 Guiding rules: **KISS**. Every OS- or platform-specific piece sits behind a directory or
-variable boundary, so adding Windows/vSphere means **adding files, not refactoring**. A platform is
+variable boundary. A platform is
 its `terraform/platforms/<p>/` directory in the platform repo: `platform.json` (label, OSes with their
-login user, display name and versions, instance-type/ID patterns, reserved tag rules), `sizes.json`,
+login user, OS family, display name, versions and memory minimum, instance-type/ID patterns, reserved
+tag rules), `sizes.json` (per OS family),
 the Terraform root, `adopt.sh` (recovery) and `power.sh` (start/stop/reboot). Scripts, `spec.py`,
 Terraform and the IDP read those files; outside them only a few places name a platform: the
 workflow's cloud login step, the bake's source selector, the IDP's per-cloud spec/health readers and
@@ -48,8 +49,8 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
 | Base image | Azure: Canonical's Marketplace image `ubuntu-26_04-lts/server` (section 4.1). AWS: Canonical's official Ubuntu AMI, looked up through the public SSM parameter `/aws/service/canonical/ubuntu/server/<ver>/stable/current/amd64/hvm/ebs-gp3/ami-id`. These are the same official images the Marketplace lists, without needing a Marketplace subscription. |
 | Bake trigger | GHA in the builder repo, on push to `main` |
 | Provision/Fry engine | GHA in the platform repo, triggered by Backstage |
-| Software install | `winget` on Windows (future); `apt` on Ubuntu (POC). Same role interface. |
-| VM access | SSH for every OS and platform, authenticated with SSH user certificates signed by a mock CA |
+| Software install | `apt` on Ubuntu; winget (the `Microsoft.WinGet.Client` PowerShell module, as SYSTEM) on Windows. Same role interface. |
+| VM access | SSH for every OS and platform, authenticated with SSH user certificates signed by a mock CA. Windows adds Remote Desktop, only through SSH port forwarding (browser RDP via guacd, or a native client), with one shared login per VM |
 | Network | Default VPC in ap-southeast-2 (`vpc-23619045`, exists); VMs get public IPs; SG allows 22 from anywhere (POC) |
 | Azure | Subscription `amirasyraf` (`74b39a79-…`), tenant `c26545da-…`, region `australiaeast`. One resource group, VNet, NSG (22 from anywhere) and static public IP per VM |
 | Shared base for Azure | AWS stays the shared base: the SSH CA (Secrets Manager), Terraform state (S3) and the IDP host. Azure stages log in to both clouds |
@@ -150,15 +151,18 @@ packer/
     source.aws.pkr.hcl         # amazon-ebs source
     source.azure.pkr.hcl       # azure-arm source -> Azure Compute Gallery cf-images/cfimages/ubuntu
     # source.vsphere.pkr.hcl   # vsphere-iso/clone (future)
-  # windows-2022/              # future
+  windows/                     # Windows Server (images.yaml version = os_version, e.g. 2025)
+    windows.pkr.hcl            # WinRM communicator; EC2Launch reset (AWS) / sysprep (Azure)
+    source.aws.pkr.hcl source.azure.pkr.hcl winrm.ps1   # winrm.ps1: EC2 user data for the build's WinRM
 ansible/
   bake.yml                     # entry playbook, roles chosen by OS family
   roles/
-    common/                    # e.g. updates, base packages (Linux tasks; Windows tasks later)
+    common/                    # Linux: updates, base packages; Windows: UTC, RDP allowed, WinGet module
+  connection/<family>.yml      # become (Linux) / WinRM settings (Windows), passed by Packer
     ssh_ca/                    # installs CA pubkey + sshd TrustedUserCAKeys + AuthorizedPrincipalsFile
                                # CA PUBLIC key is NOT committed: bake reads it from SSM parameter
                                # /compute-factory/ssh-ca-pub (the CA lives as long as the images; 12.1)
-images.yaml                    # build matrix: ubuntu 26.04 on aws and on azure
+images.yaml                    # build matrix: ubuntu 26.04 and windows 2025, each on aws and azure
 .github/workflows/bake.yml     # on push to main + workflow_dispatch (used by `poc up`):
                                # matrix from images.yaml -> packer build -only=<platform>
 ```
@@ -185,8 +189,17 @@ Bake does:
    definition `ubuntu` (NVMe-capable: the sizes with quota in the region are NVMe-only), with the same
    tags; Terraform launches the latest bake from the definition mapped to the selected OS release.
 
+Windows Server 2025 bakes the same way from Amazon's `Windows_Server-2025-English-Full-Base` AMI and
+`WindowsServer:2025-datacenter-g2` on Azure, over WinRM (Packer's ansible provisioner with `pywinrm`):
+OpenSSH Server (in-box) with PowerShell as its shell and a whole `sshd_config` that accepts only CA
+certificates (`AuthorizedKeysFile none`, port forwarding allowed for RDP), the principals file for the
+login user (`Administrator` on AWS; `cfadmin` on Azure, which forbids `Administrator`), UTC, Remote
+Desktop allowed, provenance, and the WinGet PowerShell module for all users. No updates at bake (the
+bases are patched monthly). AWS ends with `ec2launch reset`, Azure with sysprep; gallery definition
+`windows-2025`. Details: CONTRACTS §2a.
+
 Platform agnosticism: Packer `-only=<source>.<os>` comes from the matrix. Adding a platform means
-adding a source file, a matrix row and its case in the workflow's source selector. Ansible roles branch on `ansible_os_family` (Windows tasks go in
+adding a source file, a matrix row and its case in the workflow's source selector. Ansible roles branch on `ansible_os_family` (`tasks/linux.yml`,
 `tasks/windows.yml`).
 
 ### 4.2 `compute-factory-platform` (Provision + Fry)
@@ -202,11 +215,13 @@ terraform/
 ansible/
   fry/
     baseline.yml               # hostname, timezone, motd, banner
-    software.yml               # installs the user's picks from software-catalog.yml (apt now, winget later)
+    software.yml               # installs the user's picks from software-catalog.json (apt / winget)
     ad-join.yml                # MOCK: writes /etc/compute-factory/ad-join.json, logs "joined CORP.EXAMPLE"
     access.yml                 # writes the owning team's principal so team members' certs work
-  software-catalog.yml         # the only software users may pick, with per-OS package IDs
-  roles/ ...                   # per-stage roles with tasks/linux.yml (+ tasks/windows.yml later)
+  software-catalog.json        # the only software users may pick, with per-OS-family package IDs
+  connection/<family>.yml      # Ansible settings known before facts (become / PowerShell shell)
+  requirements.yml             # pinned ansible.windows collection
+  roles/ ...                   # per-stage roles with tasks/linux.yml and tasks/windows.yml
 catalog/
   templates/
     vm-request/template.yaml   # Backstage Software Template: new VM
@@ -222,36 +237,50 @@ vms/                           # inventory (written by stage runs only)
 | Stage | When | What it does |
 |---|---|---|
 | `baseline` | always | Hostname set to the VM name, `/etc/hosts`, login banner (VM, team, requester, platform), `/etc/compute-factory/vm-info.json` |
-| `software` | if any software picked | Installs the picks using `software-catalog.yml`; in a Modify run also removes unchecked catalog packages |
+| `software` | if any software picked | Installs the picks using `software-catalog.json`; in a Modify run also removes unchecked catalog packages |
 | `ad-join` | if picked (mock) | Writes `/etc/compute-factory/ad-join.json` (domain `corp.example.local`, OU, timestamp), adds a banner line, logs "joined CORP.EXAMPLE.LOCAL". No real AD. When Modify turns AD join off, removes them again. |
-| `access` | always, last | Writes `team-<owning team>` into `/etc/ssh/auth_principals/<login user>` and turns off `authorized_keys` logins (Azure requires an admin key at launch; only CA certs log in afterwards), then `sshd -t` and reload |
+| `access` | always, last | Writes `team-<owning team>` into the login user's principals file. Linux: turns off `authorized_keys` logins (Azure requires an admin key at launch; only CA certs log in afterwards), then `sshd -t` and reload. Windows: sets the login user's password to the team's shared one (Secrets Manager `compute-factory/vm/<name>`, created once per VM by the workflow) |
+
+Windows equivalents: baseline sets the computer name (cut to 15 characters; one reboot), UTC, the SSH
+banner file `C:\ProgramData\ComputeFactory\banner.txt` and `vm-info.json`; the mock AD join writes
+`ad-join.json` and a banner line there.
 
 `ansible/maintain/os-update.yml` (stage `os-update`, the "Apply OS updates" action) is maintenance,
-not a fry stage: a full `apt` upgrade, then a reboot only if `/var/run/reboot-required` exists.
+not a fry stage: Linux runs a full `apt` upgrade, then reboots only if `/var/run/reboot-required`
+exists; Windows installs updates of every category with `win_updates`, rebooting as needed (the job
+allows 40 minutes).
 
-**Software catalog** (`ansible/software-catalog.yml`). The POC set:
+**Software catalog** (`ansible/software-catalog.json`). The POC set:
 
-```yaml
-git:    { linux: git,       windows: Git.Git }
-htop:   { linux: htop,      windows: null }      # null = not offered on that OS
-nginx:  { linux: nginx,     windows: null }
-docker: { linux: docker.io, windows: null }
-```
+| Key | Label | linux (apt) | windows (winget) |
+|---|---|---|---|
+| `git` | Git | `git` | `Git.Git` |
+| `htop` | htop | `htop` | — |
+| `nginx` | nginx | `nginx` | — |
+| `docker` | Docker | `docker.io` | — |
+| `vscode` | VS Code | — | `Microsoft.VisualStudioCode` |
+| `firefox` | Firefox | — | `Mozilla.Firefox` |
+| `7zip` | 7-Zip | — | `7zip.7zip` |
 
-- On Linux the stage installs the `linux` names with `apt`. On Windows later it runs
-  `winget install --id <windows id> --silent --accept-package-agreements --accept-source-agreements`.
-- The request form's checkboxes list the same names, filtered by OS. They're maintained by hand next to this
-  file, in the same repo.
-- The `register` stage's validation rejects any name not in the catalog for the chosen OS, so the form
-  can't be bypassed.
+- On Linux the stage installs the `linux` names with `apt`. On Windows it uses the
+  `Microsoft.WinGet.Client` PowerShell module as SYSTEM (`Install-WinGetPackage -MatchOption Equals
+  -Mode Silent -Scope SystemOrUnknown`): the winget CLI is not supported as SYSTEM and fails in SSH/WinRM
+  sessions. Chocolatey was rejected: from 2027-01-01 its terms forbid organisations from using the
+  community repository directly.
+- The request and Modify forms' `VmSoftwarePicker` reads this file (through the IDP) and shows only
+  entries offered for the chosen OS's family.
+- The IDP (admission, Modify) and the `register` stage's validation reject any name not in the catalog
+  for the chosen OS family, so the form can't be bypassed.
 - To add or remove software on an existing VM, use **Modify** on the VM page and check or uncheck it.
-  Removal uses `apt` `state: absent`, so package data and configuration files stay.
+  Removal uses `apt` `state: absent` (package data and configuration files stay) or `Uninstall-WinGetPackage`.
 
 **Ansible conventions** (bake and fry):
 - Every role's `tasks/main.yml` includes `tasks/linux.yml` or `tasks/windows.yml` based on `ansible_os_family`.
-  Adding Windows means adding the `windows.yml` files, not changing the playbooks.
-- Ansible connects over SSH on both OSes; Windows will use `ansible_shell_type: powershell`.
-- The Ansible version is pinned and installed with `pip` on the runner, the same in both repos.
+- Connection settings that must be known before facts come from `ansible/connection/<family>.yml`
+  (`-e`, chosen by the OS family in `platform.json`): Linux `ansible_become: true`; Windows
+  `ansible_shell_type: powershell` (SSH as an administrator; SYSTEM tasks use `runas`). Plays do not set `become`.
+- Fry connects over SSH on both OSes; the Windows bake uses WinRM (Packer's communicator).
+- The Ansible version and Windows collections are pinned, the same in both repos.
 
 **Platform contract** (every `terraform/platforms/<p>/` root has the same interface):
 
@@ -259,9 +288,13 @@ docker: { linux: docker.io, windows: null }
 |---|---|
 | `name`, `os`, `image_version`, `size` (XS/S/M/L) or `instance_type`, `team`, `cloud_tags` | `public_ip`, `ssh_user`, `instance_id`, `instance_type` |
 
-- Each platform maps sizes in one data file. AWS: `sizes.json` (XS=`t3.micro`, S=`t3.small`,
-  M=`t3.medium`, L=`t3.large`; all 2 vCPU, 1/2/4/8 GiB). Azure: `Standard_D2ls_v6`, `D2s_v6`,
-  `D4ls_v6`, `D4s_v6` (B-series has no quota in this subscription; the region allows 10 vCPUs).
+- Each platform maps sizes in one data file, per OS family. AWS `sizes.json`: Linux XS=`t3.micro`,
+  S=`t3.small`, M=`t3.medium`, L=`t3.large` (2 vCPU, 1/2/4/8 GiB); Windows XS=`t3.medium`, S=`t3.large`,
+  M=`t3.xlarge`, L=`t3.2xlarge` (4/8/16/32 GiB). Azure: Linux `Standard_D2ls_v6`, `D2s_v6`, `D4ls_v6`,
+  `D4s_v6`; Windows `D2ls_v6`, `D2s_v6`, `D4s_v6`, `D8s_v6` (B-series has no quota in this
+  subscription; the region allows 10 vCPUs). Windows needs at least 4 GiB (`minMemoryMiB`): the
+  Advanced picker greys out smaller types and AWS Terraform refuses them; the AWS root volume is 50 GiB
+  for Windows (`rootVolumeGiB`).
   Regular users pick a size card showing the instance type and live specs from the VM's cloud. A
   collapsed **Advanced** picker lists every x86_64 instance type the platform offers in its region
   (AWS: EC2 offerings; Azure: Resource SKUs without a location restriction that boot the Gen2 image),
@@ -273,7 +306,10 @@ docker: { linux: docker.io, windows: null }
 - Image lookup: AWS `data "aws_ami"` with `cf:os=<os>`, `cf:os-version=<imageVersion>`,
   `cf:managed=true`, `most_recent`; Azure uses the latest bake in the definition mapped to the
   selected release. Both ignore image changes after launch.
-- `ssh_user` comes from the OS entry in `platform.json`: `ubuntu` for Ubuntu, `Administrator` for Windows later.
+- `ssh_user` comes from the OS entry in `platform.json`: `ubuntu` for Ubuntu; `Administrator` for
+  Windows on AWS, `cfadmin` on Azure (Azure forbids `Administrator`).
+- Azure creates `azurerm_linux_virtual_machine` or `azurerm_windows_virtual_machine` by OS family (`count`;
+  the Windows one launches with a random password that the access stage replaces).
 - State: S3 bucket `cf-tfstate-134584031874-apse2`, key `vms/<platform>/<name>/terraform.tfstate`, S3 native
   locking (`use_lockfile = true`). The workflow passes the key through `-backend-config`.
 
@@ -456,6 +492,16 @@ to one VM's run, and would expose runs through a shared token regardless of team
     output travel over short HTTP requests (long-polled output), not WebSockets, for the same proxy
     reason as the task page. Two sessions per user, 15-minute idle timeout, open/close logged.
     `CONTRACTS.md` §8.4.
+  - Windows VMs add **Open Remote Desktop**: the IDP opens an SSH port forward to the VM's own RDP
+    port (with the same kind of per-session cert; 3389 is never exposed) and a `guacd` sidecar
+    (Apache Guacamole 1.6.0) connects through it with the VM's shared login. The browser draws the
+    desktop with guacamole-common-js over a custom long-poll tunnel (Guacamole's own HTTP tunnel keeps
+    responses open, which buffering proxies break; the WebSocket-only alternatives were rejected for
+    the same reason: Teleport, Cloudflare, Devolutions/IronRDP, Warpgate, RD Web Client; AWS Fleet
+    Manager and Azure Bastion work only in their consoles). One session per user, 30-minute idle
+    timeout. **Show Password** reveals the shared login (logged) for native clients, which use
+    `ssh -L 33389:localhost:3389 …` and a downloaded `.rdp` file. Everyone signs in as the same user,
+    so a second person takes over the first one's desktop. `CONTRACTS.md` §8.5.
 - Rules: a running run blocks every action except Destroy; a failed (incomplete) provision must be
   retried, skipped or destroyed first; any new action supersedes a failed day-2 run. Modify, Reboot,
   OS updates and Re-apply need a running VM; the backend refuses them (and a redundant start/stop) when
@@ -527,8 +573,9 @@ is already gone. All stages are serialized per VM by the workflow concurrency gr
 3. Wait for SSH, then `ansible-playbook -i <ip>, -u <ssh_user> ansible/fry/<stage>.yml`.
 
 No per-VM keys and no key pairs in Terraform. The pipeline is just another CA client, like the users.
-For Windows later, Ansible connects over SSH as well (`ansible_shell_type: powershell`), because OpenSSH
-Server is baked into the Windows image.
+Windows uses the same path: OpenSSH Server is baked into the image with PowerShell as its shell, and
+Ansible runs with `ansible_shell_type: powershell`. Readiness probes run `exit` (valid in every shell);
+the reboot check compares the last boot time instead of `/proc/sys/kernel/random/boot_id`.
 
 ### 6.5 `bake.yml` (builder repo)
 
@@ -552,7 +599,8 @@ store anyone's public key.
 - **Private key**: stored in **one place**, the AWS Secrets Manager secret `compute-factory/ssh-ca`
   (ap-southeast-2). Two signers fetch it at signing time and keep it only in memory, never on disk:
   - the Backstage backend signs user certs. It reads the secret through the IDP EC2 instance role, which
-    has `secretsmanager:GetSecretValue` on that one secret ARN only;
+    has `secretsmanager:GetSecretValue` on that secret ARN and on `compute-factory/vm/*` (Windows VM
+    login passwords, shown to the owning team and used for browser RDP);
   - `stage.yml` (fry stages) signs the pipeline's throwaway certs. It reads the secret through the existing OIDC role.
 - Rotation means updating the secret and re-baking with the new public key. Moving to Vault later only
   replaces the signing function in those two places.
@@ -607,14 +655,23 @@ Check a cert with `ssh-keygen -L -f ~/.ssh/id_ed25519-cert.pub` (shows principal
 
 | To add | Add |
 |---|---|
-| Windows OS | `packer/windows-2022/`, Windows task files in roles (OpenSSH Server + CA config, winget), OS row in `images.yaml`, an `os` entry (login user, family, label, versions) in each platform's `platform.json`, a gallery image definition for each release on Azure |
+| Windows OS | Done (Windows Server 2025): see below |
 | Another image release | Publish the tagged AWS bake and the Azure bake under a separate Azure gallery definition. Then advertise the release in each supported platform's `os.<os>.versions` and map the Azure definition in `galleryImages`. |
 | A platform (vSphere) | `terraform/platforms/<p>/` with the same contract plus `platform.json`, `sizes.json`, `adopt.sh`, `power.sh`; a Packer source and matrix row; its login step in `stage.yml`/`bake.yml`; the IDP's spec/health readers for that cloud (`vmSizes.ts`, `observed.ts`) and `PLATFORMS`; `./poc` sweeps; template enum. vSphere also needs a self-hosted runner that reaches vCenter |
 | A product | Register its category, product ID, resource type, product page and launch template in the IDP; tag the template `product` and define its authorization policy before exposing inventory |
+| New fry stage | `ansible/fry/<stage>.yml` + role, one entry in the orchestrator's stage list and `stage.yml`'s stage enum, one form checkbox |
 
 Azure was added this way. It also exposed what the first version had hardcoded (the SSH user, the
 cloud login, EC2-only validation and health checks), now read from `platform.json`.
-| New fry stage | `ansible/fry/<stage>.yml` + role, one entry in the orchestrator's stage list and `stage.yml`'s stage enum, one form checkbox |
+
+Windows was **not** only new files. Besides `packer/windows/`, the Windows task files, `images.yaml`
+rows, `os.windows` entries and the `windows-2025` gallery definition, shared code had to become OS-aware:
+Ansible connection settings per family (`ansible/connection/`, no play-level `become`), the SSH probe
+(`exit`) and reboot check, `os-update`, sizes per OS family (with a memory minimum), the AWS root volume
+size, the default image version, Azure's Linux/Windows VM resources, the software catalog (JSON, read by
+the forms through the IDP), the IDP's login-user check, and the Windows password and remote desktop
+pieces (§5.4). Another OS family follows the same pattern; another release of an existing OS is the
+"Another image release" row.
 
 ## 9. One-time manual steps (outside `./poc`)
 
@@ -638,7 +695,11 @@ Modify) → destroy → `./poc down` → check that nothing is left on either cl
 
 ## 10. Rough cost (running 24/7)
 
-IDP t4g.medium about $30/mo plus EIP/EBS. Each test VM (t3.small) costs about $0.03/hr. AMI snapshots
+IDP t4g.medium about $30/mo plus EIP/EBS. Each test VM (t3.small) costs about $0.03/hr. Windows
+instances include the licence: roughly 1.5–2× the Linux price of the same type, and the Windows sizes
+are larger (S = t3.large, about $0.13/hr on AWS). Browser RDP adds a `guacd` container on the IDP host
+(1 GiB memory limit; per-session load to be measured on the first Windows VM; move the host to
+t4g.large if 4 GiB proves too small). AMI snapshots
 cost cents. An Azure test VM (2 vCPU v6) is roughly $0.10/hr plus a static IP and disk while it
 exists; a deallocated one pays only those. Gallery storage costs cents. After `./poc down` the cost is
 $0: no AWS or Azure resources remain. After `./poc down --keep-images` only the image tier remains:
@@ -806,7 +867,7 @@ for garbage collection but the running application stays up.
    Delete an empty bucket without force before shared Terraform destroy, including for old state
    that recorded `force_destroy = true`.
 3. **Sweep owned resources**: terminate tagged AWS instances, sweep tagged detached disks, ENIs, EIPs,
-   groups and key pairs in `ap-southeast-2` only. The POC does not discover or touch other AWS regions;
+   groups, key pairs and Windows VM password secrets (`compute-factory/vm/*`) in `ap-southeast-2` only. The POC does not discover or touch other AWS regions;
    check those separately if a manual run used one. When VM state is resolved and `--keep-images` was
    not given, deregister tagged AMIs including disabled ones before deleting independently tagged
    snapshots. Delete tagged Azure VM and build groups; then, unless images are kept, remove gallery

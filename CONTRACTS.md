@@ -41,15 +41,17 @@ AWS remains the shared base (SSH CA, Terraform state bucket, IDP host); Azure ho
 | Location | `australiaeast` |
 | GHA identity (OIDC) | Entra app `cf-github-actions` (`2e6cce7d-…`), Contributor on the subscription; federated subjects `repo:amirasyraf@15522007/compute-factory-{builder@1458285691,platform@1458285776}:ref:refs/heads/main` |
 | GHA repo variables (builder + platform) | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_LOCATION` |
-| Image gallery | resource group `cf-images`, gallery `cfimages`, one definition per OS release (`ubuntu`: Ubuntu 26.04, Linux, Gen2, x64, NVMe + SCSI); the group (tag `cf:module=images`), gallery and current definition are created by `infra/images/gallery.tf` |
-| Per-VM resources | resource group `cf-vm-<name>`; VNet, subnet, NSG (tcp/22 from anywhere), static Standard public IP, NIC and VM all named `cf-<name>` |
+| Image gallery | resource group `cf-images`, gallery `cfimages`, one definition per OS release (`ubuntu`: Ubuntu 26.04, Linux; `windows-2025`: Windows Server 2025, Windows; both Gen2, x64, NVMe + SCSI); the group (tag `cf:module=images`), gallery and definitions are created by `infra/images/gallery.tf` |
+| Per-VM resources | resource group `cf-vm-<name>`; VNet, subnet, NSG (tcp/22 from anywhere; never 3389), static Standard public IP, NIC and VM all named `cf-<name>` (a Linux or Windows VM resource by OS family) |
 | IDP reader | service principal `cf-idp-azure-reader` (Reader, certificate); Secrets Manager `compute-factory/azure-reader`, `SecretString` JSON `{tenantId, clientId, subscriptionId, location, certificatePem}` |
 | Laptop admin | service principal `cf-admin-local` (Owner, certificate; `ARM_*` in `~/.zshrc`) for `infra/images` and `./poc` |
 
 Tooling versions (pin these):
 - Terraform `>= 1.10` (S3 `use_lockfile`), AWS provider `~> 6.0`.
 - Packer latest 1.x with plugins `amazon`, `azure` (`>= 2.6, < 3`) + `ansible`. azurerm provider `~> 4.0`.
-- `ansible-core`: one exact pinned version, chosen by Agent A, recorded in both repos' `requirements-ansible.txt`.
+- `ansible-core`: one exact pinned version, chosen by Agent A, recorded in both repos' `requirements-ansible.txt`
+  (the builder adds `pywinrm` for the Windows bake). Collection `ansible.windows` is
+  pinned in both repos' `ansible/requirements.yml` and installed by the workflows.
 - Node 24 for Backstage.
 
 ## 2. Golden image (bake → provision)
@@ -80,6 +82,33 @@ Tooling versions (pin these):
 - The principals file is named after the OS login user (`platform.json` `os.<os>.sshUser`; Packer passes
   `cf_ssh_user`).
 
+### 2a. Windows Server 2025 image
+
+- `images.yaml` rows `os: windows`, `version: "2025"` for `aws` and `azure`; Packer `packer/windows`
+  (`-only=<builder>.windows`, `os_version` = the row version). Tags as above with `cf:os=windows`,
+  `cf:os-family=windows`, `cf:os-version=2025`; AMI name `cf-windows-2025-<YYYYMMDDhhmmss>`.
+- AWS base: Amazon's `Windows_Server-2025-English-Full-Base` (SSM
+  `/aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base`, owner `801119661308`; Desktop
+  Experience, UEFI). Packer connects over WinRM HTTPS (user-data bootstrap, NTLM, the EC2-generated
+  Administrator password) and finishes with `ec2launch reset` (EC2Launch v2 runs again at first boot:
+  new random Administrator password, disk extension). No sysprep (no domain join; shared SID accepted).
+- Azure base: `MicrosoftWindowsServer:WindowsServer:2025-datacenter-g2:latest` (Gen2, NVMe + SCSI);
+  WinRM via Packer's temporary Key Vault; sysprep `/generalize /oobe /mode:vm`; gallery definition
+  `windows-2025`, version `1.<YYYYMMDD>.<hhmmss>`.
+- Baked: OpenSSH Server (in-box; started automatically) with PowerShell as `DefaultShell`; the whole
+  `C:\ProgramData\ssh\sshd_config` = `TrustedUserCAKeys __PROGRAMDATA__/ssh/trusted_user_ca_keys`,
+  `AuthorizedPrincipalsFile __PROGRAMDATA__/ssh/auth_principals/%u`, `AuthorizedKeysFile none`,
+  `PasswordAuthentication no`, `AllowTcpForwarding yes`, `Banner __PROGRAMDATA__/ComputeFactory/banner.txt`;
+  principals file for the login user (`Administrator` on AWS, `cfadmin` on Azure, which forbids
+  `Administrator`); firewall rule `OpenSSH-Server-In-TCP`; UTC; Remote Desktop allowed
+  (`fDenyTSConnections=0`; reached only through SSH, §8.5); `C:\ProgramData\ComputeFactory\image-info.json`;
+  the `Microsoft.WinGet.Client` PowerShell module for all users and `Repair-WinGetPackageManager -AllUsers`.
+  No Windows updates are applied at bake time (the bases are patched monthly; OS Updates installs the rest).
+  The build's WinRM listener and port-5986 firewall rule stay in the image; no security group opens it.
+  On Azure the Packer build user (`packer`, random password) also survives sysprep; it has no principals
+  file, so it cannot log in over SSH. All VMs of one image share its SSH host keys (host keys are not
+  pinned anywhere in this POC).
+
 ## 3. SSH identity
 
 | Principal | Meaning |
@@ -88,13 +117,19 @@ Tooling versions (pin these):
 | `team-<group>` | a member of Backstage group `<group>`, e.g. `team-alpha` |
 | `team-platform-admins` | admins; baked into every VM |
 
-- Browser terminal (§8.4) certs: a fresh per-session ed25519 key generated on the IDP host, key ID
-  `idp-terminal:<username>`, one principal (`team-<VM's team>` if the user is in it, else
+- Browser terminal (§8.4) and remote desktop (§8.5) certs: a fresh per-session ed25519 key generated on
+  the IDP host, key ID `idp-terminal:<username>` or `idp-rdp:<username>`, one principal (`team-<VM's team>` if the user is in it, else
   `team-platform-admins`), validity 5 minutes (only the SSH handshake needs it). The private key never
   leaves the IDP and is deleted when the session ends.
 
 - OS login user: `platform.json` `os.<os>.sshUser` of the VM's platform (`ubuntu` for Ubuntu on AWS and
-  Azure); recorded as `cf/ssh-user`.
+  Azure; `Administrator` for Windows on AWS, `cfadmin` on Azure); recorded as `cf/ssh-user`.
+- Windows: the same principals rule in `C:\ProgramData\ssh\auth_principals\<login user>` (the image
+  already has `AuthorizedKeysFile none`; sshd is not restarted). The team shares the login user's
+  password for Remote Desktop: `access` sets it from Secrets Manager `compute-factory/vm/<name>`
+  (`SecretString` `{username, password, requestId}`, tags `cf:poc=true`, `cf:vm`, `cf:request-id`; created once per
+  incarnation by `scripts/vm-password.sh`, deleted by `destroy`, swept by `./poc down`). The IDP shows it
+  only to the owning team and admins (§8.2) and uses it for browser RDP.
 - The fry stage `access` writes the **whole** `/etc/ssh/auth_principals/<login user>` file with exactly
   three lines: `cf-automation`, `team-platform-admins` and `team-<owning team>`, and the drop-in
   `/etc/ssh/sshd_config.d/01-compute-factory-certificates-only.conf` (`AuthorizedKeysFile none`), so
@@ -112,16 +147,25 @@ Tooling versions (pin these):
 - Usernames must match the password entries managed by `./poc set-password`.
 - Group names are bare (`alpha`). The owner ref is `group:default/alpha`, and the principal is `team-alpha`.
 
-## 5. Software catalog (platform repo `ansible/software-catalog.yml`)
+## 5. Software catalog (platform repo `ansible/software-catalog.json`)
 
-```yaml
-git:    { linux: git,       windows: Git.Git }
-htop:   { linux: htop,      windows: null }
-nginx:  { linux: nginx,     windows: null }
-docker: { linux: docker.io, windows: null }
+```json
+{
+  "git": { "label": "Git", "linux": "git", "windows": "Git.Git" },
+  "htop": { "label": "htop", "linux": "htop", "windows": null },
+  "nginx": { "label": "nginx", "linux": "nginx", "windows": null },
+  "docker": { "label": "Docker", "linux": "docker.io", "windows": null },
+  "vscode": { "label": "VS Code", "linux": null, "windows": "Microsoft.VisualStudioCode" },
+  "firefox": { "label": "Firefox", "linux": null, "windows": "Mozilla.Firefox" },
+  "7zip": { "label": "7-Zip", "linux": null, "windows": "7zip.7zip" }
+}
 ```
 
-The `vm-request` template's software enum must be exactly `[git, htop, nginx, docker]`.
+Keys match `^[a-z0-9][a-z0-9-]{0,40}$`; each OS-family column holds that family's package (apt name,
+winget ID) or `null` (not offered). It is the single allowlist: `spec.py`, `validate.sh`, the software
+role, the IDP admission/Modify checks and the forms' `ui:field: VmSoftwarePicker` (checkboxes for the
+form's OS family, from `GET /api/vm-sizes/software`) all read it. The templates' `software` field is a
+unique string array (`maxItems: 20`) with no enum.
 
 ## 6. Platform repo: stage workflow
 
@@ -144,6 +188,8 @@ All inputs are strings and required unless noted.
 | `requester_teams` | `alpha,bravo` | comma-separated bare group names, server-derived by the IDP |
 | `params_json` | `{}` | optional, default `{}`; stage-specific JSON object (below); max 40 KiB |
 
+- Job timeout: 20 minutes; 40 for `os-update` (Windows updates).
+
 - `run-name: "stage <stage> <name> by <requested_by> [<run_key>]"`. The orchestrator recovers a lost
   dispatch response by this exact `[<run_key>]` suffix, so it must stay the end of the title.
 - `concurrency: { group: vm-<name>, cancel-in-progress: false }`. The orchestrator dispatches at most one
@@ -151,7 +197,7 @@ All inputs are strings and required unless noted.
 - Azure: job env `ARM_USE_OIDC=true` and `ARM_CLIENT_ID`/`ARM_TENANT_ID`/`ARM_SUBSCRIPTION_ID` from the
   `AZURE_*` variables (Terraform azurerm); `azure/login@v3` (OIDC) runs after AWS credentials when the
   validated platform is `azure` and the stage is `provision`, an eligible `destroy`, `start`, `stop` or
-  `reboot`. `Validate inputs` outputs `platform` and `ssh_user` (from `platform.json`) for the later steps.
+  `reboot`. `Validate inputs` outputs `platform`, `family` and `ssh_user` (from `platform.json`) for the later steps.
 - `permissions: { contents: write, id-token: write }`. Executor code (scripts, Ansible, Terraform) comes
   from the dispatched commit (`github.sha`). Inventory is read from, and committed to, a separate
   checkout of current `main` taken when the job starts, because a stage queued behind another one must
@@ -186,8 +232,8 @@ first checks that `vms/<name>/catalog-info.yaml` exists with `cf/request-id == r
 | `software` (removal) | Besides installing `cf_software`, removes `params_json.remove` minus anything still desired (`apt` `state: absent`; data and configuration files are kept). |
 | `ad-join` (leave) | With `adJoin: false` in the persisted spec (Modify turned it off) the mock join record and banner line are removed. |
 | `start`, `stop`, `reboot` | Instance from `cf/instance-id` (matching the platform's `instanceIdPattern`); it must carry `cf:vm=<name>`, `cf:request-id=<request_id>`, `cf:poc=true`. Cloud calls come from `terraform/platforms/<p>/power.sh`. `stop`: stop and wait (Azure: deallocate, also for a guest-stopped VM that is still allocated), then `cf/public-ip: ""`. `start`: start and wait, record the current `cf/public-ip`, wait for SSH. `reboot`: requires `running`; cloud reboot, then wait until the guest's boot ID changes (10 min). Already in the target state → success. `cf/status` is not changed. |
-| `os-update` | Requires a public IP. Runs `ansible/maintain/os-update.yml` (full `apt` upgrade; reboot only if `/var/run/reboot-required`). `cf/status` is not changed. |
-| `destroy` | Inventory missing → success (already destroyed). With `demoGeneration`: the existing fail-closed cleanup check (`GET $BACKSTAGE_URL/api/vms/cleanup-check/<name>?generation=…&request_id=…`); ineligible → success without changes. Otherwise identity check, `cf/status: destroying`, `terraform destroy`, delete the state object, delete the inventory directory. A retry after partial completion converges. |
+| `os-update` | Requires a public IP. Runs `ansible/maintain/os-update.yml`: Linux full `apt` upgrade, reboot only if `/var/run/reboot-required`; Windows `win_updates` of every category, rebooting as needed. `cf/status` is not changed. |
+| `destroy` | Inventory missing → success (already destroyed). With `demoGeneration`: the existing fail-closed cleanup check (`GET $BACKSTAGE_URL/api/vms/cleanup-check/<name>?generation=…&request_id=…`); ineligible → success without changes. Otherwise identity check, `cf/status: destroying`, `terraform destroy`, delete the state object, delete this incarnation's `compute-factory/vm/<name>` password secret if any, delete the inventory directory. A retry after partial completion converges. |
 | `finalize` | Inventory missing or a different request ID → success without changes. `ready` → `cf/status: ready`, `cf/ready-at` (first time only). `failed` → `cf/status: failed`, `cf/failed-at` (first time only). |
 
 Team guard: the persisted (or, for `register`, desired) `spec.owner` group must be in `requester_teams`;
@@ -197,9 +243,14 @@ Team guard: the persisted (or, for `register`, desired) `spec.owner` group must 
 ```
 ansible-playbook -i "<host>," -u <ssh_user> \
   --private-key <ephemeral_key> \
-  --ssh-common-args "-o CertificateFile=<ephemeral_key>-cert.pub -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
-  ansible/fry/<stage>.yml -e @<vars.json>
+  --ssh-common-args "-o CertificateFile=<ephemeral_key>-cert.pub -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30" \
+  ansible/fry/<stage>.yml -e @ansible/connection/<family>.yml -e @<vars.json> -e @<secret.json>
 ```
+
+`ansible/connection/<family>.yml` holds what must be known before facts: Linux `ansible_become: true`;
+Windows `ansible_shell_type: powershell` (the login user is an administrator; SYSTEM tasks use
+`become_method: runas`). Plays do not set `become`. `secret.json` is `{}` except for the Windows
+`access` stage: `{"cf_admin_password": …}` (§3).
 
 Run from the platform repo root. `vars.json` keys (all always present):
 
@@ -217,7 +268,7 @@ Run from the platform repo root. `vars.json` keys (all always present):
 
 Stage playbooks: `ansible/fry/baseline.yml`, `software.yml`, `ad-join.yml`, `access.yml`; the
 maintenance playbook `ansible/maintain/os-update.yml` (stage `os-update`) takes the same variables.
-Install with `pip install -r requirements-ansible.txt`.
+Install with `pip install -r requirements-ansible.txt` and `ansible-galaxy collection install -r ansible/requirements.yml`.
 
 ## 7. VM inventory (platform repo `vms/<name>/`)
 
@@ -264,14 +315,15 @@ spec:
 - `spec` is desired state, annotations are observed results/provenance. No duplicated desired
   `cf/platform`, `cf/os`, `cf/size`, `cf/team`, `cf/software` annotations are written or consumed.
 - `scripts/spec.py` is the workflow-boundary validator/normalizer. Required: `type: vm`, `owner`, and
-  `compute.{platform,os}` plus exactly one of `compute.size` (a key of that platform's `sizes.json`:
-  XS/S/M/L) or `compute.instanceType` (matching the platform's `instanceTypePattern` and not its
+  `compute.{platform,os}` plus exactly one of `compute.size` (a key of that platform's `sizes.json` map
+  for the OS's family: XS/S/M/L) or `compute.instanceType` (matching the platform's `instanceTypePattern` and not its
   `excludedInstanceTypePattern`: AWS `m7i.large`, `mac*` rejected; Azure `Standard_*`). Supported
   platforms are the `terraform/platforms/<p>` directories with `platform.json` and `sizes.json`;
   supported OSes are the keys of that file's `os`. Owner normalizes to
   `group:default/<team>`; other namespaces/kinds are rejected. Optional `lifecycle` defaults to `poc` (bounded
   nonempty string); `configuration` defaults to `{software: [], adJoin: false}`; billing/tags to `{}`.
-  Software is a unique list of software-catalog keys; AD join is a boolean, not an encoded string.
+  Software is a unique list of software-catalog keys offered for the OS's family (§5); AD join is a
+  boolean, not an encoded string.
   Unknown section fields, invalid types and control characters are rejected. Custom fields are not
   automatically schema-validated by the stock Backstage catalog.
 - Billing supports only nonempty `costCenter` and `projectCode` strings up to 256 characters,
@@ -286,7 +338,9 @@ spec:
   `forbiddenTagKeyCharacters` (Azure `<>%&\?/`).
   Mandatory platform tags cannot be overridden. Never store secrets in catalog data or tags.
 - `terraform/platforms/<p>/platform.json` (read by `spec.py`, `validate.sh`, `inventory.sh`, Terraform
-  and the IDP from `main`): `label`, `os` (`{<os>: {label, versions, sshUser, family}}`),
+  and the IDP from `main`): `label`, `os` (`{<os>: {label, versions, sshUser, family, minMemoryMiB?,
+  rootVolumeGiB (AWS), galleryImages (Azure)}}`; `family` is `linux` or `windows`; `minMemoryMiB` (Windows
+  4096) is enforced by the IDP's Advanced picker and AWS Terraform),
   `instanceTypePattern`, `excludedInstanceTypePattern` (`""` = none), `instanceIdPattern`,
   `reservedTagPrefixes`, `forbiddenTagKeyCharacters`, `staticPublicIp` (AWS `false`: stop releases the
   address and resize/start gives a new one; Azure `true`: kept; the IDP's stop/start wording uses it).
@@ -294,8 +348,9 @@ spec:
    Publish the bake before advertising a release. On Azure `os.<os>.galleryImages` maps each release to a
    distinct gallery definition; retain mappings for existing VMs even after a release is no longer
    advertised. Keep the AWS golden image available for Terraform to resolve during existing VM operations.
-   `family` selects the software catalog column. The register stage rejects explicit releases not offered
-   on the platform. Legacy inventory and queued requests without a release retain the Ubuntu 26.04 fallback.
+   `family` selects the software catalog column, the size map, the Ansible connection settings and the
+   Azure VM resource. The register stage rejects explicit releases not offered on the platform. Legacy
+   inventory and queued requests without a release use the OS's first listed version (Ubuntu 26.04).
 - Terraform loads persisted spec and maps it to temporary `.tfvars.json` (`name`, `os`, `image_version`, `size`,
   `team`, original `requested_by`, `cloud_tags` including billing). It deletes that file on exit.
   Each stage derives Ansible variables and applicability from the committed entity.
@@ -479,11 +534,19 @@ one of their groups.
 | `POST /runs` | `{operation, vm, requestKey, compute?, software?, adJoin?}` → `{runId, runUrl}`. 400 invalid, not the platform's instance type, or (Modify) nothing to change, 403 other team or demo-disallowed instance type, 404 unknown VM, 409 conflict, 503 automation off or platform/size files unreadable |
 | `GET /observed/:name?platform=<p>` | `{ enabled, checkedAt, error, vm: ObservedVm \| null }` (§8.3); `checkedAt`/`error` are that platform's (all platforms without `platform`) |
 | `POST /terminal` | `{vm, cols, rows}` → `{id, host, user}` (§8.4); 409 not running / no IP, 429 two sessions already open, 503 automation off |
+| `GET /password/:name` | Windows: `{username, password}` from `compute-factory/vm/<name>`, only when its `requestId` is the VM entity's `cf/request-id` (team or admin; logged `VM password of <vm> shown to <user>`; `Cache-Control: no-store`); 404 none yet |
+| `POST /rdp` | `{vm, width, height, dpi, timezone}` → `{id, host, user}` (§8.5); 400 not Windows, 409 not running / no IP / no password, 429 one session already open, 502 tunnel or guacd failure, 503 automation off |
+| `GET /rdp/:id/output?after=<seq>` | `{seq, data, closed}`; `data` is Guacamole instructions; `after` acknowledges (frees) earlier output; waits up to 25 s |
+| `POST /rdp/:id/input` | `{data}` (≤ 512 KiB of Guacamole instructions) → `{}` |
+| `DELETE /rdp/:id` | Close the session → `{}` |
 | `GET /terminal/:id/output?after=<seq>` | `{seq, data, closed: string \| null}`; waits up to 25 s for output after `seq` |
 | `POST /terminal/:id/input` | `{data}` (≤ 16 KiB keystrokes) or `{cols, rows}` (resize) → `{}` |
 | `DELETE /terminal/:id` | Close the session → `{}` |
 | `POST /runs/:id/retry` | `RunView`; 409 when not retryable, 403 when not allowed |
 | `POST /runs/:id/skip` | `RunView`; 409 when the failed stage is not skippable or the run is not failed |
+
+`POST /runs` and `POST /requests` also refuse (400) software the OS's family does not offer (§5), and
+503 when the catalog cannot be read.
 
 `POST /runs`: `operation` maps to a run kind (`start`/`stop`/`reboot` → `power`, `update` → `update`,
 otherwise the same name). The VM entity is read with the caller's credentials; its `cf/request-id` is
@@ -586,7 +649,8 @@ type ObservedVm = {
   access exactly like `POST /runs` (team or admin; entity read with the user's credentials), refuses a VM
   the fresh health check does not show running, and connects to the observed public IP (else
   `cf/public-ip`). It signs a per-session key (§3) and runs the system `ssh -tt <cf/ssh-user>@<ip>` in a PTY
-  (`node-pty`); 409 when `cf/ssh-user` is missing or not a valid user name. Host keys are not pinned
+  (`node-pty`; Windows: a PowerShell session); 409 when `cf/ssh-user` is missing or not a valid user name
+  (`^[A-Za-z_][A-Za-z0-9_-]{0,31}$`). Host keys are not pinned
   (POC, same as the fry stages).
 - Transport is plain HTTP, not WebSocket (TLS-inspecting proxies hold back long-lived streams): the
   browser (xterm.js) posts keystrokes in order and long-polls output (25 s). Sessions belong to the user
@@ -597,6 +661,29 @@ type ObservedVm = {
 - Audit: backend log lines `Terminal <id> opened: <user> → <vm> (<ip>) as <principal>` and
   `Terminal <id> closed: … after <n>s: <reason>`; the VM's auth log shows the cert key ID. Keystrokes and
   output are not recorded.
+- Only where `computeFactory.demoAutomation` is on (production); otherwise 503.
+
+### 8.5 Browser remote desktop (`vms` backend plugin, Windows VMs)
+
+- "Open Remote Desktop" on a Windows VM's page. Access, running/IP checks and the per-session key (§3)
+  are the terminal's. The backend runs `ssh -N -L 127.0.0.1:<free port>:localhost:3389 <cf/ssh-user>@<ip>`
+  (3389 is never opened on the VM), then speaks the Guacamole protocol to `guacd` (`guacamole/guacd:1.6.0`,
+  a compose service sharing the backstage container's network namespace, `127.0.0.1:4822`; override with
+  `GUACD_HOST`/`GUACD_PORT`): `select rdp`, `size`, `audio`, `video`, `image`, `timezone`, `connect` with
+  `hostname=127.0.0.1`, the forward's port, the VM's shared login (§3), `security=nla`, `ignore-cert=true`,
+  `resize-method=display-update`, audio off. It consumes `ready`; everything else is passed through.
+- Transport is plain HTTP like the terminal: the browser (guacamole-common-js 1.5.0 with a custom
+  long-poll `Guacamole.Tunnel`) posts instructions in order and long-polls output. Output not yet
+  acknowledged is buffered up to 8 MiB, then reading from guacd pauses (guacd drops frames); one poll
+  returns at most 2 MiB.
+- Limits: 1 open or connecting session per user; input guacd has not consumed is capped at 4 MiB (then
+  the session closes); closed after 30 minutes without input (frame `sync` acknowledgements
+  do not count), 90 s without a poll, or when guacd or the tunnel closes. Windows itself allows two
+  concurrent RDP sessions without RDS licences, and everyone signs in as the same user, so a second
+  person takes over the first one's session.
+- Audit: `RDP <id> opened: <user> → <vm> (<ip>) as <principal>` / `RDP <id> closed: … after <n>s: <reason>`.
+- Native clients: the VM page shows `ssh -L 33389:localhost:3389 <user>@<ip>` and a `.rdp` file for
+  `localhost:33389`; the password comes from "Show Password" (`GET /password/:name`).
 - Only where `computeFactory.demoAutomation` is on (production); otherwise 503.
 
 ## 9. IDP runtime (orchestrator infra ↔ Agent C deploy)
@@ -632,6 +719,10 @@ type ObservedVm = {
 | `SSH_CA_SECRET_ID` | `compute-factory/ssh-ca` |
 | `AZURE_READER_SECRET_ID` | `compute-factory/azure-reader` (unset: Azure specs, picker and health check report "not configured") |
 
+- Compose services: `caddy`, `backstage`, `guacd` (§8.5; `network_mode: service:backstage`, 1 GiB
+  memory limit, pulled from Docker Hub, multi-arch), `postgres`, `registry`. The host role may read
+  Secrets Manager `compute-factory/ssh-ca` and `compute-factory/vm/*` (Windows VM passwords).
+
 - Caddy terminates TLS for `IDP_DOMAIN` and proxies to the backstage container on port 7007.
   It rewrites only `/mock-rest/servicenow` to the authenticated `/api/mock-rest/servicenow` plugin route;
   other paths are unchanged. No new environment variable or external-access token is introduced.
@@ -645,21 +736,34 @@ type ObservedVm = {
   `power.sh` (sourced; `vm_describe` → `{state, ip, tags}`, `vm_start`, `vm_stop`, `vm_reboot`).
 - Backend: `backend "s3" {}` with partial config passed at init (also for Azure: state stays in AWS):
   `-backend-config=bucket=$TF_STATE_BUCKET -backend-config=key=vms/<p>/<name>/terraform.tfstate -backend-config=region=ap-southeast-2 -backend-config=use_lockfile=true`.
-- Variables: `name` (required), `os` (default `ubuntu`), `image_version` (null defaults to the legacy
-  release `26.04`), `size` (default `S`), `instance_type` (default
+- Variables: `name` (required), `os` (default `ubuntu`), `image_version` (null = the OS's first
+  `platform.json` version, the legacy release), `size` (default `S`), `instance_type` (default
   `""`; overrides `size`), `team` (default `""`),
   `requested_by` (default `""`), `request_id` (default `""`; VM incarnation, tagged as `cf:request-id`),
   `cloud_tags`; Azure also `location` (default `australiaeast`).
   **`terraform destroy -var name=<name>` must work with nothing else**,
   because `./poc down` uses that.
 - Outputs: `public_ip`, `ssh_user` (from `platform.json`), `instance_id`, `instance_type`.
-- Size map: `terraform/platforms/<p>/sizes.json`, size (`XS`/`S`/`M`/`L`) to instance type. AWS:
-  `t3.micro`/`small`/`medium`/`large`. Azure: `Standard_D2ls_v6`/`D2s_v6`/`D4ls_v6`/`D4s_v6`. `spec.py`
-  and Terraform read it; the IDP reads the same files from `main` (§10a). Modify uses the same field.
-  AWS Terraform rejects types that cannot boot x86_64 and launches into a default subnet whose AZ offers
-  the type. Azure: an admin key (`tls_private_key`, only in state) is required at launch and disabled by
-  the `access` stage; the VM ignores image and admin-key changes; the disk controller is Azure's default
-  for the size and image (NVMe on v6).
+- Size map: `terraform/platforms/<p>/sizes.json`, `{<family>: {<size>: <instance type>}}` with sizes
+  `XS`/`S`/`M`/`L`:
+
+  | Size | AWS linux | AWS windows | Azure linux | Azure windows |
+  |---|---|---|---|---|
+  | XS | t3.micro | t3.medium | Standard_D2ls_v6 | Standard_D2ls_v6 |
+  | S | t3.small | t3.large | Standard_D2s_v6 | Standard_D2s_v6 |
+  | M | t3.medium | t3.xlarge | Standard_D4ls_v6 | Standard_D4s_v6 |
+  | L | t3.large | t3.2xlarge | Standard_D4s_v6 | Standard_D8s_v6 |
+
+  `spec.py` and Terraform read it; the IDP reads the same files from `main` (§10a). Modify uses the same field.
+  AWS Terraform rejects types that cannot boot x86_64 or have less memory than the OS's `minMemoryMiB`,
+  launches into a default subnet whose AZ offers the type, and sizes the root volume from
+  `rootVolumeGiB` (Ubuntu 16, Windows 50 GiB). Azure: a Linux VM gets an admin key (`tls_private_key`,
+  only in state), disabled by the `access` stage; a Windows VM (`azurerm_windows_virtual_machine`,
+  computer name = the VM name cut to 15 characters) gets a `random_password`, replaced by the `access`
+  stage. The VM resource has `count` by family (a `moved` block keeps existing Linux state); `adopt.sh`
+  imports the family's `…_virtual_machine.vm[0]`. The VM ignores image and admin-credential changes; the
+  disk controller is Azure's default for the size and image (NVMe on v6). Server-side, the Windows memory
+  minimum is enforced only on AWS (Azure has no size data source); the IDP picker enforces it on both.
 - Demo mode: while on, the IDP accepts `compute.instanceType` only from the union of every platform's
   `sizes.json` values (`/api/vms/demo/state` returns them as `instanceTypes`; empty, and explicit types
   refused with 503, when the files cannot be read), for requests and Modify; sizes are allowed.
@@ -676,11 +780,11 @@ type ObservedVm = {
 
 ### 10a. IDP `vm-sizes` API (signed-in users)
 
-- `GET /api/vm-sizes/platforms` → `{platforms: [{id, label, available, os: [{id, label, versions}],
+- `GET /api/vm-sizes/platforms` → `{platforms: [{id, label, available, os: [{id, label, versions, family, minMemoryMiB}],
   reservedTagPrefixes, forbiddenTagKeyCharacters, staticPublicIp, error}]}`: `aws`, `azure` from `platform.json` on
   `main` (cached 5 minutes), plus `{id: vsphere, label: vSphere, available: false}` ("Coming soon").
-- `GET /api/vm-sizes/sizes?platform=<p>` (default `aws`) → `{platform, label, reservedTagPrefixes,
-  sizes: [{size, instanceType, specs}], error}`. Specs: AWS `ec2:DescribeInstanceTypes`; Azure the
+- `GET /api/vm-sizes/sizes?platform=<p>&os=<os>` (defaults `aws`, Linux) → `{platform, label, family,
+  minMemoryMiB, reservedTagPrefixes, sizes: [{size, instanceType, specs}], error}`: the OS family's map. Specs: AWS `ec2:DescribeInstanceTypes`; Azure the
   Resource SKUs API (`2021-07-01`, location filter) with `quotaOk`.
 - `GET /api/vm-sizes/instance-types?platform=<p>` → `{region, types}`; each type `{type, family,
   category, currentGeneration, bareMetal, gpus, vcpus, memoryMiB, architectures, network, burstable,
@@ -689,6 +793,8 @@ type ObservedVm = {
   category from the series letter; `currentGeneration` always true; `quotaOk` = free family and regional
   `cores` usage (Compute usages, cached 5 minutes) ≥ vCPUs, null when usages are unavailable. 503 when
   the list is unavailable.
+- `GET /api/vm-sizes/software` → `{software: [{id, label, families}]}` from `ansible/software-catalog.json`
+  on `main` (cached 5 minutes); `families` lists the OS families with a non-null package.
 
 ## 11. Ground rules for all agents
 
