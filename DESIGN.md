@@ -370,8 +370,8 @@ Form fields:
 | Software | checkboxes: git, htop, nginx, docker (from the software catalog, filtered by OS) | None picked = `software` stage skipped |
 | AD join | checkbox (mock) | baseline + access always run |
 
-How users get there: **Launch** (top bar; Home and Resources' Request VM buttons open its platform
-step) shows product cards (Scaffolder templates tagged `product`; name from `cf/product`), then for a
+How users get there: **Launch** (top bar, and the Launch buttons on Home and Resources; the form's
+submit button also reads Launch) shows product cards (Scaffolder templates tagged `product`; name from `cf/product`), then for a
 template with `cf/launch-flow: platform-image` platform cards (`GET /api/vm-sizes/platforms`) and
 image cards, then opens the template with `?formData={"compute":{"platform","os"}}`. Other products
 would open their template directly. The stock template list stays at `/create` but is not in the bar.
