@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Compute Factory POC lifecycle.
 #   ./poc up       create everything (assumes a clean slate apart from a kept SSH CA + golden images)
+#   ./poc up --resume <run-id>   finish bootstrap on existing infra using one successful bake
 #   ./poc up --images-only   create the SSH CA/gallery if missing, bake every images.yaml row, prune old images
 #   ./poc down     destroy everything, including user VMs, then verify nothing tagged cf:poc=true remains
 #   ./poc down --keep-images  the same, but keep the SSH CA and golden images (infra/images) for the next up
@@ -57,6 +58,26 @@ log()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 warn() { printf '    \033[33mWARN: %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+
+# Only for reads. Buffer stdout so a failed (possibly paginated) request cannot
+# supply partial data to callers, and never replay a dispatch or deletion.
+retry_read() {
+  local label="$1" attempt output
+  shift
+  for attempt in 1 2 3 4; do
+    if output="$("$@")"; then
+      if [[ -n "$output" ]]; then printf '%s\n' "$output"; fi
+      return 0
+    fi
+    warn "$label: read failed ($attempt/4)"
+    if (( attempt < 4 )); then sleep "$((2 ** attempt))"; fi
+  done
+  return 1
+}
+
+gh_read() {
+  retry_read "GitHub $1" gh "$@"
+}
 
 locked() {
   [[ "${CF_POC_LOCK_HELD:-}" == 1 ]] || return 1
@@ -141,7 +162,7 @@ require_tools() {
   local acct
   acct="$(aws sts get-caller-identity --query Account --output text 2>/dev/null)" || die "AWS profile $AWS_PROFILE not usable (aws sso login?)"
   [[ "$acct" == "$POC_AWS_ACCOUNT" ]] || die "AWS profile $AWS_PROFILE points at $acct, expected $POC_AWS_ACCOUNT"
-  gh auth status >/dev/null 2>&1 || die "gh is not authenticated"
+  gh_read auth status >/dev/null 2>&1 || die "cannot verify GitHub authentication; check gh auth status"
   # The sweeps use the az CLI. Terraform's azurerm provider needs ARM_* only for
   # `up` and for destroying an existing local infra state; see DESIGN.md §9.
   [[ "$(az account show --query id -o tsv 2>/dev/null)" == "$AZURE_SUBSCRIPTION" ]] || die "az CLI not logged in to subscription $AZURE_SUBSCRIPTION (run azsp)"
@@ -163,7 +184,8 @@ set_maintenance_gate() {
   shift
   for repo in "$@"; do
     gh variable set "$MAINTENANCE_VARIABLE" -R "$repo" -b "$value" >/dev/null \
-      || die "could not set $MAINTENANCE_VARIABLE=$value on $repo; refusing to continue"
+      || verify_maintenance_gate "$value" "$repo" \
+      || die "could not confirm $MAINTENANCE_VARIABLE=$value on $repo; refusing to continue"
   done
 }
 
@@ -171,8 +193,8 @@ verify_maintenance_gate() {
   local expected="$1" repo value
   shift
   for repo in "$@"; do
-    value="$(gh variable get "$MAINTENANCE_VARIABLE" -R "$repo" 2>&1)" \
-      || { warn "could not read $MAINTENANCE_VARIABLE on $repo: $value"; return 1; }
+    value="$(gh_read variable get "$MAINTENANCE_VARIABLE" -R "$repo")" \
+      || { warn "could not read $MAINTENANCE_VARIABLE on $repo"; return 1; }
     [[ "$value" == "$expected" ]] \
       || { warn "$MAINTENANCE_VARIABLE on $repo is '$value', expected $expected"; return 1; }
   done
@@ -186,8 +208,14 @@ ensure_repos() {
 }
 
 verify_inventory_empty() {
-  gh api "repos/$PLATFORM_REPO/contents/vms?ref=main" \
-    | jq -e 'type == "array" and all(.[]; .name == ".gitkeep" and .type == "file")' >/dev/null
+  local inventory status
+  inventory="$(gh_read api "repos/$PLATFORM_REPO/contents/vms?ref=main")" || return 2
+  jq -e 'select(type == "array" and all(.[]; type == "object" and (.name | type == "string") and (.type | type == "string")))
+    | all(.[]; .name == ".gitkeep" and .type == "file")' \
+    >/dev/null <<<"$inventory" && return 0
+  status=$?
+  if [[ "$status" == 1 ]]; then return 1; fi # Confirmed nonempty, not a failed read.
+  return 2
 }
 
 # Only down may clear the inventory, after the cloud and state checks have passed.
@@ -220,7 +248,8 @@ check_repo_variables() {
   local repo var value
   for repo in "$@"; do
     for var in AWS_ROLE_ARN AWS_REGION AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_LOCATION; do
-      value="$(gh variable get "$var" -R "$repo")" && [[ -n "$value" ]] || die "$repo is missing $var (DESIGN.md section 9)"
+      value="$(gh_read variable get "$var" -R "$repo")" || die "could not read $var on $repo (DESIGN.md section 9)"
+      [[ -n "$value" ]] || die "$repo is missing $var (DESIGN.md section 9)"
       case "$var" in
         AWS_ROLE_ARN) [[ "$value" == "arn:aws:iam::$POC_AWS_ACCOUNT:role/"* ]] || die "$repo uses an unexpected AWS role" ;;
         AWS_REGION) [[ "$value" == "$POC_AWS_REGION" ]] || die "$repo uses an unexpected AWS region" ;;
@@ -259,7 +288,10 @@ apply_images_root() {
 
 # Prints "<os> <version> <platform>" for each images.yaml row at a builder ref.
 image_rows() {
-  gh api -H 'Accept: application/vnd.github.raw' "repos/$BUILDER_REPO/contents/images.yaml?ref=$1" | python3 -c '
+  local yaml
+  yaml="$(gh_read api -H 'Accept: application/vnd.github.raw' "repos/$BUILDER_REPO/contents/images.yaml?ref=$1")" \
+    || { warn "could not fetch images.yaml at builder $1"; return 1; }
+  python3 -c '
 import re, sys, yaml
 rows = yaml.safe_load(sys.stdin)
 if not isinstance(rows, list) or not rows:
@@ -269,12 +301,12 @@ for row in rows:
     if not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", v) for v in values):
         sys.exit(f"unexpected images.yaml row: {row}")
     print(*values)
-'
+' <<<"$yaml"
 }
 
 # The gallery definition a release launches from (the platform repo's mapping, as Terraform uses it).
 azure_gallery_image() {
-  gh api -H 'Accept: application/vnd.github.raw' \
+  gh_read api -H 'Accept: application/vnd.github.raw' \
     "repos/$PLATFORM_REPO/contents/terraform/platforms/azure/platform.json?ref=main" \
     | jq -er --arg os "$1" --arg version "$2" \
       '.os[$os].galleryImages[$version] | strings | select(test("^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"))'
@@ -282,30 +314,40 @@ azure_gallery_image() {
 
 # Prints "<image-id>\t<git-sha>\t<created>" for the image a new VM of this row would launch (the
 # newest one, as platform Terraform selects it), only if it is usable and trusts CA $4.
+# 1 means no matching usable image; 2 means the lookup could not establish that.
 current_image() {
-  local platform="$1" os="$2" version="$3" fp="$4" json def
+  local platform="$1" os="$2" version="$3" fp="$4" json def line status=0
   case "$platform" in
     aws)
       json="$(aws ec2 describe-images --owners self --filters Name=tag:cf:os,Values="$os" \
-        Name=tag:cf:os-version,Values="$version" Name=tag:cf:managed,Values=true --output json)" || return 1
-      jq -er --arg fp "$fp" '.Images | sort_by(.CreationDate) | last
+        Name=tag:cf:os-version,Values="$version" Name=tag:cf:managed,Values=true --output json)" \
+        && [[ -n "$json" ]] || return 2
+      line="$(jq -er --arg fp "$fp" '.Images | if type == "array" then . else error("invalid Images response") end | sort_by(.CreationDate) | last
         | select(. != null and .State == "available")
         | (.Tags // [] | from_entries) as $t
         | select($t["cf:poc"] == "true" and $t["cf:ssh-ca-fingerprint"] == $fp)
-        | [.ImageId, ($t["cf:git-sha"] // "unknown"), .CreationDate] | @tsv' <<<"$json"
+        | [.ImageId, ($t["cf:git-sha"] // "unknown"), .CreationDate] | @tsv' <<<"$json")" || status=$?
       ;;
     azure)
-      def="$(azure_gallery_image "$os" "$version")" || { warn "no Azure gallery definition mapped for $os $version"; return 1; }
-      json="$(az_poc sig image-version list -g cf-images -r cfimages -i "$def" -o json)" || return 1
-      jq -er --arg fp "$fp" --arg os "$os" --arg version "$version" '
-        map(select(.publishingProfile.excludeFromLatest != true))
+      def="$(azure_gallery_image "$os" "$version")" \
+        || { warn "could not resolve Azure gallery definition for $os $version"; return 2; }
+      json="$(az_poc sig image-version list -g cf-images -r cfimages -i "$def" -o json)" \
+        && [[ -n "$json" ]] || return 2
+      line="$(jq -er --arg fp "$fp" --arg os "$os" --arg version "$version" '
+        if type == "array" then . else error("invalid gallery response") end
+        | map(select(.publishingProfile.excludeFromLatest != true))
         | sort_by(.name | split(".") | map(tonumber)) | last
         | select(. != null and .provisioningState == "Succeeded")
         | select(.tags["cf:poc"] == "true" and .tags["cf:ssh-ca-fingerprint"] == $fp
             and .tags["cf:os"] == $os and .tags["cf:os-version"] == $version)
-        | [.id, (.tags["cf:git-sha"] // "unknown"), (.publishingProfile.publishedDate // "unknown")] | @tsv' <<<"$json"
+        | [.id, (.tags["cf:git-sha"] // "unknown"), (.publishingProfile.publishedDate // "unknown")] | @tsv' <<<"$json")" || status=$?
       ;;
-    *) warn "./poc cannot verify images for platform $platform"; return 1 ;;
+    *) warn "./poc cannot verify images for platform $platform"; return 2 ;;
+  esac
+  case "$status" in
+    0) printf '%s\n' "$line" ;;
+    4) return 1 ;; # jq -e: no selected result
+    *) return 2 ;;
   esac
 }
 
@@ -313,13 +355,16 @@ current_image() {
 # Fails unless every row has a current, usable image that trusts CA $1.
 current_images() {
   local fp="$1" ref="$2" rows os version platform line failed=0
-  rows="$(image_rows "$ref")" || { warn "could not read images.yaml at builder $ref"; return 1; }
+  rows="$(image_rows "$ref")" || { warn "could not read images.yaml at builder $ref"; return 2; }
   while read -r os version platform <&3; do
     if line="$(current_image "$platform" "$os" "$version" "$fp")"; then
       printf '%s %s %s\t%s\n' "$platform" "$os" "$version" "$line"
-    else
+    elif [[ "$?" == 1 ]]; then
       info "no current $platform $os $version image trusting CA $fp" >&2
       failed=1
+    else
+      warn "could not determine the current $platform $os $version image; not safe to dispatch a bake"
+      return 2
     fi
   done 3<<<"$rows"
   return "$failed"
@@ -328,7 +373,7 @@ current_images() {
 # Warn only: kept images are used even when builder main has moved on.
 report_images() {
   local main row id sha created
-  main="$(gh api "repos/$BUILDER_REPO/commits/main" --jq .sha)" || { warn "could not read builder main"; main=; }
+  main="$(gh_read api "repos/$BUILDER_REPO/commits/main" --jq .sha)" || { warn "could not read builder main"; main=; }
   while IFS=$'\t' read -r row id sha created; do
     info "$row: $id (built $created from builder ${sha:0:7})"
     if [[ -n "$main" && "$sha" != "$main" ]]; then
@@ -481,49 +526,70 @@ run_bake() {
   verify_bake_images "$id" "$fp"
 }
 
+download_bake_manifest() {
+  local id="$1" dir="$2" name="$3" attempt_dir
+  # gh may skip existing files; a partial download must not contaminate a retry.
+  attempt_dir="$(mktemp -d "$dir/$name.XXXXXX")" || return 1
+  gh run download "$id" -R "$BUILDER_REPO" -n "$name" -D "$attempt_dir" </dev/null >&2 || return 1
+  printf '%s\n' "$attempt_dir/packer-manifest.json"
+}
+
 # Every images.yaml row of the run's commit must have produced exactly one artifact that is now the
-# current usable image of its row and trusts CA $2. Then superseded images of that row are removed.
+# current usable image of its row and trusts CA $2. Only prune after every row is verified.
 verify_bake_images() (
-  local id="$1" fp="$2" tmp sha rows os version platform name builder artifact expected line deadline failed=0
+  local id="$1" fp="$2" prune="${3:-1}" tmp run sha rows os version platform name builder manifest artifact expected line deadline
+  local verified=()
   tmp="$(mktemp -d "$GEN/bake.XXXXXX")" || return 1
   trap 'rm -rf "$tmp"' EXIT
-  sha="$(gh run view "$id" -R "$BUILDER_REPO" --json headSha --jq .headSha)" && [[ "$sha" =~ ^[0-9a-f]{40}$ ]] \
-    || { warn "could not read the commit of bake run $id"; return 1; }
+  run="$(gh_read api "repos/$BUILDER_REPO/actions/runs/$id")" \
+    || { warn "could not read bake run $id"; return 1; }
+  sha="$(jq -er --arg repo "$BUILDER_REPO" '
+    select(.path == ".github/workflows/bake.yml" and .head_repository.full_name == $repo
+      and .head_branch == "main" and .event == "workflow_dispatch"
+      and .status == "completed" and .conclusion == "success")
+    | .head_sha | strings | select(test("^[0-9a-f]{40}$"))' <<<"$run")" \
+    || { warn "run $id is not a confirmed successful bake.yml dispatch on $BUILDER_REPO main"; return 1; }
   rows="$(image_rows "$sha")" || { warn "could not read images.yaml at builder $sha"; return 1; }
   while read -r os version platform <&3; do
     name="manifest-$os-$version-$platform"
     case "$platform" in
       aws) builder=amazon-ebs ;;
       azure) builder=azure-arm ;;
-      *) warn "./poc cannot verify images for platform $platform"; failed=1; continue ;;
+      *) warn "./poc cannot verify images for platform $platform"; return 1 ;;
     esac
-    if ! gh run download "$id" -R "$BUILDER_REPO" -n "$name" -D "$tmp/$name" </dev/null \
-      || ! artifact="$(jq -er --arg b "$builder" '[.builds[] | select(.builder_type == $b) | .artifact_id] | select(length == 1) | .[0]' \
-        "$tmp/$name/packer-manifest.json")"; then
-      warn "bake run $id has no single $builder artifact in $name"; failed=1; continue
+    manifest="$(retry_read "download $name from bake $id" download_bake_manifest "$id" "$tmp" "$name")" \
+      || { warn "could not download $name from bake $id"; return 1; }
+    if ! artifact="$(jq -er --arg b "$builder" '[.builds[] | select(.builder_type == $b) | .artifact_id] | select(length == 1) | .[0] | strings' \
+        "$manifest")"; then
+      warn "bake run $id has no single $builder artifact in $name"; return 1
     fi
     if [[ "$platform" == aws && "$artifact" =~ ^${POC_AWS_REGION}:ami-[0-9a-f]+$ ]]; then
       expected="${artifact#*:}"
     elif [[ "$platform" == azure && "$artifact" =~ ^/subscriptions/${AZURE_SUBSCRIPTION}/resourceGroups/cf-images/providers/Microsoft\.Compute/galleries/cfimages/images/[A-Za-z0-9._-]+/versions/[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       expected="$artifact"
     else
-      warn "unexpected $platform artifact in $name: $artifact"; failed=1; continue
+      warn "unexpected $platform artifact in $name: $artifact"; return 1
     fi
     deadline=$((SECONDS + 120))
-    while ! line="$(current_image "$platform" "$os" "$version" "$fp" 2>/dev/null)" \
+    while ! line="$(current_image "$platform" "$os" "$version" "$fp")" \
       || ! same_image "${line%%$'\t'*}" "$expected"; do
       if (( SECONDS >= deadline )); then line=; break; fi
       sleep 5
     done
     if [[ -z "$line" ]]; then
       warn "bake $id: $platform $os $version artifact $expected is not the current usable image trusting CA $fp"
-      failed=1; continue
+      return 1
     fi
     printf 'Bake %s %s %s %s: %s\n' "$id" "$platform" "$os" "$version" "$expected"
-    prune_superseded "$platform" "$os" "$version" "$expected" \
-      || warn "could not remove every superseded $platform $os $version image; the next bake or down retries"
+    verified+=("$platform $os $version $expected")
   done 3<<<"$rows"
-  return "$failed"
+  if [[ "$prune" == 1 ]]; then
+    for line in "${verified[@]}"; do
+      read -r platform os version expected <<<"$line"
+      prune_superseded "$platform" "$os" "$version" "$expected" \
+        || warn "could not remove every superseded $platform $os $version image; the next bake or down retries"
+    done
+  fi
 )
 
 # The catalog keeps entities in Postgres across redeploys; re-read every location now so changes to
@@ -622,6 +688,7 @@ require_image_tools() {
 }
 
 cmd_up() (
+  local resume="${1:-}"
   log "Preflight"
   require_image_tools docker scp dig
   if ! docker info >/dev/null 2>&1 || ! docker buildx version >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
@@ -635,60 +702,93 @@ cmd_up() (
   [[ -s "$USERS_FILE" ]] || die "no IDP users; run ./poc set-password <user> first"
   # One-time Azure setup that survives down (DESIGN.md section 9).
   [[ -s "$ROOT/.poc-azure-reader.pem" ]] || die "missing $ROOT/.poc-azure-reader.pem (IDP Azure reader certificate; DESIGN.md section 9)"
-  local state ip bucket tmp fp images
+  local state ip bucket tmp fp images bake_needed=0 active keys
   check_repo_variables "$BUILDER_REPO" "$PLATFORM_REPO"
   tf_infra init -input=false -lockfile=readonly >/dev/null
   state="$(infra_state)" || die "cannot read local Terraform state; refusing to apply"
-  [[ -z "$state" ]] || die "infra state already exists; use ./poc down only if you intend to destroy the POC"
+  if [[ -z "$resume" ]]; then
+    [[ -z "$state" ]] || die "infra state already exists; to finish bootstrap after a successful bake use ./poc up --resume <run-id>. Do not tear down to resume."
+  else
+    [[ -n "$state" ]] || die "no existing infra to resume; use ./poc up for a clean start"
+  fi
   verify_inventory_empty || die "platform main has a nonempty or unreadable VM inventory; refusing to reset it during up"
   ensure_repos
   tmp="$(mktemp -d "$GEN/up.XXXXXX")"
   trap 'rm -rf "$tmp"' EXIT
   git clone -q --depth 1 --branch main "git@github.com:$OWNER/compute-factory-idp.git" "$tmp/idp"
 
-  log "Keep resource workflows closed during bootstrap"
-  set_maintenance_gate 1 "$BUILDER_REPO" "$PLATFORM_REPO"
-  workflow_action disable "${WORKFLOW_SPECS[@]}"
-  verify_quiescent || die "cannot verify bootstrap freeze and workflow quiescence"
-  verify_cloud_clean 1 || die "cannot prove a clean cloud/DNS starting point (only the SSH CA and golden images may remain); inspect the checks above"
-  verify_quiescent || die "resource workflows changed during preflight; refusing to apply"
+  if [[ -n "$resume" ]]; then
+    log "Check existing bootstrap"
+    verify_maintenance_gate 1 "$PLATFORM_REPO" || die "platform is not gated; cannot resume a running POC"
+    active="$(active_runs)" && [[ -z "$active" ]] || die "cannot prove both resource workflows are idle"
+    ip="$(existing_idp_ip)" || die "cannot verify the existing IDP host"
+    bucket="$(tf_infra output -raw state_bucket)"
+    [[ "$bucket" == "$STATE_BUCKET" ]] || die "unexpected state bucket in Terraform outputs"
+    keys="$(state_bucket_keys require-present)" && [[ -z "$keys" ]] \
+      || die "state bucket is missing, nonempty or unreadable; cannot resume bootstrap"
+    fp="$(tf_images output -raw ssh_ca_fingerprint)" && [[ "$fp" =~ $CA_FINGERPRINT_RE ]] \
+      && [[ "$(ca_fingerprint_from_ssm)" == "$fp" ]] || die "cannot verify the existing POC SSH CA"
+  else
+    log "Keep resource workflows closed during bootstrap"
+    set_maintenance_gate 1 "$BUILDER_REPO" "$PLATFORM_REPO"
+    workflow_action disable "${WORKFLOW_SPECS[@]}"
+    verify_quiescent || die "cannot verify bootstrap freeze and workflow quiescence"
+    verify_cloud_clean 1 || die "cannot prove a clean cloud/DNS starting point (only the SSH CA and golden images may remain); inspect the checks above"
+    verify_quiescent || die "resource workflows changed during preflight; refusing to apply"
 
-  log "Image tier (SSH CA, Azure gallery)"
-  fp="$(apply_images_root)" || die "image tier not ready (see $GEN/logs/images-apply.log)"
-  info "SSH CA $fp"
+    log "Image tier (SSH CA, Azure gallery)"
+    fp="$(apply_images_root)" || die "image tier not ready (see $GEN/logs/images-apply.log)"
+    info "SSH CA $fp"
+    if images="$(current_images "$fp" main)"; then
+      info "reusing images that trust this CA; no bake"
+    elif [[ "$?" == 1 ]]; then
+      bake_needed=1
+    else
+      die "image availability is unknown; no bake was dispatched and shared infra was not applied. Retry ./poc up."
+    fi
 
-  log "Shared AWS infra (state bucket, IDP host, tokens)"
-  infra_apply_or_destroy apply >"$GEN/logs/infra-apply.log" 2>&1 \
-    || { tail -40 "$GEN/logs/infra-apply.log" >&2; die "infra apply failed"; }
-  ip="$(tf_infra output -raw idp_ip)"; bucket="$(tf_infra output -raw state_bucket)"
-  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$bucket" == "$STATE_BUCKET" ]] || die "infra returned an unexpected host or state bucket"
+    log "Shared AWS infra (state bucket, IDP host, tokens)"
+    infra_apply_or_destroy apply >"$GEN/logs/infra-apply.log" 2>&1 \
+      || { tail -40 "$GEN/logs/infra-apply.log" >&2; die "infra apply failed"; }
+    ip="$(tf_infra output -raw idp_ip)"; bucket="$(tf_infra output -raw state_bucket)"
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$bucket" == "$STATE_BUCKET" ]] || die "infra returned an unexpected host or state bucket"
+  fi
   info "IDP host $ip, state bucket $bucket"
+
+  log "Golden images"
+  if [[ -n "$resume" ]]; then
+    verify_bake_images "$resume" "$fp" 0 >"$GEN/logs/bake-resume.log" 2>&1 \
+      || { tail -30 "$GEN/logs/bake-resume.log" >&2; die "existing bake $resume not verified; nothing was dispatched or pruned"; }
+    images="$(current_images "$fp" main)" || die "could not verify current images for builder main; platform remains gated"
+  elif [[ "$bake_needed" == 1 ]]; then
+    set_maintenance_gate 0 "$BUILDER_REPO"
+    verify_maintenance_gate 0 "$BUILDER_REPO" || die "builder maintenance gate did not open"
+    workflow_action enable "$BUILDER_REPO:bake.yml"
+    info "baking every images.yaml row; live log: $GEN/logs/bake.log"
+    run_bake "$fp" >"$GEN/logs/bake.log" 2>&1 \
+      || { tail -30 "$GEN/logs/bake.log" >&2; die "bake not verified; platform remains gated. Check the exact bake run; after success use ./poc up --resume <run-id>."; }
+    images="$(current_images "$fp" main)" || die "could not verify current images for builder main; platform remains gated. Use ./poc up --resume <run-id>."
+  fi
+  report_images "$images"
 
   log "GitHub wiring"
   gh variable set TF_STATE_BUCKET -R "$PLATFORM_REPO" -b "$bucket"
   gh variable set BACKSTAGE_URL -R "$PLATFORM_REPO" -b "https://$DOMAIN"
   tf_infra output -raw backstage_token | gh secret set BACKSTAGE_TOKEN -R "$PLATFORM_REPO"
-  log "Golden images"
   set_maintenance_gate 0 "$BUILDER_REPO"
   verify_maintenance_gate 0 "$BUILDER_REPO" || die "builder maintenance gate did not open"
   workflow_action enable "$BUILDER_REPO:bake.yml"
-  if images="$(current_images "$fp" main)"; then
-    info "reusing images that trust this CA; no bake"
-  else
-    info "baking every images.yaml row; live log: $GEN/logs/bake.log"
-    run_bake "$fp" >"$GEN/logs/bake.log" 2>&1 \
-      || { tail -30 "$GEN/logs/bake.log" >&2; die "bake not verified; platform remains gated and the IDP is not published. Resources remain; use down only for intentional teardown."; }
-    images="$(current_images "$fp" main)" || die "baked images are not current for builder main; platform remains gated"
-  fi
-  report_images "$images"
 
-  log "Enable VM stages and bootstrap IDP"
+  log "Bootstrap IDP"
+  verify_maintenance_gate 1 "$PLATFORM_REPO" || die "platform gate changed; refusing to publish the IDP"
+  info "live log: $GEN/logs/idp.log"
+  deploy_idp "$ip" bootstrap "" "$tmp/idp" >"$GEN/logs/idp.log" 2>&1 \
+    || { tail -35 "$GEN/logs/idp.log" >&2; die "IDP bootstrap failed; the platform remains gated. Inspect the log before retrying."; }
+
+  log "Enable VM stages"
   workflow_action enable "$PLATFORM_REPO:stage.yml"
   set_maintenance_gate 0 "$PLATFORM_REPO"
   verify_maintenance_gate 0 "$PLATFORM_REPO" || die "platform maintenance gate did not open"
-  info "live log: $GEN/logs/idp.log"
-  deploy_idp "$ip" bootstrap "" "$tmp/idp" >"$GEN/logs/idp.log" 2>&1 \
-    || { tail -35 "$GEN/logs/idp.log" >&2; die "IDP bootstrap failed; images and resources remain in place. Inspect the log or intentionally tear down."; }
 
   log "Up"
   info "IDP:          https://$DOMAIN"
@@ -703,9 +803,9 @@ cmd_images_only() (
   require_image_tools
   check_repo_variables "$BUILDER_REPO"
   local prev_gate prev_workflow fp images
-  prev_gate="$(gh variable get "$MAINTENANCE_VARIABLE" -R "$BUILDER_REPO")" || die "could not read the builder gate"
+  prev_gate="$(gh_read variable get "$MAINTENANCE_VARIABLE" -R "$BUILDER_REPO")" || die "could not read the builder gate"
   [[ "$prev_gate" == 0 || "$prev_gate" == 1 ]] || die "builder $MAINTENANCE_VARIABLE is '$prev_gate'; run up or down first"
-  prev_workflow="$(gh api "repos/$BUILDER_REPO/actions/workflows/bake.yml" --jq .state)" || die "could not read bake.yml state"
+  prev_workflow="$(gh_read api "repos/$BUILDER_REPO/actions/workflows/bake.yml" --jq .state)" || die "could not read bake.yml state"
   [[ "$prev_workflow" == active || "$prev_workflow" == disabled_manually ]] || die "unexpected bake.yml state: $prev_workflow"
 
   log "Image tier (SSH CA, Azure gallery)"
@@ -746,7 +846,7 @@ workflow_action() {
   for spec in "$@"; do
     repo="${spec%%:*}"
     workflow="${spec#*:}"
-    state="$(gh workflow list --all -R "$repo" --json path,state \
+    state="$(gh_read workflow list --all -R "$repo" --json path,state \
       --jq ".[] | select(.path == \".github/workflows/$workflow\") | .state")" \
       || die "could not inspect $repo/$workflow; refusing to continue"
     [[ -n "$state" ]] || die "$repo/$workflow was not found; refusing to continue"
@@ -759,8 +859,8 @@ workflow_action() {
       continue
     fi
     gh workflow "$action" "$workflow" -R "$repo" >/dev/null \
-      || die "could not $action $repo/$workflow; refusing to continue"
-    state="$(gh api "repos/$repo/actions/workflows/$workflow" --jq '.state')" \
+      || warn "could not confirm $action of $repo/$workflow from the write response; checking current state"
+    state="$(gh_read api "repos/$repo/actions/workflows/$workflow" --jq '.state')" \
       || die "could not confirm $action of $repo/$workflow"
     if [[ "$action" == enable && "$state" != active ]] || [[ "$action" == disable && "$state" != disabled_manually ]]; then
       die "could not confirm $action of $repo/$workflow (state: $state)"
@@ -774,7 +874,7 @@ verify_workflows_disabled() {
   for spec in "${WORKFLOW_SPECS[@]}"; do
     repo="${spec%%:*}"
     workflow="${spec#*:}"
-    state="$(gh api "repos/$repo/actions/workflows/$workflow" --jq '.state')" \
+    state="$(gh_read api "repos/$repo/actions/workflows/$workflow" --jq '.state')" \
       || { warn "could not inspect $repo/$workflow"; return 1; }
     [[ -n "$state" ]] \
       || { warn "$repo/$workflow was not found"; return 1; }
@@ -789,7 +889,7 @@ verify_frozen() {
 
 list_active_runs() {
   local repo="$1" workflow="$2"
-  gh api --paginate "repos/$repo/actions/workflows/$workflow/runs?per_page=100" \
+  gh_read api --paginate "repos/$repo/actions/workflows/$workflow/runs?per_page=100" \
     --jq '.workflow_runs[] | select(.status != "completed") | .id'
 }
 
@@ -856,10 +956,12 @@ restore_caddy_data() {
     return 0
   fi
   # shellcheck disable=SC2029
-  ssh "${SSH_OPTS[@]}" "ubuntu@$ip" "docker volume create \
+  ssh "${SSH_OPTS[@]}" "ubuntu@$ip" "running=\$(docker ps -q \
+        --filter label=com.docker.compose.project=idp --filter label=com.docker.compose.service=caddy) \
+    && if [ -n \"\$running\" ]; then echo 'Caddy is already running; keeping its TLS storage'; else docker volume create \
       --label com.docker.compose.project=idp --label com.docker.compose.volume=caddy_data $CADDY_VOLUME >/dev/null \
-    && docker run --rm -i -v $CADDY_VOLUME:/data alpine tar xz -C /data" <"$CADDY_BACKUP" || return 1
-  echo "restored saved TLS cert storage"
+    && docker run --rm -i -v $CADDY_VOLUME:/data alpine tar xz -C /data \
+    && echo 'restored saved TLS cert storage'; fi" <"$CADDY_BACKUP" || return 1
 }
 
 stop_idp() {
@@ -929,14 +1031,18 @@ find_state_bucket() {
 state_bucket_keys() {
   local owned tags
   owned="$(find_state_bucket "$STATE_BUCKET")" || return 1
-  [[ -n "$owned" ]] || return 0
+  if [[ -z "$owned" ]]; then
+    [[ "${1:-}" != require-present ]] || return 2
+    return 0
+  fi
   [[ "$owned" == "$STATE_BUCKET" ]] || return 1
   if ! tags="$(aws s3api get-bucket-tagging --bucket "$STATE_BUCKET" --query TagSet --output json)" \
     || ! owned_infra_tags <<<"$tags"; then
     warn "cannot establish ownership of bucket $STATE_BUCKET"
     return 1
   fi
-  aws s3api list-objects-v2 --bucket "$STATE_BUCKET" --output json | jq -r '.Contents[]?.Key'
+  aws s3api list-objects-v2 --bucket "$STATE_BUCKET" --output json \
+    | jq -r '.Contents[]?.Key' || return 1
 }
 
 prepare_vm_states() {
@@ -1473,7 +1579,7 @@ verify_clean() {
 platform_wiring() {
   local kind names
   for kind in variable secret; do
-    names="$(gh "$kind" list -R "$PLATFORM_REPO" --json name)" || return 1
+    names="$(gh_read "$kind" list -R "$PLATFORM_REPO" --json name)" || return 1
     jq -e 'type == "array" and all(.[]; (.name | type == "string"))' <<<"$names" >/dev/null || return 1
     jq -r '.[].name | select(. == "TF_STATE_BUCKET" or . == "BACKSTAGE_URL" or . == "BACKSTAGE_TOKEN")' <<<"$names" || return 1
   done
@@ -1482,7 +1588,7 @@ platform_wiring() {
 clear_platform_wiring() {
   local name kind names
   for kind in variable secret; do
-    names="$(gh "$kind" list -R "$PLATFORM_REPO" --json name)" || return 1
+    names="$(gh_read "$kind" list -R "$PLATFORM_REPO" --json name)" || return 1
     for name in TF_STATE_BUCKET BACKSTAGE_URL BACKSTAGE_TOKEN; do
       if jq -e --arg name "$name" 'any(.[]; .name == $name)' <<<"$names" >/dev/null; then
         gh "$kind" delete "$name" -R "$PLATFORM_REPO" >/dev/null \
@@ -1608,10 +1714,14 @@ cmd_down() (
 
   log "Clear and verify GitHub wiring and inventory"
   clear_platform_wiring || die "NOT CLEAN: platform GitHub wiring could not be cleared and verified"
-  if ! verify_inventory_empty; then
+  if verify_inventory_empty; then
+    info "inventory already empty"
+  elif [[ "$?" == 1 ]]; then
     if [[ ! -d "$PLATFORM_DIR/.git" ]] || ! reset_inventory "$PLATFORM_DIR" || ! verify_inventory_empty; then
       die "NOT CLEAN: could not reset and verify platform main's VM inventory"
     fi
+  else
+    die "NOT CLEAN: could not read platform main's VM inventory; it was not reset. Rerun down to verify."
   fi
   verify_quiescent || die "NOT CLEAN: resource workflows are no longer quiescent"
   wiring="$(platform_wiring)" && [[ -z "$wiring" ]] || die "NOT CLEAN: platform GitHub wiring remains or could not be read"
@@ -1652,7 +1762,7 @@ cmd_set_password() {
 
 cmd_status() {
   require_tools
-  local state
+  local state keys
   state="$(infra_state)" || die "cannot read local Terraform state"
   log "Shared infra"
   if [[ -n "$state" ]]; then
@@ -1673,7 +1783,13 @@ cmd_status() {
   log "Azure resource groups tagged cf:poc=true"
   az group list --query "[?tags.\"cf:poc\"=='true'].[name,properties.provisioningState]" -o tsv | sed 's/^/    /'
   log "VM state files"
-  aws s3 ls "s3://cf-tfstate-134584031874-apse2/vms/" --recursive 2>/dev/null | sed 's/^/    /' || info "no bucket"
+  if keys="$(state_bucket_keys require-present)"; then
+    if [[ -n "$keys" ]]; then printf '%s\n' "$keys" | sed 's/^/    /'; else info "state bucket is empty"; fi
+  elif [[ "$?" == 2 ]]; then
+    info "no owned state bucket"
+  else
+    warn "could not verify the state bucket or list its contents"
+  fi
   log "Active pipeline runs"
   local repo
   for repo in "$PLATFORM_REPO" "$BUILDER_REPO"; do
@@ -1724,7 +1840,9 @@ cmd_run() {
 
 case "${1:-}" in
   up)
-    [[ $# == 1 || ( $# == 2 && "$2" == --images-only ) ]] || die "usage: ./poc up [--images-only]"
+    [[ $# == 1 || ( $# == 2 && "$2" == --images-only ) \
+      || ( $# == 3 && "$2" == --resume && "$3" =~ ^[1-9][0-9]*$ ) ]] \
+      || die "usage: ./poc up [--images-only | --resume <run-id>]"
     acquire_poc_lock "$@"
     prepare_lifecycle
     ;;
@@ -1743,7 +1861,7 @@ case "${1:-}" in
 esac
 
 case "${1:-}" in
-  up)          if [[ "${2:-}" == --images-only ]]; then cmd_images_only; else cmd_up; fi ;;
+  up)          if [[ "${2:-}" == --images-only ]]; then cmd_images_only; else cmd_up "${3:-}"; fi ;;
   logs)        shift; cmd_logs "$@" ;;
   task)        shift; cmd_task "$@" ;;
   run)         shift; cmd_run "$@" ;;
@@ -1756,5 +1874,5 @@ case "${1:-}" in
   deploy-idp)  shift; cmd_deploy_idp "$@" ;;
   prune-idp-images) shift; cmd_prune_idp_images "$@" ;;
   _destroy_vm) shift; PLATFORM_DIR="${CF_POC_PLATFORM_DIR:?}"; cmd_destroy_vm "$@" ;;
-  *) echo "usage: $0 up [--images-only]|down [--keep-images]|status|deploy-idp [<image-id>]|prune-idp-images|set-password <user>|watch-bake <run-id>|logs [service] [since]|task <task-id>|run <run-id>" >&2; exit 2 ;;
+  *) echo "usage: $0 up [--images-only | --resume <run-id>]|down [--keep-images]|status|deploy-idp [<image-id>]|prune-idp-images|set-password <user>|watch-bake <run-id>|logs [service] [since]|task <task-id>|run <run-id>" >&2; exit 2 ;;
 esac

@@ -32,6 +32,7 @@ without changing existing checkouts). Bootstrap and teardown use temporary clone
 cp poc.env.example .poc.env   # once: Backstage PAT
 ./poc set-password amirasyraf  # once per user: IDP login (hash kept in .poc-users)
 ./poc up                      # image tier, shared infra, bake (or reuse matching images), then IDP deploy
+./poc up --resume <run-id>     # finish a gated bootstrap using an existing successful bake; no rebake or pruning
 ./poc up --images-only        # SSH CA/gallery if missing, bake + verify every images.yaml row, prune old images
 ./poc status                  # what exists right now
 ./poc watch-bake <run-id>      # monitor an existing bake; never dispatches another
@@ -56,21 +57,27 @@ reporting an **unknown outcome**, not a failed bake. Only a completed run with c
 counts as a successful bake. `watch-bake` exits 0 for success, 1 for a completed non-success conclusion,
 or 2 when monitoring cannot determine the outcome.
 
-If `up` cannot finish, it leaves resources in place. Check `./poc status` and `.generated/logs/`;
-`./poc watch-bake <run-id>` resumes monitoring without dispatching. An identified run ID is also saved to
-`.generated/bake-run-id`. If the response did not identify a run, inspect the builder repo's Actions page;
-`up` never guesses or automatically dispatches again. The platform workflow stays gated and the IDP
-unpublished until both artifacts are verified. `up` is not a resume command: it refuses nonempty state
-or VM inventory and never resets the inventory. Use `./poc down` only for intentional teardown of the POC
-**and all requested VMs**. `up` accepts only `--images-only` and `down` only `--keep-images`; there is no
-dry-run or force-up option.
+If `up` stops, it leaves resources in place. Check `./poc status` and `.generated/logs/`.
+`./poc watch-bake <run-id>` resumes monitoring only. The dispatch ID is saved in `.generated/bake-run-id`.
+If dispatch did not return an ID, inspect builder Actions; the script does not replay an ambiguous dispatch.
+Once the exact bake has succeeded, run `./poc up --resume <run-id>` to verify its artifacts and finish
+bootstrap on the existing host. Resume requires the platform gate to be closed, both workflows idle,
+and no VM inventory or state. It does not reapply shared/image infrastructure, dispatch a bake, or prune images.
+It cannot repair a partial Terraform apply or recover a failed bake. Plain `up` still requires empty
+shared state. Neither form resets inventory; `down` is only for intentional teardown of the POC
+**and all requested VMs**. The VM workflow opens only after successful IDP readiness and catalog checks.
+
+GitHub reads used in image verification and workflow freeze/teardown checks get up to four attempts.
+An unreadable image lookup does not trigger a bake, and an unreadable inventory does not trigger an
+inventory reset. If an intentional `down` stops without reporting `CLEAN`, fix the reported blocker and
+rerun it with the same retention option.
 
 Golden images bake the SSH CA public key, so the CA and images are one tier with its own Terraform root,
 `infra/images` (DESIGN.md §12.1). Every image is tagged `cf:ssh-ca-fingerprint`. `up` reuses the images
 when each `images.yaml` row's current image trusts the current CA and bakes otherwise; if a reused image
 was built from an older builder commit than `main` it only warns, so run `./poc up --images-only` after
 changing the image recipe. `--images-only` works whether the POC is up or down and returns the builder
-gate to its previous state afterwards. A successful bake deletes that row's older images.
+gate to its previous state afterwards. A new bake prunes superseded images only after every row is verified.
 
 After a VM request, the browser goes to the run page: every stage of the run (ServiceNow mock,
 registration, Terraform provisioning, every fry stage, finalization) with retries, errors and GitHub

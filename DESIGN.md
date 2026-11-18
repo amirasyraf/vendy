@@ -742,28 +742,40 @@ commands use the default workspace and reject ambient `TF_CLI_ARGS*` / `TF_VAR_*
    and AMIs/snapshots tagged `cf:managed=true`).
 2. **Image tier**: apply `infra/images` (creates the CA and gallery if missing, otherwise no change) and
    require the SSM public key to match the CA fingerprint in its state.
-3. **Shared infra**: apply `infra/` using the pinned AWS account; wire `TF_STATE_BUCKET`,
-   `BACKSTAGE_URL` and `BACKSTAGE_TOKEN` in the platform repo. Existing sibling checkouts are not
-   rebased or used as bootstrap sources.
-4. **Golden images**: open only `bake.yml`. For every `images.yaml` row on builder `main`, find the
+3. **Image availability**: for every `images.yaml` row on builder `main`, find the
    image a new VM would launch (AWS: newest AMI with the row's tags; Azure: latest version of the
    gallery definition mapped in platform `platform.json`). If each is usable and tagged with the
    current CA fingerprint, reuse them without baking; warn, but still reuse, when an image was built
-   from an older builder commit than `main`. Otherwise bake: request a run ID in the dispatch response
+   from an older builder commit than `main`. Abort before applying shared infra if availability is
+   unknown rather than treating a failed lookup as a missing image.
+4. **Shared infra and bake**: apply `infra/` using the pinned AWS account. If images are missing or
+   unusable, open only `bake.yml`. Request a run ID in the dispatch response
    and never retry an ambiguous dispatch. Poll that exact run. After `completed` + `success`, download
    the Packer manifest of every row of the run's commit and require each artifact to be the current
-   usable image trusting the CA. Then delete the row's superseded images (AMIs with their snapshots,
-   gallery versions); a failed prune only warns.
-5. **IDP**: only then open `stage.yml`. Wait for host initialization, apply the targeted Cloudflare DNS
-   record, restore any TLS backup, and deploy from a temporary clone of IDP `main`. Require HTTP 200
-   and authenticated catalog access/refresh requests before declaring success.
+   usable image trusting the CA. Only after all rows pass, delete their superseded images (AMIs with
+   snapshots, gallery versions); a failed prune only warns.
+5. **IDP**: wire `TF_STATE_BUCKET`, `BACKSTAGE_URL` and `BACKSTAGE_TOKEN` in the platform repo.
+   Wait for host initialization, apply the targeted Cloudflare DNS record, restore the TLS backup
+   unless Caddy is already running, and deploy from a temporary clone of IDP `main`. Sibling checkouts
+   are not rebased or used as bootstrap sources. Require HTTP 200 and authenticated catalog access/refresh
+   before opening `stage.yml` and the platform gate.
 
-`up` never clears inventory and has no force/recovery switch. Failed bootstrap retains resources; check
+`up` never clears inventory and has no force option. Failed bootstrap retains resources; check
 `./poc status` and `.generated/logs/{images-apply,infra-apply,bake,idp}.log`. An exact dispatch ID is saved in
 `.generated/bake-run-id`. `./poc watch-bake <run-id>` only monitors the run: it returns 0 for success,
 1 for a completed non-success conclusion, and 2 if the outcome is unknown. The monitor polls every
 30 seconds with a one-hour limit and stops after 10 consecutive failed status reads. It does not
-verify artifacts, publish DNS, or deploy the IDP. `down` is intentional teardown, not a watcher recovery step.
+verify artifacts, publish DNS, or deploy the IDP. `./poc up --resume <run-id>` completes an interrupted
+bootstrap given a successful `bake.yml` dispatch on builder `main`. It checks that both resource
+workflows are idle, the platform gate is still closed, inventory is empty, and Terraform points to
+an owned running IDP, an owned empty bucket and the existing SSH CA. It verifies that run's manifests
+and current images before continuing at step 5, and never reapplies infrastructure, dispatches or
+prunes. It is not a repair command for a partial apply or a failed bake. `down` is intentional
+teardown, not recovery for a failed verification read.
+
+Image verification and workflow freeze/teardown GitHub reads retry up to four times (2, 4 and 8 seconds
+between failures). A failed read cannot supply partial output; an unknown gate, run list or
+inventory is not treated as an empty one. Dispatch is never retried automatically.
 
 `./poc up --images-only` rebakes without touching anything else, whether the POC is up or down: it
 applies `infra/images`, opens the builder gate and `bake.yml`, runs and verifies the bake as in step 4
