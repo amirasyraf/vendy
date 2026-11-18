@@ -750,6 +750,11 @@ for garbage collection but the running application stays up.
 
 ### 12.3 `./poc down` (about 5–10 min)
 
+`down` requires an Azure CLI login but does not fail preflight when the Terraform-only `ARM_*`
+variables are absent; it still runs the independent Azure sweep. If local `infra` state exists,
+Terraform destroy also uses those variables when available and any remaining resources are handled
+by the named/tagged sweeps.
+
 Order matters: stop anything that could create resources, then destroy what Terraform knows about,
 then sweep anything else, then verify.
 
@@ -765,7 +770,8 @@ then sweep anything else, then verify.
 3. **Sweep leftovers by tag** (catches failed provisions, interrupted bakes, missing state):
    - deregister AMIs tagged `cf:poc=true` and delete their snapshots;
    - terminate instances tagged `cf:poc=true`, including Packer build instances (Packer `run_tags`);
-   - delete leftover `packer_*` key pairs and security groups;
+   - delete tagged detached volumes, available network interfaces and EIPs, plus leftover `packer_*` key pairs and security groups;
+   - remove the exact-name `cf-idp` instance, EIP, security group and key pair as a fallback when a partial apply created them before tags/state were recorded;
    - delete Azure resource groups tagged `cf:poc=true` except infra's (VMs, Packer build groups), then
      every gallery image definition's versions (Packer-published, outside Terraform; a definition can't be
       deleted while it has versions). Log each version before waiting for Azure to delete it. A
@@ -777,8 +783,9 @@ then sweep anything else, then verify.
    it holds nothing but those automatic network watchers).
 6. **GitHub cleanup**: delete the repo variables and secrets set in `up`, and commit an empty `vms/`.
 7. **Verify**:
-   - check the tagged EC2 resources, account-owned state bucket, named AWS secrets, SSM parameter and
-     IAM role; AWS point lookups must explicitly report not found to count as absent;
+   - check the tagged EC2 resources, available network interfaces and EIPs, account-owned state bucket,
+     named AWS secrets, SSM parameter, IAM role/profile, and exact-name `cf-idp` security group/key pair;
+     AWS point lookups must explicitly report not found to count as absent;
    - check for Azure resource groups tagged `cf:poc=true`, `NetworkWatcherRG`, and the IDP DNS record;
    - if a required lookup fails or reports a remaining resource, report the affected check and exit
      nonzero instead of printing `CLEAN`. The AWS Resource Groups Tagging API is informational

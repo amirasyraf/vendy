@@ -57,9 +57,14 @@ require_tools() {
   acct="$(aws sts get-caller-identity --query Account --output text 2>/dev/null)" || die "AWS profile $AWS_PROFILE not usable (aws sso login?)"
   [[ "$acct" == "134584031874" ]] || die "AWS profile $AWS_PROFILE points at $acct, expected 134584031874"
   gh auth status >/dev/null 2>&1 || die "gh is not authenticated"
-  # Terraform azurerm (infra, Azure VMs) uses ARM_*; the sweeps use the az CLI. See DESIGN.md §9.
-  [[ -n "${ARM_CLIENT_ID:-}" && -f "${ARM_CLIENT_CERTIFICATE_PATH:-}" ]] || die "ARM_CLIENT_ID/ARM_CLIENT_CERTIFICATE_PATH not set (cf-admin-local; see ~/.zshrc)"
+  # The sweeps use the az CLI. Terraform's azurerm provider needs ARM_* only for
+  # `up` and for destroying an existing local infra state; see DESIGN.md §9.
   [[ "$(az account show --query id -o tsv 2>/dev/null)" == "$AZURE_SUBSCRIPTION" ]] || die "az CLI not logged in to subscription $AZURE_SUBSCRIPTION (run azsp)"
+}
+
+require_terraform_azure_auth() {
+  [[ -n "${ARM_CLIENT_ID:-}" && -f "${ARM_CLIENT_CERTIFICATE_PATH:-}" ]] \
+    || die "ARM_CLIENT_ID/ARM_CLIENT_CERTIFICATE_PATH not set (cf-admin-local; see ~/.zshrc)"
 }
 
 ensure_repos() {
@@ -273,6 +278,7 @@ cmd_prune_idp_images() {
 cmd_up() {
   log "Preflight"
   require_tools docker
+  require_terraform_azure_auth
   [[ -f "$ROOT/.poc.env" ]] || die "missing $ROOT/.poc.env (copy poc.env.example and fill it in)"
   # shellcheck disable=SC1091
   ( set -a; source "$ROOT/.poc.env"; : "${GITHUB_TOKEN:?}" ) || die ".poc.env must set GITHUB_TOKEN"
@@ -456,6 +462,17 @@ sweep_tagged() {
   for v in $(aws ec2 describe-volumes --filters Name=tag:cf:poc,Values=true Name=status,Values=available --query 'Volumes[].VolumeId' --output text); do
     aws ec2 delete-volume --volume-id "$v" >/dev/null 2>&1 && info "deleted $v" || true
   done
+  for eni in $(aws ec2 describe-network-interfaces \
+    --filters Name=tag:cf:poc,Values=true Name=status,Values=available \
+    --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
+    aws ec2 delete-network-interface --network-interface-id "$eni" >/dev/null 2>&1 \
+      && info "deleted $eni" || warn "could not delete $eni"
+  done
+  for a in $(aws ec2 describe-addresses --filters Name=tag:cf:poc,Values=true \
+    --query 'Addresses[].AllocationId' --output text); do
+    aws ec2 release-address --allocation-id "$a" >/dev/null 2>&1 \
+      && info "released EIP $a" || warn "could not release EIP $a"
+  done
 
   q='SecurityGroups[]'
   [[ "$exclude_infra" == "1" ]] && q+='[?!(Tags[?Key==`cf:module`&&Value==`infra`])]'
@@ -519,13 +536,36 @@ sweep_network_watchers() {
 
 # Named singletons from infra/, in case local state was lost.
 sweep_infra_orphans() {
-  local bucket="cf-tfstate-134584031874-apse2"
+  local bucket="cf-tfstate-134584031874-apse2" ids sg a
   aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1 && aws s3 rb "s3://$bucket" --force >/dev/null && info "deleted bucket $bucket"
   aws secretsmanager describe-secret --secret-id compute-factory/ssh-ca >/dev/null 2>&1 \
     && aws secretsmanager delete-secret --secret-id compute-factory/ssh-ca --force-delete-without-recovery >/dev/null && info "deleted CA secret"
   aws ssm delete-parameter --name /compute-factory/ssh-ca-pub >/dev/null 2>&1 && info "deleted CA public key parameter" || true
   aws secretsmanager describe-secret --secret-id compute-factory/azure-reader >/dev/null 2>&1 \
     && aws secretsmanager delete-secret --secret-id compute-factory/azure-reader --force-delete-without-recovery >/dev/null && info "deleted Azure reader secret"
+  # These exact names are owned by this POC. The fallback catches a partial apply that
+  # created a singleton before tags/state were recorded.
+  ids="$(aws ec2 describe-instances --filters Name=tag:Name,Values=cf-idp \
+    Name=instance-state-name,Values=pending,running,stopping,stopped \
+    --query 'Reservations[].Instances[].InstanceId' --output text)"
+  if [[ -n "$ids" ]]; then
+    info "terminating named IDP instance(s): $ids"
+    # shellcheck disable=SC2086
+    aws ec2 terminate-instances --instance-ids $ids >/dev/null
+    # shellcheck disable=SC2086
+    aws ec2 wait instance-terminated --instance-ids $ids
+  fi
+  for a in $(aws ec2 describe-addresses --query \
+    'Addresses[?Tags[?Key==`Name`&&Value==`cf-idp`]].AllocationId' --output text); do
+    aws ec2 release-address --allocation-id "$a" >/dev/null 2>&1 && info "released named IDP EIP $a" || true
+  done
+  for sg in $(aws ec2 describe-security-groups --filters Name=group-name,Values=cf-idp \
+    --query 'SecurityGroups[].GroupId' --output text); do
+    for _ in 1 2 3 4 5 6; do
+      aws ec2 delete-security-group --group-id "$sg" >/dev/null 2>&1 && { info "deleted named IDP security group $sg"; break; }
+      sleep 10
+    done
+  done
   for a in $(aws ec2 describe-addresses --filters Name=tag:cf:poc,Values=true --query 'Addresses[].AllocationId' --output text); do
     aws ec2 release-address --allocation-id "$a" >/dev/null && info "released EIP $a"
   done
@@ -581,12 +621,16 @@ verify_clean() {
   verify_absent "AMIs" "" aws ec2 describe-images --owners self --filters Name=tag:cf:poc,Values=true --query 'Images[].ImageId' --output text || failed=1
   verify_absent "snapshots" "" aws ec2 describe-snapshots --owner-ids self --filters Name=tag:cf:poc,Values=true --query 'Snapshots[].SnapshotId' --output text || failed=1
   verify_absent "volumes" "" aws ec2 describe-volumes --filters Name=tag:cf:poc,Values=true --query 'Volumes[].VolumeId' --output text || failed=1
+  verify_absent "network interfaces" "" aws ec2 describe-network-interfaces --filters Name=tag:cf:poc,Values=true --query 'NetworkInterfaces[].NetworkInterfaceId' --output text || failed=1
   verify_absent "security groups" "" aws ec2 describe-security-groups --filters Name=tag:cf:poc,Values=true --query 'SecurityGroups[].GroupId' --output text || failed=1
   verify_absent "EIPs" "" aws ec2 describe-addresses --filters Name=tag:cf:poc,Values=true --query 'Addresses[].PublicIp' --output text || failed=1
+  verify_absent "named cf-idp security group" "" aws ec2 describe-security-groups --filters Name=group-name,Values=cf-idp --query 'SecurityGroups[].GroupId' --output text || failed=1
+  verify_absent "named cf-idp key pair" InvalidKeyPair.NotFound aws ec2 describe-key-pairs --key-names cf-idp --query 'KeyPairs[].KeyName' --output text || failed=1
   verify_absent "state bucket" "" find_state_bucket "$bucket" || failed=1
   verify_absent "CA secret" ResourceNotFoundException aws secretsmanager describe-secret --secret-id compute-factory/ssh-ca --query ARN --output text || failed=1
   verify_absent "CA public key parameter" ParameterNotFound aws ssm get-parameter --name /compute-factory/ssh-ca-pub --query Parameter.Name --output text || failed=1
   verify_absent "IAM role cf-idp" NoSuchEntity aws iam get-role --role-name cf-idp --query Role.RoleName --output text || failed=1
+  verify_absent "IAM instance profile cf-idp" NoSuchEntity aws iam get-instance-profile --instance-profile-name cf-idp --query InstanceProfile.InstanceProfileName --output text || failed=1
   verify_absent "Azure reader secret" ResourceNotFoundException aws secretsmanager describe-secret --secret-id compute-factory/azure-reader --query ARN --output text || failed=1
   verify_absent "Azure resource groups" "" az group list --query "[?tags.\"cf:poc\"=='true' || name=='NetworkWatcherRG'].name" -o tsv || failed=1
   verify_dns_absent || failed=1
