@@ -76,11 +76,14 @@ image), `jq`, `ssh` with `~/.ssh/id_ed25519`, and `dig` for teardown DNS verific
 The Azure identities and `AZURE_*` repo variables are one-time setup that survives `down` (DESIGN.md §9).
 
 `down` is safe to rerun after a failed teardown or `up`. Azure gallery image deletion can take
-several minutes; teardown prints the image version before it waits. The final AWS, Azure and DNS
-checks must all confirm absence before `down` prints `CLEAN`. If a resource remains or a lookup
-fails, it reports the affected check and exits nonzero. It removes `NetworkWatcherRG`, which Azure
-creates untagged with the first VNet, only while it holds only automatic watchers. `up` checks the
-one-time Azure setup first and stops if it is missing.
+several minutes; teardown prints the image version before it waits. Teardown first stops the IDP,
+disables the builder/platform resource workflows, cancels all active runs, and refuses to sweep if
+workflow quiescence cannot be proven. The final multi-region AWS, Azure and DNS checks must all
+confirm absence across stable repeated passes before `down` prints `CLEAN`. If a resource remains
+or a lookup fails, it reports the affected check and exits nonzero. It removes `NetworkWatcherRG`,
+which Azure creates untagged with the first VNet, only while it holds only automatic watchers.
+The two workflows remain disabled after teardown; `up` re-enables them after shared infrastructure
+is ready and clears the shared `CF_POC_MAINTENANCE` gate.
 
 The `idp.amirasyraf.dev` DNS record lives in `~/projects/cloudflare/amirasyraf.dev/idp.tf` and is only
 applied with `-target` by `./poc`.

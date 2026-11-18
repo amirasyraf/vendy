@@ -28,11 +28,19 @@ HEALTH_URL="https://$DOMAIN/.backstage/health/v1/readiness"
 USERS_FILE="$ROOT/.poc-users" # username:scrypt-hash lines, gitignored, persists across cycles
 PASSWORDS_FILE="$ROOT/.poc-passwords" # username:plaintext, gitignored; POC test logins for agents/scripts
 PARALLEL_DESTROYS="${PARALLEL_DESTROYS:-5}"
+RUN_CANCEL_TIMEOUT=900
+CLEAN_STABILITY_PASSES=3
+CLEAN_STABILITY_SECONDS=30
+AWS_REGION_PARALLEL=5
+POC_LOCK_DIR="$GEN/poc.lock"
+MAINTENANCE_VARIABLE="CF_POC_MAINTENANCE"
 
 export AWS_PROFILE="${AWS_PROFILE:-amirasyraf}"
-export AWS_REGION="ap-southeast-2" AWS_DEFAULT_REGION="ap-southeast-2"
-export AWS_PAGER=""
+POC_AWS_REGION="ap-southeast-2"
+export AWS_REGION="$POC_AWS_REGION" AWS_DEFAULT_REGION="$POC_AWS_REGION"
+export AWS_PAGER="" AWS_CLI_TELEMETRY=0
 AZURE_SUBSCRIPTION="74b39a79-f79d-4adb-8ae0-fe9118fc564a"
+WORKFLOW_SPECS=("$BUILDER_REPO:bake.yml" "$PLATFORM_REPO:stage.yml")
 export TF_IN_AUTOMATION=1 TF_INPUT=0
 export TF_PLUGIN_CACHE_DIR="$GEN/tf-plugin-cache"
 mkdir -p "$GEN/logs" "$TF_PLUGIN_CACHE_DIR"
@@ -43,6 +51,18 @@ log()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 warn() { printf '    \033[33mWARN: %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+
+acquire_poc_lock() {
+  if ! mkdir "$POC_LOCK_DIR" 2>/dev/null; then
+    local owner
+    owner="$(cat "$POC_LOCK_DIR/pid" 2>/dev/null || true)"
+    die "POC lifecycle lock is held${owner:+ by PID $owner}; refusing to continue"
+  fi
+  printf '%s\n' "$$" >"$POC_LOCK_DIR/pid"
+  trap 'rm -rf "$POC_LOCK_DIR"' EXIT
+  trap 'rm -rf "$POC_LOCK_DIR"; exit 130' INT
+  trap 'rm -rf "$POC_LOCK_DIR"; exit 143' TERM
+}
 
 tf_infra()  { terraform -chdir="$INFRA_DIR" "$@"; }
 infra_out() { tf_infra output -raw "$1" 2>/dev/null || true; }
@@ -65,6 +85,24 @@ require_tools() {
 require_terraform_azure_auth() {
   [[ -n "${ARM_CLIENT_ID:-}" && -f "${ARM_CLIENT_CERTIFICATE_PATH:-}" ]] \
     || die "ARM_CLIENT_ID/ARM_CLIENT_CERTIFICATE_PATH not set (cf-admin-local; see ~/.zshrc)"
+}
+
+set_maintenance_gate() {
+  local value="$1" repo
+  for repo in "$BUILDER_REPO" "$PLATFORM_REPO"; do
+    gh variable set "$MAINTENANCE_VARIABLE" -R "$repo" -b "$value" >/dev/null \
+      || die "could not set $MAINTENANCE_VARIABLE=$value on $repo; refusing to continue"
+  done
+}
+
+verify_maintenance_gate() {
+  local repo value
+  for repo in "$BUILDER_REPO" "$PLATFORM_REPO"; do
+    value="$(gh variable get "$MAINTENANCE_VARIABLE" -R "$repo" 2>&1)" \
+      || { warn "could not read $MAINTENANCE_VARIABLE on $repo: $value"; return 1; }
+    [[ "$value" == 1 ]] \
+      || { warn "$MAINTENANCE_VARIABLE on $repo is '$value', expected 1"; return 1; }
+  done
 }
 
 ensure_repos() {
@@ -276,6 +314,7 @@ cmd_prune_idp_images() {
 }
 
 cmd_up() {
+  acquire_poc_lock
   log "Preflight"
   require_tools docker
   require_terraform_azure_auth
@@ -310,6 +349,11 @@ cmd_up() {
   tf_infra output -raw backstage_token | gh secret set BACKSTAGE_TOKEN -R "$PLATFORM_REPO"
   reset_inventory
 
+  log "Clear maintenance gate"
+  set_maintenance_gate 0
+  log "Enable resource workflows"
+  workflow_action enable
+
   log "Bake golden image + deploy IDP (in parallel)"
   run_bake   >"$GEN/logs/bake.log" 2>&1 & local bake_pid=$!
   deploy_idp "$ip" bootstrap >"$GEN/logs/idp.log" 2>&1 & local idp_pid=$!
@@ -337,24 +381,79 @@ cmd_up() {
 
 # ---------------------------------------------------------------- down
 
-cancel_runs() {
-  local repo ids id
+workflow_action() {
+  local action="$1" spec repo workflow state
+  for spec in "${WORKFLOW_SPECS[@]}"; do
+    repo="${spec%%:*}"
+    workflow="${spec#*:}"
+    state="$(gh workflow list --all -R "$repo" --json path,state \
+      --jq ".[] | select(.path == \".github/workflows/$workflow\") | .state")" \
+      || die "could not inspect $repo/$workflow; refusing to continue"
+    [[ -n "$state" ]] || die "$repo/$workflow was not found; refusing to continue"
+    if [[ "$action" == disable && "$state" != active ]]; then
+      info "$repo/$workflow already disabled ($state)"
+      continue
+    fi
+    if [[ "$action" == enable && "$state" == active ]]; then
+      info "$repo/$workflow already enabled"
+      continue
+    fi
+    gh workflow "$action" "$workflow" -R "$repo" >/dev/null \
+      || die "could not $action $repo/$workflow; refusing to continue"
+    info "$action $repo/$workflow"
+  done
+}
+
+verify_workflows_disabled() {
+  local spec repo workflow state
+  for spec in "${WORKFLOW_SPECS[@]}"; do
+    repo="${spec%%:*}"
+    workflow="${spec#*:}"
+    state="$(gh workflow list --all -R "$repo" --json path,state \
+      --jq ".[] | select(.path == \".github/workflows/$workflow\") | .state")" \
+      || { warn "could not inspect $repo/$workflow"; return 1; }
+    [[ -n "$state" ]] \
+      || { warn "$repo/$workflow was not found"; return 1; }
+    [[ "$state" != active ]] \
+      || { warn "$repo/$workflow is active during teardown"; return 1; }
+  done
+}
+
+list_active_runs() {
+  local repo="$1"
+  gh api --paginate "repos/$repo/actions/runs?per_page=100" \
+    --jq '.workflow_runs[] | select(.status != "completed") | .id'
+}
+
+active_runs() {
+  local repo
   for repo in "$PLATFORM_REPO" "$BUILDER_REPO"; do
-    ids="$(gh run list -R "$repo" -L 100 --json databaseId,status -q '.[] | select(.status != "completed") | .databaseId' 2>/dev/null || true)"
+    list_active_runs "$repo" | awk -v repo="$repo" '{print repo ":" $0}' \
+      || return 1
+  done
+}
+
+cancel_runs() {
+  local repo ids id active deadline
+  for repo in "$PLATFORM_REPO" "$BUILDER_REPO"; do
+    ids="$(list_active_runs "$repo")" || die "could not enumerate active runs in $repo; refusing to continue"
     for id in $ids; do
-      gh run cancel "$id" -R "$repo" >/dev/null 2>&1 && info "cancelled $repo run $id" || true
+      gh run cancel "$id" -R "$repo" >/dev/null 2>&1 \
+        && info "cancelled $repo run $id" \
+        || warn "run $repo/$id was not cancellable; it must disappear before teardown continues"
     done
   done
-  # Let cancelled jobs finish their cleanup (Packer removes its build instance, Terraform releases locks).
-  for _ in $(seq 1 30); do
-    ids=""
-    for repo in "$PLATFORM_REPO" "$BUILDER_REPO"; do
-      ids+="$(gh run list -R "$repo" -L 100 --json status -q '.[] | select(.status != "completed") | .status' 2>/dev/null || true)"
-    done
-    [[ -z "$ids" ]] && return 0
+
+  # A cancelled workflow can still be cleaning up its runner. Never sweep cloud resources
+  # while any resource-creating workflow is still active.
+  deadline=$((SECONDS + RUN_CANCEL_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    active="$(active_runs)" || die "could not verify workflow quiescence; refusing to continue"
+    [[ -z "$active" ]] && return 0
     sleep 10
   done
-  warn "some runs still not completed after 5 min; continuing"
+  printf '%s\n' "$active" | sed 's/^/    /' >&2
+  die "resource-creating workflows are still active after ${RUN_CANCEL_TIMEOUT}s; refusing to sweep"
 }
 
 # Caddy's TLS cert/account storage is kept on the laptop across cycles, so `up` doesn't hit
@@ -388,11 +487,41 @@ restore_caddy_data() {
 }
 
 stop_idp() {
-  local ip
+  local ip instance_ids instance_id state result discovered
   ip="$(infra_out idp_ip)"
-  [[ -n "$ip" ]] || return 0
-  ssh "${SSH_OPTS[@]}" "ubuntu@$ip" 'cd /opt/idp 2>/dev/null && docker compose down' >/dev/null 2>&1 \
-    && info "IDP stopped" || info "IDP not reachable (already gone?)"
+  if [[ -n "$ip" ]]; then
+    ssh "${SSH_OPTS[@]}" "ubuntu@$ip" 'cd /opt/idp 2>/dev/null && docker compose down' >/dev/null 2>&1 \
+      && info "IDP containers stopped" || warn "could not reach IDP host; stopping its EC2 instance instead"
+  fi
+  instance_ids="$(infra_out idp_instance_id)"
+  discovered="$(aws ec2 describe-instances --filters Name=tag:Name,Values=cf-idp \
+    Name=instance-state-name,Values=pending,running,stopping,stopped \
+    --query 'Reservations[].Instances[].InstanceId' --output text)"
+  instance_ids="$(printf '%s\n%s\n' "$instance_ids" "$discovered" | tr '\t' '\n' |
+    awk 'NF && $0 != "None"' | sort -u || true)"
+  [[ -n "$instance_ids" ]] || return 0
+  for instance_id in $instance_ids; do
+    result="$(aws ec2 describe-instances --instance-ids "$instance_id" \
+      --query 'Reservations[0].Instances[0].State.Name' --output text 2>&1)" \
+      || { [[ "$result" == *"InvalidInstanceID.NotFound"* ]] && continue; die "could not inspect IDP instance $instance_id"; }
+    state="$result"
+    case "$state" in
+      stopped) ;;
+      stopping)
+        aws ec2 wait instance-stopped --instance-ids "$instance_id" \
+          || die "IDP instance $instance_id did not stop; refusing to continue"
+        ;;
+      terminated) continue ;;
+      pending|running)
+        aws ec2 stop-instances --instance-ids "$instance_id" >/dev/null \
+          || die "could not stop IDP instance $instance_id; refusing to continue"
+        aws ec2 wait instance-stopped --instance-ids "$instance_id" \
+          || die "IDP instance $instance_id did not stop; refusing to continue"
+        ;;
+      *) die "unexpected IDP instance state '$state'; refusing to continue" ;;
+    esac
+    info "IDP instance quiesced: $instance_id ($state)"
+  done
 }
 
 # Called per VM by xargs: ./poc _destroy_vm <bucket> <platform> <name>
@@ -431,72 +560,133 @@ destroy_vms() {
     | xargs -n 3 -P "$PARALLEL_DESTROYS" "$0" _destroy_vm
 }
 
-# Remove everything tagged cf:poc=true that Terraform does not (or no longer) know about.
-sweep_tagged() {
-  local exclude_infra="$1" ids q
+# Remove everything tagged cf:poc=true that Terraform does not (or no longer) know about
+# in one AWS region.
+sweep_tagged_region() {
+  local exclude_infra="$1" ids q ami_query snapshot_query volume_query eni_query eip_query sg_query
   q='Reservations[].Instances[]'
-  [[ "$exclude_infra" == "1" ]] && q+='[?!(Tags[?Key==`cf:module`&&Value==`infra`])]'
-  ids="$( {
-      aws ec2 describe-instances --filters Name=tag:cf:poc,Values=true \
-        Name=instance-state-name,Values=pending,running,stopping,stopped --query "$q.InstanceId" --output text
-      aws ec2 describe-instances --filters 'Name=key-name,Values=packer_*' \
-        Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].InstanceId' --output text
-    } | tr '\t' '\n' | sort -u | grep . || true)"
+  [[ "$exclude_infra" == "1" ]] && q='Reservations[].Instances[?!(Tags[?Key==`cf:module`&&Value==`infra`])]'
+  tagged_ids="$(aws ec2 describe-instances --filters Name=tag:cf:poc,Values=true \
+    Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
+    --query "$q.InstanceId" --output text)" || return 1
+  ids="$(printf '%s\n' "$tagged_ids" | tr '\t' '\n' | awk 'NF' | sort -u)"
   if [[ -n "$ids" ]]; then
     info "terminating instances: $(echo $ids)"
     # shellcheck disable=SC2086
-    aws ec2 terminate-instances --instance-ids $ids >/dev/null
+    aws ec2 terminate-instances --instance-ids $ids >/dev/null || return 1
     # shellcheck disable=SC2086
-    aws ec2 wait instance-terminated --instance-ids $ids
+    aws ec2 wait instance-terminated --instance-ids $ids || return 1
   fi
 
-  local ami snap
-  for ami in $(aws ec2 describe-images --owners self --filters Name=tag:cf:poc,Values=true --query 'Images[].ImageId' --output text); do
-    snap="$(aws ec2 describe-images --image-ids "$ami" --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' --output text)"
-    aws ec2 deregister-image --image-id "$ami" >/dev/null && info "deregistered $ami"
-    for s in $snap; do aws ec2 delete-snapshot --snapshot-id "$s" >/dev/null 2>&1 && info "deleted $s" || true; done
-  done
-  for s in $(aws ec2 describe-snapshots --owner-ids self --filters Name=tag:cf:poc,Values=true --query 'Snapshots[].SnapshotId' --output text); do
-    aws ec2 delete-snapshot --snapshot-id "$s" >/dev/null 2>&1 && info "deleted $s" || warn "could not delete $s"
-  done
-  for v in $(aws ec2 describe-volumes --filters Name=tag:cf:poc,Values=true Name=status,Values=available --query 'Volumes[].VolumeId' --output text); do
-    aws ec2 delete-volume --volume-id "$v" >/dev/null 2>&1 && info "deleted $v" || true
-  done
-  for eni in $(aws ec2 describe-network-interfaces \
-    --filters Name=tag:cf:poc,Values=true Name=status,Values=available \
-    --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
-    aws ec2 delete-network-interface --network-interface-id "$eni" >/dev/null 2>&1 \
-      && info "deleted $eni" || warn "could not delete $eni"
-  done
-  for a in $(aws ec2 describe-addresses --filters Name=tag:cf:poc,Values=true \
-    --query 'Addresses[].AllocationId' --output text); do
-    aws ec2 release-address --allocation-id "$a" >/dev/null 2>&1 \
-      && info "released EIP $a" || warn "could not release EIP $a"
-  done
+  ami_query='Images[].ImageId'
+  snapshot_query='Snapshots[].SnapshotId'
+  volume_query='Volumes[].VolumeId'
+  eni_query='NetworkInterfaces[].NetworkInterfaceId'
+  eip_query='Addresses[].AllocationId'
+  sg_query='SecurityGroups[].GroupId'
+  if [[ "$exclude_infra" == "1" ]]; then
+    ami_query='Images[?!(Tags[?Key==`cf:module`&&Value==`infra`])].ImageId'
+    snapshot_query='Snapshots[?!(Tags[?Key==`cf:module`&&Value==`infra`])].SnapshotId'
+    volume_query='Volumes[?!(Tags[?Key==`cf:module`&&Value==`infra`])].VolumeId'
+    eni_query='NetworkInterfaces[?!(TagSet[?Key==`cf:module`&&Value==`infra`])].NetworkInterfaceId'
+    eip_query='Addresses[?!(Tags[?Key==`cf:module`&&Value==`infra`])].AllocationId'
+    sg_query='SecurityGroups[?!(Tags[?Key==`cf:module`&&Value==`infra`])].GroupId'
+  fi
 
-  q='SecurityGroups[]'
-  [[ "$exclude_infra" == "1" ]] && q+='[?!(Tags[?Key==`cf:module`&&Value==`infra`])]'
-  for sg in $( { aws ec2 describe-security-groups --filters Name=tag:cf:poc,Values=true --query "$q.GroupId" --output text
-                 aws ec2 describe-security-groups --filters 'Name=group-name,Values=packer_*' --query 'SecurityGroups[].GroupId' --output text
-               } | tr '\t' '\n' | sort -u | grep . || true); do
-    for _ in 1 2 3 4 5 6; do # ENIs of just-terminated instances take a moment to go away
-      aws ec2 delete-security-group --group-id "$sg" >/dev/null 2>&1 && { info "deleted $sg"; break; }
-      sleep 10
+  local amis ami snap snapshots volumes enis eips sgs sg result
+  amis="$(aws ec2 describe-images --owners self --filters Name=tag:cf:poc,Values=true \
+    --query "$ami_query" --output text)" || return 1
+  for ami in $amis; do
+    snap="$(aws ec2 describe-images --image-ids "$ami" \
+      --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' --output text)" || return 1
+    aws ec2 deregister-image --image-id "$ami" >/dev/null || return 1
+    info "deregistered $ami"
+    for s in $snap; do
+      [[ "$s" == "None" ]] && continue
+      aws ec2 delete-snapshot --snapshot-id "$s" >/dev/null || return 1
+      info "deleted $s"
     done
   done
-  for kp in $(aws ec2 describe-key-pairs --filters 'Name=key-name,Values=packer_*' --query 'KeyPairs[].KeyName' --output text); do
-    aws ec2 delete-key-pair --key-name "$kp" >/dev/null && info "deleted key pair $kp"
+
+  snapshots="$(aws ec2 describe-snapshots --owner-ids self --filters Name=tag:cf:poc,Values=true \
+    --query "$snapshot_query" --output text)" || return 1
+  for s in $snapshots; do
+    aws ec2 delete-snapshot --snapshot-id "$s" >/dev/null || return 1
+    info "deleted $s"
   done
+
+  volumes="$(aws ec2 describe-volumes --filters Name=tag:cf:poc,Values=true Name=status,Values=available \
+    --query "$volume_query" --output text)" || return 1
+  for v in $volumes; do
+    aws ec2 delete-volume --volume-id "$v" >/dev/null || return 1
+    info "deleted $v"
+  done
+
+  enis="$(aws ec2 describe-network-interfaces --filters Name=tag:cf:poc,Values=true Name=status,Values=available \
+    --query "$eni_query" --output text)" || return 1
+  for eni in $enis; do
+    aws ec2 delete-network-interface --network-interface-id "$eni" >/dev/null || return 1
+    info "deleted $eni"
+  done
+
+  eips="$(aws ec2 describe-addresses --filters Name=tag:cf:poc,Values=true \
+    --query "$eip_query" --output text)" || return 1
+  for a in $eips; do
+    aws ec2 release-address --allocation-id "$a" >/dev/null || return 1
+    info "released EIP $a"
+  done
+
+  sgs="$(aws ec2 describe-security-groups --filters Name=tag:cf:poc,Values=true \
+    --query "$sg_query" --output text)" || return 1
+  for sg in $sgs; do
+    for _ in 1 2 3 4 5 6; do # ENIs of just-terminated instances take a moment to go away
+      if aws ec2 delete-security-group --group-id "$sg" >/dev/null 2>&1; then
+        info "deleted $sg"
+        break
+      fi
+      sleep 10
+    done
+    if result="$(aws ec2 describe-security-groups --group-ids "$sg" 2>&1)"; then
+      return 1
+    fi
+    [[ "$result" == *"InvalidGroup.NotFound"* ]] || return 1
+  done
+}
+
+# The POC normally uses ap-southeast-2, but a failed/manual workflow must not strand
+# tagged resources in another enabled region.
+sweep_tagged() {
+  local exclude_infra="$1" regions
+  regions="$(aws ec2 describe-regions --all-regions \
+    --query 'Regions[?OptInStatus==`opt-in-not-required` || OptInStatus==`opted-in`].RegionName' \
+    --output text)" || die "could not enumerate AWS regions; refusing to sweep"
+  printf '%s\n' $regions | xargs -n 1 -P "$AWS_REGION_PARALLEL" \
+    "$ROOT/poc" _sweep_region "$exclude_infra" \
+    || die "AWS sweep failed in at least one region; refusing to continue"
+}
+
+cmd_sweep_region() {
+  local exclude_infra="$1" region="$2"
+  info "sweeping AWS region $region"
+  AWS_REGION="$region" AWS_DEFAULT_REGION="$region" sweep_tagged_region "$exclude_infra"
 }
 
 # Azure: every VM and Packer build has its own resource group tagged cf:poc=true; infra's is cf:module=infra.
 sweep_azure() {
   local exclude_infra="$1" q groups g
-  q="[?tags.\"cf:poc\"=='true']"
-  [[ "$exclude_infra" == "1" ]] && q="[?tags.\"cf:poc\"=='true' && tags.\"cf:module\"!='infra']"
+  if [[ "$exclude_infra" == "1" ]]; then
+    q="[?tags.\"cf:poc\"=='true' && tags.\"cf:module\"!='infra']"
+  else
+    q="[?tags.\"cf:poc\"=='true']"
+  fi
   groups="$(az group list --query "$q.name" -o tsv)"
-  for g in $groups; do az group delete -n "$g" --yes --no-wait && info "deleting resource group $g"; done
-  for g in $groups; do az group wait -n "$g" --deleted --timeout 1800 2>/dev/null || true; done
+  for g in $groups; do
+    az group delete -n "$g" --yes --no-wait || return 1
+    info "deleting resource group $g"
+  done
+  for g in $groups; do
+    az group wait -n "$g" --deleted --timeout 1800 || return 1
+  done
 }
 
 # Packer publishes gallery image versions outside Terraform; an image definition cannot be deleted with them.
@@ -524,12 +714,14 @@ delete_image_versions() {
 # Azure creates NetworkWatcherRG (untagged) with the first VNet in a region. Delete it only while it holds
 # nothing but those automatic network watchers, so anything else in it is never touched.
 sweep_network_watchers() {
-  local other
-  az group exists -n NetworkWatcherRG 2>/dev/null | grep -q true || return 0
+  local exists other
+  exists="$(az group exists -n NetworkWatcherRG -o tsv)" \
+    || die "could not check NetworkWatcherRG; refusing to continue"
+  [[ "$exists" == true ]] || return 0
   other="$(az resource list -g NetworkWatcherRG --query "[?type!='Microsoft.Network/networkWatchers'].id" -o tsv)"
   if [[ -n "$other" ]]; then
     warn "NetworkWatcherRG holds other resources; leaving it"
-    return 0
+    return 1
   fi
   az group delete -n NetworkWatcherRG --yes && info "deleted NetworkWatcherRG (Azure's automatic network watchers)"
 }
@@ -615,49 +807,123 @@ verify_dns_absent() {
   return 1
 }
 
-verify_clean() {
-  local bucket="$1" failed=0 x
-  verify_absent "instances" "" aws ec2 describe-instances --filters Name=tag:cf:poc,Values=true Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].InstanceId' --output text || failed=1
-  verify_absent "AMIs" "" aws ec2 describe-images --owners self --filters Name=tag:cf:poc,Values=true --query 'Images[].ImageId' --output text || failed=1
-  verify_absent "snapshots" "" aws ec2 describe-snapshots --owner-ids self --filters Name=tag:cf:poc,Values=true --query 'Snapshots[].SnapshotId' --output text || failed=1
-  verify_absent "volumes" "" aws ec2 describe-volumes --filters Name=tag:cf:poc,Values=true --query 'Volumes[].VolumeId' --output text || failed=1
-  verify_absent "network interfaces" "" aws ec2 describe-network-interfaces --filters Name=tag:cf:poc,Values=true --query 'NetworkInterfaces[].NetworkInterfaceId' --output text || failed=1
-  verify_absent "security groups" "" aws ec2 describe-security-groups --filters Name=tag:cf:poc,Values=true --query 'SecurityGroups[].GroupId' --output text || failed=1
-  verify_absent "EIPs" "" aws ec2 describe-addresses --filters Name=tag:cf:poc,Values=true --query 'Addresses[].PublicIp' --output text || failed=1
-  verify_absent "named cf-idp security group" "" aws ec2 describe-security-groups --filters Name=group-name,Values=cf-idp --query 'SecurityGroups[].GroupId' --output text || failed=1
-  verify_absent "named cf-idp key pair" InvalidKeyPair.NotFound aws ec2 describe-key-pairs --key-names cf-idp --query 'KeyPairs[].KeyName' --output text || failed=1
-  verify_absent "state bucket" "" find_state_bucket "$bucket" || failed=1
-  verify_absent "CA secret" ResourceNotFoundException aws secretsmanager describe-secret --secret-id compute-factory/ssh-ca --query ARN --output text || failed=1
-  verify_absent "CA public key parameter" ParameterNotFound aws ssm get-parameter --name /compute-factory/ssh-ca-pub --query Parameter.Name --output text || failed=1
-  verify_absent "IAM role cf-idp" NoSuchEntity aws iam get-role --role-name cf-idp --query Role.RoleName --output text || failed=1
-  verify_absent "IAM instance profile cf-idp" NoSuchEntity aws iam get-instance-profile --instance-profile-name cf-idp --query InstanceProfile.InstanceProfileName --output text || failed=1
-  verify_absent "Azure reader secret" ResourceNotFoundException aws secretsmanager describe-secret --secret-id compute-factory/azure-reader --query ARN --output text || failed=1
-  verify_absent "Azure resource groups" "" az group list --query "[?tags.\"cf:poc\"=='true' || name=='NetworkWatcherRG'].name" -o tsv || failed=1
-  verify_dns_absent || failed=1
-
-  # Informational: anything else the tagging API still reports (can lag a few minutes behind deletes).
-  x="$(aws resourcegroupstaggingapi get-resources --tag-filters Key=cf:poc,Values=true --query 'ResourceTagMappingList[].ResourceARN' --output text 2>/dev/null | tr '\t' '\n' | grep -v ':instance/' || true)"
-  [[ -n "$x" ]] && info "tagging API still lists (eventual consistency, re-check with ./poc status):" && echo "$x" | sed 's/^/      /'
-
-  if [[ "$failed" == 0 ]]; then
-    printf '\n\033[32mCLEAN: no Compute Factory resources found by the required checks.\033[0m\n'
-  else
-    printf '\n\033[31mNOT CLEAN: resources remain or a required check failed; see warnings above.\033[0m\n'
+verify_aws_region() {
+  local region="$1" tagged
+  verify_absent "AWS $region instances" "" aws ec2 describe-instances \
+    --filters Name=tag:cf:poc,Values=true Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
+    --query 'Reservations[].Instances[].InstanceId' --output text || return 1
+  verify_absent "AWS $region named cf-idp instances" "" aws ec2 describe-instances \
+    --filters Name=tag:Name,Values=cf-idp Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
+    --query 'Reservations[].Instances[].InstanceId' --output text || return 1
+  verify_absent "AWS $region packer instances" "" aws ec2 describe-instances \
+    --filters Name=key-name,Values=packer_* Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
+    --query 'Reservations[].Instances[].InstanceId' --output text || return 1
+  verify_absent "AWS $region AMIs" "" aws ec2 describe-images --owners self \
+    --filters Name=tag:cf:poc,Values=true --query 'Images[].ImageId' --output text || return 1
+  verify_absent "AWS $region snapshots" "" aws ec2 describe-snapshots --owner-ids self \
+    --filters Name=tag:cf:poc,Values=true --query 'Snapshots[].SnapshotId' --output text || return 1
+  verify_absent "AWS $region volumes" "" aws ec2 describe-volumes \
+    --filters Name=tag:cf:poc,Values=true --query 'Volumes[].VolumeId' --output text || return 1
+  verify_absent "AWS $region network interfaces" "" aws ec2 describe-network-interfaces \
+    --filters Name=tag:cf:poc,Values=true --query 'NetworkInterfaces[].NetworkInterfaceId' --output text || return 1
+  verify_absent "AWS $region security groups" "" aws ec2 describe-security-groups \
+    --filters Name=tag:cf:poc,Values=true --query 'SecurityGroups[].GroupId' --output text || return 1
+  verify_absent "AWS $region named cf-idp security group" "" aws ec2 describe-security-groups \
+    --filters Name=group-name,Values=cf-idp --query 'SecurityGroups[].GroupId' --output text || return 1
+  verify_absent "AWS $region packer security groups" "" aws ec2 describe-security-groups \
+    --filters Name=group-name,Values=packer_* --query 'SecurityGroups[].GroupId' --output text || return 1
+  verify_absent "AWS $region EIPs" "" aws ec2 describe-addresses \
+    --filters Name=tag:cf:poc,Values=true --query 'Addresses[].PublicIp' --output text || return 1
+  verify_absent "AWS $region named cf-idp EIPs" "" aws ec2 describe-addresses \
+    --query 'Addresses[?Tags[?Key==`Name`&&Value==`cf-idp`]].AllocationId' --output text || return 1
+  verify_absent "AWS $region packer key pairs" "" aws ec2 describe-key-pairs \
+    --filters 'Name=key-name,Values=packer_*' --query 'KeyPairs[].KeyName' --output text || return 1
+  verify_absent "AWS $region named cf-idp-admin key pair" InvalidKeyPair.NotFound \
+    aws ec2 describe-key-pairs --key-names cf-idp-admin --query 'KeyPairs[].KeyName' --output text || return 1
+  tagged="$(aws resourcegroupstaggingapi get-resources --tag-filters Key=cf:poc,Values=true \
+    --query 'ResourceTagMappingList[].ResourceARN' --output text)" || return 1
+  if [[ -n "$tagged" ]]; then
+    warn "AWS $region tagging API still reports POC resources:"
+    printf '%s\n' "$tagged" | tr '\t' '\n' | sed 's/^/      /' >&2
     return 1
   fi
 }
 
+verify_aws_regions() {
+  local regions
+  regions="$(aws ec2 describe-regions --all-regions \
+    --query 'Regions[?OptInStatus==`opt-in-not-required` || OptInStatus==`opted-in`].RegionName' \
+    --output text)" || return 1
+  printf '%s\n' $regions | xargs -n 1 -P "$AWS_REGION_PARALLEL" \
+    "$ROOT/poc" _verify_region
+}
+
+cmd_verify_region() {
+  local region="$1"
+  AWS_REGION="$region" AWS_DEFAULT_REGION="$region" verify_aws_region "$region"
+}
+
+verify_clean_once() {
+  local bucket="$1" failed=0 active
+  verify_maintenance_gate || failed=1
+  verify_workflows_disabled || failed=1
+  active="$(active_runs)" || { warn "could not verify workflow quiescence"; return 1; }
+  if [[ -n "$active" ]]; then
+    warn "active resource-creating workflows remain:"
+    printf '%s\n' "$active" | sed 's/^/      /' >&2
+    failed=1
+  fi
+  verify_aws_regions || failed=1
+
+  AWS_REGION="$POC_AWS_REGION" AWS_DEFAULT_REGION="$POC_AWS_REGION" \
+    verify_absent "state bucket" "" find_state_bucket "$bucket" || failed=1
+  AWS_REGION="$POC_AWS_REGION" AWS_DEFAULT_REGION="$POC_AWS_REGION" \
+    verify_absent "CA secret" ResourceNotFoundException aws secretsmanager describe-secret \
+      --secret-id compute-factory/ssh-ca --query ARN --output text || failed=1
+  AWS_REGION="$POC_AWS_REGION" AWS_DEFAULT_REGION="$POC_AWS_REGION" \
+    verify_absent "CA public key parameter" ParameterNotFound aws ssm get-parameter \
+      --name /compute-factory/ssh-ca-pub --query Parameter.Name --output text || failed=1
+  verify_absent "IAM role cf-idp" NoSuchEntity aws iam get-role \
+    --role-name cf-idp --query Role.RoleName --output text || failed=1
+  verify_absent "IAM instance profile cf-idp" NoSuchEntity aws iam get-instance-profile \
+    --instance-profile-name cf-idp --query InstanceProfile.InstanceProfileName --output text || failed=1
+  AWS_REGION="$POC_AWS_REGION" AWS_DEFAULT_REGION="$POC_AWS_REGION" \
+    verify_absent "Azure reader secret" ResourceNotFoundException aws secretsmanager describe-secret \
+      --secret-id compute-factory/azure-reader --query ARN --output text || failed=1
+  verify_absent "Azure resource groups" "" az group list --query '[].name' -o tsv || failed=1
+  verify_absent "Azure tagged resources" "" az resource list \
+    --tag 'cf:poc=true' --query '[].id' -o tsv || failed=1
+  verify_dns_absent || failed=1
+  [[ "$failed" == 0 ]]
+}
+
+verify_clean() {
+  local bucket="$1" pass
+  for pass in $(seq 1 "$CLEAN_STABILITY_PASSES"); do
+    log "Verify pass $pass/$CLEAN_STABILITY_PASSES"
+    if ! verify_clean_once "$bucket"; then
+      printf '\n\033[31mNOT CLEAN: resources remain, workflows are active, or a required check failed.\033[0m\n'
+      return 1
+    fi
+    [[ "$pass" == "$CLEAN_STABILITY_PASSES" ]] || sleep "$CLEAN_STABILITY_SECONDS"
+  done
+  printf '\n\033[32mCLEAN: no Compute Factory resources found across enabled regions and stable verification passes.\033[0m\n'
+}
+
 cmd_down() {
+  acquire_poc_lock
   log "Preflight"
   require_tools dig
   terraform -chdir="$INFRA_DIR" init -input=false >/dev/null
   local bucket
   bucket="$(infra_out state_bucket)"; bucket="${bucket:-cf-tfstate-134584031874-apse2}"
 
-  log "Freeze: cancel pipeline runs, stop IDP"
-  cancel_runs
+  log "Freeze: stop IDP and gate resource workflows"
   save_caddy_data
+  set_maintenance_gate 1
   stop_idp
+  workflow_action disable
+  cancel_runs
 
   log "Destroy user VMs (Terraform, $PARALLEL_DESTROYS in parallel)"
   [[ -d "$PLATFORM_DIR/.git" ]] || git clone -q "git@github.com:$PLATFORM_REPO.git" "$PLATFORM_DIR"
@@ -807,5 +1073,7 @@ case "${1:-}" in
   deploy-idp)  shift; cmd_deploy_idp "$@" ;;
   prune-idp-images) shift; cmd_prune_idp_images "$@" ;;
   _destroy_vm) shift; cmd_destroy_vm "$@" ;;
+  _sweep_region) shift; cmd_sweep_region "$@" ;;
+  _verify_region) shift; cmd_verify_region "$@" ;;
   *) echo "usage: $0 up|down|status|deploy-idp [<image-id>]|prune-idp-images|set-password <user>|watch-bake <run-id>|logs [service] [since]|task <task-id>|run <run-id>" >&2; exit 2 ;;
 esac

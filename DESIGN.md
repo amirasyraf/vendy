@@ -719,7 +719,7 @@ compute-factory/                 # 4th repo: the "home" of the POC
    the Azure image gallery and the Azure reader secret.
 3. **GitHub wiring** (`gh variable set` / `gh secret set` on the builder and platform repos): `AWS_ROLE_ARN`,
    `TF_STATE_BUCKET`, `BACKSTAGE_URL`, `BACKSTAGE_TOKEN`. Reset `vms/` in the platform repo to empty.
-4. **Run in parallel**:
+4. **Enable the builder `bake.yml` and platform `stage.yml` workflows**, then run in parallel:
    - A. **Bake**: dispatch `bake.yml` once, retry run discovery without redispatching, then poll
      `gh run view --json status,conclusion` every 30 seconds. Status-read errors are retried (up to
      10 consecutive errors); monitoring has a one-hour limit. Only `completed` + `success` counts
@@ -759,19 +759,25 @@ Order matters: stop anything that could create resources, then destroy what Terr
 then sweep anything else, then verify.
 
 1. **Freeze**:
-   - cancel every queued or in-progress run in the platform and builder repos (`gh run list` / `gh run cancel`),
-     so no VM or bake starts during teardown;
-   - stop the Backstage containers, so no new requests come in.
+    - stop the IDP host at the EC2 layer, so no new requests can dispatch work;
+    - set the shared `CF_POC_MAINTENANCE=1` gate (both workflows honor it), disable the builder `bake.yml`
+      and platform `stage.yml` workflows, then cancel every queued or
+      in-progress run discovered through paginated GitHub API results;
+    - wait until both repositories report zero active runs. If workflow disabling, cancellation,
+      enumeration or quiescence verification fails, stop without sweeping and do not claim `CLEAN`.
+      The workflows remain disabled until a later `up` re-enables them;
 2. **Destroy user VMs**:
    - for every `vms/*/*/terraform.tfstate` in the state bucket, run `terraform destroy` locally from the platform
      repo checkout with that state key;
    - run them in parallel (`xargs -P 5`), so time doesn't grow with the number of VMs;
    - this uses the same platform root module as provisioning, so it works for any platform added later.
-3. **Sweep leftovers by tag** (catches failed provisions, interrupted bakes, missing state):
+3. **Sweep leftovers by tag** (catches failed provisions, interrupted bakes, missing state; AWS regions
+   are processed in bounded parallel workers):
    - deregister AMIs tagged `cf:poc=true` and delete their snapshots;
    - terminate instances tagged `cf:poc=true`, including Packer build instances (Packer `run_tags`);
-   - delete tagged detached volumes, available network interfaces and EIPs, plus leftover `packer_*` key pairs and security groups;
-   - remove the exact-name `cf-idp` instance, EIP, security group and key pair as a fallback when a partial apply created them before tags/state were recorded;
+   - delete tagged detached volumes, available network interfaces and EIPs;
+   - remove the exact-name `cf-idp` instance, EIP, security group and `cf-idp-admin` key pair as a fallback when a partial apply created them before tags/state were recorded;
+   - do not delete untagged `packer_*` resources by name; report them and fail closed instead of risking unrelated-resource deletion;
    - delete Azure resource groups tagged `cf:poc=true` except infra's (VMs, Packer build groups), then
      every gallery image definition's versions (Packer-published, outside Terraform; a definition can't be
       deleted while it has versions). Log each version before waiting for Azure to delete it. A
@@ -783,16 +789,20 @@ then sweep anything else, then verify.
    it holds nothing but those automatic network watchers).
 6. **GitHub cleanup**: delete the repo variables and secrets set in `up`, and commit an empty `vms/`.
 7. **Verify**:
-   - check the tagged EC2 resources, available network interfaces and EIPs, account-owned state bucket,
-     named AWS secrets, SSM parameter, IAM role/profile, and exact-name `cf-idp` security group/key pair;
-     AWS point lookups must explicitly report not found to count as absent;
-   - check for Azure resource groups tagged `cf:poc=true`, `NetworkWatcherRG`, and the IDP DNS record;
-   - if a required lookup fails or reports a remaining resource, report the affected check and exit
-     nonzero instead of printing `CLEAN`. The AWS Resource Groups Tagging API is informational
-     because it can lag after deletion.
+    - check the tagged EC2 resources, available network interfaces and EIPs across every enabled AWS region,
+      account-owned state bucket,
+      named AWS secrets, SSM parameter, IAM role/profile, and exact-name `cf-idp` security group/key pair;
+      AWS point lookups must explicitly report not found to count as absent;
+    - check for an empty Azure resource-group/resource inventory and the IDP DNS record;
+    - repeat the full workflow/cloud/DNS verification for stable passes. If a required lookup fails or reports a remaining resource, report the affected check and exit
+      nonzero instead of printing `CLEAN`. The AWS Resource Groups Tagging API is required to
+      report no tagged resources; eventual-consistency records therefore fail closed rather than
+      being treated as proof of absence.
 
-`down` tolerates partial state: every step continues if its target is already gone, so it also cleans up
-after a failed `up`. Running it twice is harmless.
+`down` tolerates partial cloud state: every cleanup target continues if it is already gone, so it also
+cleans up after a failed `up`. The freeze and verification gates are fail-closed; a run that cannot
+prove workflow quiescence or absence must be rerun after the reported blocker is resolved. Running a
+successful `down` twice is harmless.
 
 ### 12.4 `./poc status`
 
@@ -806,7 +816,8 @@ pipelines), so you can check before or after `up`/`down`.
   Azure has no provider default tags: every Azure resource and resource group sets the `cf:*` tags
   itself (Packer `azure_tags` tags its temporary build group).
 - No resource may be created outside Terraform or Packer, apart from Packer's temporary key pairs and
-  security groups, which the sweep handles.
+  security groups. Teardown detects any remaining named Packer temporary resources and fails closed
+  rather than deleting by an unowned name prefix.
 - Nothing outside AWS, the Azure subscription's `cf:poc` resource groups, the Cloudflare `idp` record and
   the GitHub variables, secrets and `vms/` is touched, so those are the only things `down` has to clean.
   The Azure identities and `AZURE_*` variables (9) persist like the AWS OIDC role.
