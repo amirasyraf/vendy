@@ -71,13 +71,16 @@ no real ticket and performs no approval. See `CONTRACTS.md` §8 and the IDP READ
 Requirements: `terraform`, `gh` (authenticated), `aws` (profile `amirasyraf`), `az` (logged in to
 subscription `74b39a79-…`, e.g. `azsp`), the `cf-admin-local` service principal's `ARM_*` variables
 (`~/.zshrc`; Terraform azurerm needs the `.pfx` certificate), the gitignored Azure reader certificate
-`.poc-azure-reader.pem`, `docker` (buildx, for the arm64 IDP image), `jq`, `ssh` with `~/.ssh/id_ed25519`.
+`.poc-azure-reader.pem`, `docker` (buildx, for the arm64 IDP image), `jq`, `ssh` with `~/.ssh/id_ed25519`,
+and `dig` for teardown DNS verification.
 The Azure identities and `AZURE_*` repo variables are one-time setup that survives `down` (DESIGN.md §9).
 
-`down` is safe to run repeatedly and after a failed `up`. Everything in AWS and Azure is tagged
-`cf:poc=true`; `down` ends by checking that nothing with that tag remains on either cloud. It also
-removes `NetworkWatcherRG`, which Azure creates untagged with the first VNet, while it holds only those
-automatic watchers. `up` checks the one-time Azure setup first and stops if it is missing.
+`down` is safe to rerun after a failed teardown or `up`. Azure gallery image deletion can take
+several minutes; teardown prints the image version before it waits. The final AWS, Azure and DNS
+checks must all confirm absence before `down` prints `CLEAN`. If a resource remains or a lookup
+fails, it reports the affected check and exits nonzero. It removes `NetworkWatcherRG`, which Azure
+creates untagged with the first VNet, only while it holds only automatic watchers. `up` checks the
+one-time Azure setup first and stops if it is missing.
 
 The `idp.amirasyraf.dev` DNS record lives in `~/projects/cloudflare/amirasyraf.dev/idp.tf` and is only
 applied with `-target` by `./poc`.

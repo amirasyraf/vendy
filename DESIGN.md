@@ -768,7 +768,8 @@ then sweep anything else, then verify.
    - delete leftover `packer_*` key pairs and security groups;
    - delete Azure resource groups tagged `cf:poc=true` except infra's (VMs, Packer build groups), then
      every gallery image definition's versions (Packer-published, outside Terraform; a definition can't be
-     deleted while it has versions).
+      deleted while it has versions). Log each version before waiting for Azure to delete it. A
+      missing gallery is fine; a failed gallery lookup or version deletion stops teardown.
 4. **DNS**: targeted apply removing the `idp` record.
 5. **`terraform -chdir=infra destroy`**: IDP EC2/EIP, CA secret, state bucket (force-destroy), tokens,
    Azure gallery and reader secret; then a final sweep of anything tagged `cf:poc=true` on both clouds,
@@ -776,10 +777,12 @@ then sweep anything else, then verify.
    it holds nothing but those automatic network watchers).
 6. **GitHub cleanup**: delete the repo variables and secrets set in `up`, and commit an empty `vms/`.
 7. **Verify**:
-   - the Resource Groups Tagging API (`get-resources --tag-filters Key=cf:poc,Values=true`) returns nothing in
-     ap-southeast-2;
-   - no instances, AMIs or snapshots tagged `cf:poc` remain, and no Azure resource group tagged `cf:poc=true`;
-   - print CLEAN, or list what's left and exit non-zero.
+   - check the tagged EC2 resources, account-owned state bucket, named AWS secrets, SSM parameter and
+     IAM role; AWS point lookups must explicitly report not found to count as absent;
+   - check for Azure resource groups tagged `cf:poc=true`, `NetworkWatcherRG`, and the IDP DNS record;
+   - if a required lookup fails or reports a remaining resource, report the affected check and exit
+     nonzero instead of printing `CLEAN`. The AWS Resource Groups Tagging API is informational
+     because it can lag after deletion.
 
 `down` tolerates partial state: every step continues if its target is already gone, so it also cleans up
 after a failed `up`. Running it twice is harmless.

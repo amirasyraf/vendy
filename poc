@@ -408,11 +408,18 @@ cmd_destroy_vm() {
   rm -rf "$TF_DATA_DIR"
 }
 
-destroy_vms() {
+# Match an account-owned bucket by exact name. HeadBucket cannot distinguish absent from inaccessible.
+find_state_bucket() {
   local bucket="$1"
-  aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1 || { info "no state bucket; skipping"; return 0; }
-  local keys
-  keys="$(aws s3api list-objects-v2 --bucket "$bucket" --prefix vms/ --query 'Contents[].Key' --output text 2>/dev/null | tr '\t' '\n' | grep '/terraform.tfstate$' || true)"
+  aws s3api list-buckets --prefix "$bucket" --query "Buckets[?Name=='$bucket'].Name" --output text
+}
+
+destroy_vms() {
+  local bucket="$1" owned keys
+  owned="$(find_state_bucket "$bucket")" || die "could not check for state bucket $bucket"
+  [[ -n "$owned" ]] || { info "no state bucket; skipping"; return 0; }
+  keys="$(aws s3api list-objects-v2 --bucket "$bucket" --prefix vms/ --query 'Contents[].Key' --output text \
+    | tr '\t' '\n' | awk '/\/terraform\.tfstate$/')" || die "could not list VM state in $bucket"
   [[ -n "$keys" ]] || { info "no VMs"; return 0; }
   echo "$keys" | awk -F/ -v b="$bucket" '{print b, $2, $3}' \
     | xargs -n 3 -P "$PARALLEL_DESTROYS" "$0" _destroy_vm
@@ -477,11 +484,22 @@ sweep_azure() {
 
 # Packer publishes gallery image versions outside Terraform; an image definition cannot be deleted with them.
 delete_image_versions() {
-  local i v
-  az group exists -n cf-images 2>/dev/null | grep -q true || return 0
-  for i in $(az sig image-definition list -g cf-images -r cfimages --query '[].name' -o tsv 2>/dev/null); do
-    for v in $(az sig image-version list -g cf-images -r cfimages -i "$i" --query '[].name' -o tsv 2>/dev/null); do
-      az sig image-version delete -g cf-images -r cfimages -i "$i" -e "$v" && info "deleted image version $i/$v"
+  local exists gallery definitions versions i v
+  exists="$(az group exists -n cf-images -o tsv)" || die "could not check for Azure resource group cf-images"
+  case "$exists" in
+    false) return 0 ;;
+    true) ;;
+    *) die "unexpected Azure response while checking for cf-images: $exists" ;;
+  esac
+  gallery="$(az sig list -g cf-images --query "[?name=='cfimages'].name" -o tsv)" || die "could not check for Azure gallery cfimages"
+  [[ -n "$gallery" ]] || return 0
+  definitions="$(az sig image-definition list -g cf-images -r cfimages --query '[].name' -o tsv)" || die "could not list Azure gallery image definitions"
+  for i in $definitions; do
+    versions="$(az sig image-version list -g cf-images -r cfimages -i "$i" --query '[].name' -o tsv)" || die "could not list Azure gallery versions for $i"
+    for v in $versions; do
+      info "deleting Azure gallery image version $i/$v (can take several minutes)"
+      az sig image-version delete -g cf-images -r cfimages -i "$i" -e "$v" || die "could not delete Azure gallery image version $i/$v"
+      info "deleted Azure gallery image version $i/$v"
     done
   done
 }
@@ -527,38 +545,67 @@ sweep_infra_orphans() {
   fi
 }
 
+# List queries must succeed and return no matches. Point lookups must return their specific
+# not-found error; permission, credential, and network failures are not evidence of absence.
+verify_absent() {
+  local label="$1" not_found="$2" result
+  shift 2
+  if result="$("$@" 2>&1)"; then
+    [[ -z "$result" ]] && return 0
+    warn "$label still present (or lookup returned unexpected output): $result"
+  elif [[ -n "$not_found" && "$result" == *"An error occurred ($not_found) when calling the "* ]]; then
+    return 0
+  else
+    warn "could not verify $label: $result"
+  fi
+  return 1
+}
+
+verify_dns_absent() {
+  local reply
+  if ! reply="$(dig @1.1.1.1 "$DOMAIN" A +noall +comments +answer +time=3 +tries=1 2>&1)"; then
+    warn "could not verify DNS for $DOMAIN: $reply"
+  elif [[ "$reply" != *"status: NOERROR,"* && "$reply" != *"status: NXDOMAIN,"* ]]; then
+    warn "could not verify DNS for $DOMAIN: $reply"
+  elif [[ "$reply" != *"ANSWER: 0,"* ]]; then
+    warn "DNS $DOMAIN still resolves (may be cached; TTL 60s)"
+  else
+    return 0
+  fi
+  return 1
+}
+
 verify_clean() {
-  local left=() x
-  x="$(aws ec2 describe-instances --filters Name=tag:cf:poc,Values=true Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].InstanceId' --output text)"; [[ -n "$x" ]] && left+=("instances: $x")
-  x="$(aws ec2 describe-images --owners self --filters Name=tag:cf:poc,Values=true --query 'Images[].ImageId' --output text)"; [[ -n "$x" ]] && left+=("AMIs: $x")
-  x="$(aws ec2 describe-snapshots --owner-ids self --filters Name=tag:cf:poc,Values=true --query 'Snapshots[].SnapshotId' --output text)"; [[ -n "$x" ]] && left+=("snapshots: $x")
-  x="$(aws ec2 describe-volumes --filters Name=tag:cf:poc,Values=true --query 'Volumes[].VolumeId' --output text)"; [[ -n "$x" ]] && left+=("volumes: $x")
-  x="$(aws ec2 describe-security-groups --filters Name=tag:cf:poc,Values=true --query 'SecurityGroups[].GroupId' --output text)"; [[ -n "$x" ]] && left+=("security groups: $x")
-  x="$(aws ec2 describe-addresses --filters Name=tag:cf:poc,Values=true --query 'Addresses[].PublicIp' --output text)"; [[ -n "$x" ]] && left+=("EIPs: $x")
-  aws s3api head-bucket --bucket cf-tfstate-134584031874-apse2 >/dev/null 2>&1 && left+=("state bucket")
-  aws secretsmanager describe-secret --secret-id compute-factory/ssh-ca >/dev/null 2>&1 && left+=("CA secret")
-  aws ssm get-parameter --name /compute-factory/ssh-ca-pub >/dev/null 2>&1 && left+=("CA public key parameter")
-  aws iam get-role --role-name cf-idp >/dev/null 2>&1 && left+=("IAM role cf-idp")
-  aws secretsmanager describe-secret --secret-id compute-factory/azure-reader >/dev/null 2>&1 && left+=("Azure reader secret")
-  x="$(az group list --query "[?tags.\"cf:poc\"=='true'].name" -o tsv)"; [[ -n "$x" ]] && left+=("Azure resource groups: $(echo $x)")
-  az group exists -n NetworkWatcherRG 2>/dev/null | grep -q true && left+=("Azure NetworkWatcherRG")
-  [[ -n "$(dig +short "$DOMAIN" @1.1.1.1 2>/dev/null || true)" ]] && left+=("DNS $DOMAIN (may be cache; TTL 60s)")
+  local bucket="$1" failed=0 x
+  verify_absent "instances" "" aws ec2 describe-instances --filters Name=tag:cf:poc,Values=true Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].InstanceId' --output text || failed=1
+  verify_absent "AMIs" "" aws ec2 describe-images --owners self --filters Name=tag:cf:poc,Values=true --query 'Images[].ImageId' --output text || failed=1
+  verify_absent "snapshots" "" aws ec2 describe-snapshots --owner-ids self --filters Name=tag:cf:poc,Values=true --query 'Snapshots[].SnapshotId' --output text || failed=1
+  verify_absent "volumes" "" aws ec2 describe-volumes --filters Name=tag:cf:poc,Values=true --query 'Volumes[].VolumeId' --output text || failed=1
+  verify_absent "security groups" "" aws ec2 describe-security-groups --filters Name=tag:cf:poc,Values=true --query 'SecurityGroups[].GroupId' --output text || failed=1
+  verify_absent "EIPs" "" aws ec2 describe-addresses --filters Name=tag:cf:poc,Values=true --query 'Addresses[].PublicIp' --output text || failed=1
+  verify_absent "state bucket" "" find_state_bucket "$bucket" || failed=1
+  verify_absent "CA secret" ResourceNotFoundException aws secretsmanager describe-secret --secret-id compute-factory/ssh-ca --query ARN --output text || failed=1
+  verify_absent "CA public key parameter" ParameterNotFound aws ssm get-parameter --name /compute-factory/ssh-ca-pub --query Parameter.Name --output text || failed=1
+  verify_absent "IAM role cf-idp" NoSuchEntity aws iam get-role --role-name cf-idp --query Role.RoleName --output text || failed=1
+  verify_absent "Azure reader secret" ResourceNotFoundException aws secretsmanager describe-secret --secret-id compute-factory/azure-reader --query ARN --output text || failed=1
+  verify_absent "Azure resource groups" "" az group list --query "[?tags.\"cf:poc\"=='true' || name=='NetworkWatcherRG'].name" -o tsv || failed=1
+  verify_dns_absent || failed=1
 
   # Informational: anything else the tagging API still reports (can lag a few minutes behind deletes).
   x="$(aws resourcegroupstaggingapi get-resources --tag-filters Key=cf:poc,Values=true --query 'ResourceTagMappingList[].ResourceARN' --output text 2>/dev/null | tr '\t' '\n' | grep -v ':instance/' || true)"
   [[ -n "$x" ]] && info "tagging API still lists (eventual consistency, re-check with ./poc status):" && echo "$x" | sed 's/^/      /'
 
-  if [[ ${#left[@]} -eq 0 ]]; then
-    printf '\n\033[32mCLEAN: no Compute Factory resources remain.\033[0m\n'
+  if [[ "$failed" == 0 ]]; then
+    printf '\n\033[32mCLEAN: no Compute Factory resources found by the required checks.\033[0m\n'
   else
-    printf '\n\033[31mNOT CLEAN:\033[0m\n'; printf '  - %s\n' "${left[@]}"
+    printf '\n\033[31mNOT CLEAN: resources remain or a required check failed; see warnings above.\033[0m\n'
     return 1
   fi
 }
 
 cmd_down() {
   log "Preflight"
-  require_tools
+  require_tools dig
   terraform -chdir="$INFRA_DIR" init -input=false >/dev/null
   local bucket
   bucket="$(infra_out state_bucket)"; bucket="${bucket:-cf-tfstate-134584031874-apse2}"
@@ -600,7 +647,7 @@ cmd_down() {
   rm -rf "$GEN/idp.env" "$GEN/tf-vms"
 
   log "Verify"
-  verify_clean
+  verify_clean "$bucket"
 }
 
 # ---------------------------------------------------------------- users
