@@ -910,7 +910,10 @@ so you can check before or after `up`/`down`.
 ### 12.5 Rules this puts on the rest of the design
 
 - Every Terraform AWS provider (`infra`, `infra/images` and `terraform/platforms/aws`) sets `default_tags { cf:poc = "true" }`.
-  Packer sets `tags`, `run_tags`, `run_volume_tags` and `snapshot_tags` with `cf:poc = "true"`.
+  Packer sets `tags`, `run_tags`, `run_volume_tags` and `snapshot_tags` with `cf:poc = "true"` and
+  `cf:bake-run = <run id>-<attempt>-<matrix row>`. A failed, cancelled or timed-out bake job deletes its
+  own build instance, `packer_*` security group and key pair, or Azure `pkr-*` group by that tag
+  (`compute-factory-builder/scripts/cleanup-build.sh`); teardown remains the backstop.
   Azure has no provider default tags: every Azure resource and resource group sets the `cf:*` tags
   itself (Packer `azure_tags` tags its temporary build group).
 - No resource may be created outside Terraform or Packer, apart from Packer's temporary key pairs and
