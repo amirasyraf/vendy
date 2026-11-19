@@ -5,6 +5,7 @@ infra/images/.terraform/
 infra/images/*.tfstate*
 infra/.terraform.lock.hcl.bak
 .generated/
+__pycache__/
 .poc-users
 .poc-passwords*
 .poc-azure-reader.pem

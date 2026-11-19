@@ -688,7 +688,8 @@ retains the CA, images, and Azure gallery. The host's database is not carried ac
 ```
 vendy/                           # 4th repo: the "home" of the POC
   DESIGN.md
-  poc                            # bash entrypoint; see README.md for commands
+  poc                            # Python 3.10+ entrypoint; see README.md for commands
+  pocctl/                        #   implementation (stdlib + PyYAML); drives the aws/az/gh/terraform/ssh CLIs
   .poc.env                       # gitignored: Backstage PAT (from 9)
   .poc-users                     # gitignored: username:scrypt-hash lines (./poc set-password)
   .poc-passwords                 # gitignored: plaintext POC logins, never deployed
@@ -726,8 +727,9 @@ vendy/                           # 4th repo: the "home" of the POC
 - The infra state stays local because a remote state bucket would have to survive `down`. It's
   disposable like everything else.
 
-`up`, `down`, IDP deploy and registry maintenance share a per-user host lock across checkouts. An
-inherited OS file descriptor keeps the lock held until surviving workers exit. Other hosts are not
+`up`, `down`, IDP deploy and registry maintenance share a per-user host lock across checkouts. Child
+processes inherit the lock's file descriptor, so it stays held until surviving children exit;
+background monitoring runs in threads and stops with the command. Other hosts are not
 covered: never run competing lifecycle or Terraform operations from a different machine. Lifecycle
 commands use the default workspace and reject ambient `TF_CLI_ARGS*` / `TF_VAR_*` overrides.
 
@@ -755,14 +757,16 @@ commands use the default workspace and reject ambient `TF_CLI_ARGS*` / `TF_VAR_*
    snapshots, gallery versions); a failed prune only warns.
 5. **IDP**: wire `TF_STATE_BUCKET`, `BACKSTAGE_URL` and `BACKSTAGE_TOKEN` in the platform repo.
    Wait for host initialization, apply the targeted Cloudflare DNS record, restore the TLS backup
-   unless Caddy is already running, and deploy from a temporary clone of IDP `main`. Sibling checkouts
-   are not rebased or used as bootstrap sources. Require HTTP 200 and authenticated catalog access/refresh
-   before opening `stage.yml` and the platform gate. The IDP does not consume golden images, so a
+   unless Caddy is already running, and deploy from a temporary clone of IDP `main`; the image builds
+   locally from that clone while the host initializes (`idp-build.log`). Sibling checkouts are not
+   rebased or used as bootstrap sources. Require HTTP 200 and authenticated catalog access/refresh,
+   connecting to the new host's IP rather than through local DNS, before opening `stage.yml` and the
+   platform gate. The IDP does not consume golden images, so a
    needed bake runs in the background during step 5's wiring and bootstrap; the platform gate opens
    only after both the IDP checks and the bake verification succeed.
 
 `up` never clears inventory and has no force option. Failed bootstrap retains resources; check
-`./poc status` and `.generated/logs/{images-apply,infra-apply,bake,idp}.log`. An exact dispatch ID is saved in
+`./poc status` and `.generated/logs/{images-apply,infra-apply,bake,idp,idp-build}.log`. An exact dispatch ID is saved in
 `.generated/bake-run-id`. `./poc watch-bake <run-id>` only monitors the run: it returns 0 for success,
 1 for a completed non-success conclusion, and 2 if the outcome is unknown. The monitor polls every
 30 seconds with a two-hour limit (bake jobs are capped at 60 minutes) and stops after 10 consecutive failed status reads. It does not
@@ -814,14 +818,16 @@ for garbage collection but the running application stays up.
    versions only from the verified POC-owned (`cf:module=images`) gallery resource group.
    `NetworkWatcherRG` is unowned and left alone. AWS named fallbacks require ownership tags, and
    untagged Packer-name candidates are reported, never deleted.
-4. **Shared infra, image tier and DNS**: remove the targeted Cloudflare record. Destroy `infra/` only
+4. **Shared infra, image tier and DNS**: remove the targeted Cloudflare record (concurrently with the
+   step 3 sweeps). Destroy `infra/` only
    when the VM bucket can safely be removed. Destroy `infra/images` (CA and gallery) only when images
    are not kept and the Azure VM/build groups and gallery versions are gone; it uses the Azure
-   certificate defaults. Independent AWS/Azure sweeps still apply when Terraform cannot complete; the
+   certificate defaults. The two roots share no Terraform references, so their destroys run
+   concurrently. Independent AWS/Azure sweeps still apply when Terraform cannot complete; the
    CA fallback runs only when the image tier is being removed. Do not force-empty the state bucket.
    Retry Terraform state reconciliation of both roots after fallback cleanup when possible.
 5. **Verify before GitHub cleanup**: require empty local `infra/` state (and `infra/images` state unless
-   images are kept). Run Sydney AWS, Azure POC-tag and DNS checks with workflow quiescence checked
+   images are kept). Run Sydney AWS, Azure POC-tag and DNS checks (concurrently) with workflow quiescence checked
    before and after. The first complete successful pass is enough; retry failures up to six attempts
    total, with starts at least 30 seconds apart. Check both service inventories and the AWS Resource
    Groups Tagging API. Batch exact ID lookups per supported EC2 resource type and ignore stale tag
