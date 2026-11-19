@@ -690,7 +690,7 @@ require_image_tools() {
 cmd_up() (
   local resume="${1:-}"
   log "Preflight"
-  require_image_tools docker scp dig
+  require_image_tools docker scp
   if ! docker info >/dev/null 2>&1 || ! docker buildx version >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
     die "Docker, buildx and Compose must be usable"
   fi
@@ -1390,11 +1390,13 @@ verify_absent() {
 
 verify_dns_absent() {
   local reply
-  if ! reply="$(dig @1.1.1.1 "$DOMAIN" A +noall +comments +answer +time=3 +tries=1 2>&1)"; then
+  # DNS over HTTPS: networks such as the Netskope proxy block port 53 to public resolvers.
+  if ! reply="$(curl -fsS --max-time 5 -H 'accept: application/dns-json' \
+    "https://cloudflare-dns.com/dns-query?name=$DOMAIN&type=A" 2>&1)"; then
     warn "could not verify DNS for $DOMAIN: $reply"
-  elif [[ "$reply" != *"status: NOERROR,"* && "$reply" != *"status: NXDOMAIN,"* ]]; then
+  elif ! jq -e '.Status == 0 or .Status == 3' <<<"$reply" >/dev/null 2>&1; then
     warn "could not verify DNS for $DOMAIN: $reply"
-  elif [[ "$reply" != *"ANSWER: 0,"* ]]; then
+  elif ! jq -e '(.Answer // []) | length == 0' <<<"$reply" >/dev/null; then
     warn "DNS $DOMAIN still resolves (may be cached; TTL 60s)"
   else
     return 0
@@ -1632,7 +1634,7 @@ cmd_down() (
     *) die "usage: ./poc down [--keep-images]" ;;
   esac
   log "Preflight"
-  require_tools dig
+  require_tools
   require_split_layout
   if [[ ! "$PARALLEL_DESTROYS" =~ ^[1-9][0-9]?$ ]] || (( PARALLEL_DESTROYS > 20 )); then
     die "PARALLEL_DESTROYS must be between 1 and 20"
