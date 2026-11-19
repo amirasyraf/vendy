@@ -1,4 +1,4 @@
-# IDP host: single EC2 running Caddy + Backstage + Postgres via Docker Compose (deployed by compute-factory-idp/deploy/deploy.sh).
+# IDP host: single EC2 running Caddy + Backstage + Postgres via Docker Compose (deployed by vendy-idp/deploy/deploy.sh).
 data "aws_ssm_parameter" "ubuntu_arm64" {
   name = "/aws/service/canonical/ubuntu/server/26.04/stable/current/arm64/hvm/ebs-gp3/ami-id"
 }
@@ -14,7 +14,7 @@ resource "aws_key_pair" "admin" {
 
 resource "aws_security_group" "idp" {
   name        = "cf-idp"
-  description = "Compute Factory IDP: SSH + HTTP(S)"
+  description = "Compute Factory IDP: SSH + HTTP(S)" # Existing security group description; changing it forces replacement.
   vpc_id      = data.aws_vpc.default.id
 }
 

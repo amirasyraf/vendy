@@ -13,7 +13,7 @@ resource "azurerm_shared_image_gallery" "images" {
   name                = "cfimages"
   resource_group_name = azurerm_resource_group.images.name
   location            = azurerm_resource_group.images.location
-  description         = "Compute Factory golden images (POC)"
+  description         = "Vendy golden images (POC)"
   tags                = local.azure_tags
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compute Factory POC lifecycle.
+# Vendy POC lifecycle.
 #   ./poc up       create everything (assumes a clean slate apart from a kept SSH CA + golden images)
 #   ./poc up --resume <run-id>   finish bootstrap on existing infra using one successful bake
 #   ./poc up --images-only   create the SSH CA/gallery if missing, bake every images.yaml row, prune old images
@@ -20,10 +20,10 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 PROJECTS="$(dirname "$ROOT")"
 OWNER="amirasyraf"
 DOMAIN="idp.amirasyraf.dev"
-BUILDER_REPO="$OWNER/compute-factory-builder"
-PLATFORM_REPO="$OWNER/compute-factory-platform"
-PLATFORM_DIR="$PROJECTS/compute-factory-platform"
-IDP_DIR="$PROJECTS/compute-factory-idp"
+BUILDER_REPO="$OWNER/vendy-builder"
+PLATFORM_REPO="$OWNER/vendy-platform"
+PLATFORM_DIR="$PROJECTS/vendy-platform"
+IDP_DIR="$PROJECTS/vendy-idp"
 CF_DNS_DIR="$HOME/projects/cloudflare/amirasyraf.dev"
 INFRA_DIR="$ROOT/infra"
 IMAGES_DIR="$INFRA_DIR/images" # SSH CA + Azure gallery; survives down --keep-images
@@ -202,7 +202,7 @@ verify_maintenance_gate() {
 
 ensure_repos() {
   local r
-  for r in compute-factory-idp compute-factory-builder compute-factory-platform; do
+  for r in vendy-idp vendy-builder vendy-platform; do
     [[ -e "$PROJECTS/$r/.git" ]] || git clone -q "git@github.com:$OWNER/$r.git" "$PROJECTS/$r"
   done
 }
@@ -661,7 +661,7 @@ existing_idp_ip() {
 cmd_deploy_idp() {
   [[ $# -le 1 ]] || die "usage: ./poc deploy-idp [<sha256:image-id>]"
   if [[ $# -eq 1 && ! "$1" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-    die "pass the full image ID printed by compute-factory-idp/deploy/build.sh"
+    die "pass the full image ID printed by vendy-idp/deploy/build.sh"
   fi
   local tool ip
   for tool in terraform aws docker curl jq ssh scp; do
@@ -715,7 +715,7 @@ cmd_up() (
   ensure_repos
   tmp="$(mktemp -d "$GEN/up.XXXXXX")"
   trap 'rm -rf "$tmp"' EXIT
-  git clone -q --depth 1 --branch main "git@github.com:$OWNER/compute-factory-idp.git" "$tmp/idp"
+  git clone -q --depth 1 --branch main "git@github.com:$OWNER/vendy-idp.git" "$tmp/idp"
 
   if [[ -n "$resume" ]]; then
     log "Check existing bootstrap"

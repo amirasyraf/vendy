@@ -6,7 +6,7 @@ resource "tls_private_key" "ssh_ca" {
 
 resource "aws_secretsmanager_secret" "ssh_ca" {
   name                    = "compute-factory/ssh-ca"
-  description             = "Compute Factory POC SSH user CA (OpenSSH private key)"
+  description             = "Vendy POC SSH user CA (OpenSSH private key)"
   recovery_window_in_days = 0 # delete immediately so the next `up` can reuse the name
 }
 

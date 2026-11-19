@@ -1,4 +1,4 @@
-# Compute Factory — POC Design
+# Vendy — POC Design
 
 Status: draft for review · Date: 2026-11-15
 
@@ -41,7 +41,7 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
 | AWS account | `amirasyraf` profile, `134584031874` (one AWS account for all AWS resources; Azure is in section 2's Azure rows) |
 | Region | `ap-southeast-2` (Sydney) |
 | GHA -> AWS | Existing OIDC role `arn:aws:iam::134584031874:role/github-aws-role` (trusts `repo:amirasyraf/*`). No static keys. |
-| Repos (user `amirasyraf`; private except `compute-factory-platform` and `compute-factory-builder`, public for free Actions minutes and checked for committed secrets first) | `compute-factory` (this doc, `./poc`, shared AWS infra), `compute-factory-idp`, `compute-factory-builder`, `compute-factory-platform` |
+| Repos (user `amirasyraf`; root private, IDP, builder and platform public) | `vendy` (this doc, `./poc`, shared AWS infra), `vendy-idp`, `vendy-builder`, `vendy-platform` |
 | Lifecycle | `./poc up` creates everything; `./poc down` removes everything, including user VMs (section 12) |
 | Tagging | Every AWS resource, from Terraform, Packer or anywhere else, gets the tag `cf:poc=true`; `down` checks that none remain |
 | IDP | Backstage (latest, v1.56.x at time of writing) on a single EC2, Docker Compose, Caddy TLS, `idp.amirasyraf.dev` |
@@ -70,17 +70,17 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
      |     (retries, retry/skip, run state in its DB)            |  |  (pipeline uses its own short cert)
      |  5. reads catalog (vms/*/catalog-info.yaml)               |  |
      v                                                           v  |
- GitHub: compute-factory-platform                         GHA runner (OIDC -> AWS, + Azure)
+ GitHub: vendy-platform                         GHA runner (OIDC -> AWS, + Azure)
    - workflow: stage.yml (one stage per dispatch)            3. terraform apply (S3 state)
    - vms/<name>/  (inventory, written by stages)             4. fry stages (ansible), commit status
                                                                 to vms/<name>/, ping Backstage refresh
- GitHub: compute-factory-builder
+ GitHub: vendy-builder
    - push to main -> packer + ansible -> golden AMI / gallery version -------^ (Terraform looks it up)
 ```
 
 ### Key design choice: Git is the VM inventory
 
-Each VM has a folder `vms/<name>/` in `compute-factory-platform` that the stage workflow writes:
+Each VM has a folder `vms/<name>/` in `vendy-platform` that the stage workflow writes:
 
 - `catalog-info.yaml`: the single desired-configuration source, a Backstage `Resource` entity with
   `spec.owner`, `spec.compute`, `spec.configuration`, optional `spec.billing` and `spec.cloudTags`.
@@ -130,7 +130,7 @@ platform-controlled `Name`, `cost_center`, `project_code`, `cf:`, `aws:` or `bil
 validation and consumers; Backstage's permissive custom-spec storage is not itself validation.
 
 Backstage registers one `Location` entity named `cf-vms` with a glob target,
-`https://github.com/amirasyraf/compute-factory-platform/blob/main/vms/*/catalog-info.yaml`,
+`https://github.com/amirasyraf/vendy-platform/blob/main/vms/*/catalog-info.yaml`,
 so new VMs show up automatically. When a VM folder is deleted, `catalog.orphanStrategy: delete`
 removes its entity.
 
@@ -142,7 +142,7 @@ Trade-off: concurrent stage commits for different VMs can race, so the commit st
 
 ## 4. Repositories
 
-### 4.1 `compute-factory-builder` (Bake)
+### 4.1 `vendy-builder` (Bake)
 
 ```
 packer/
@@ -202,7 +202,7 @@ Platform agnosticism: Packer `-only=<source>.<os>` comes from the matrix. Adding
 adding a source file, a matrix row and its case in the workflow's source selector. Ansible roles branch on `ansible_os_family` (`tasks/linux.yml`,
 `tasks/windows.yml`).
 
-### 4.2 `compute-factory-platform` (Provision + Fry)
+### 4.2 `vendy-platform` (Provision + Fry)
 
 ```
 terraform/
@@ -314,7 +314,7 @@ allows 40 minutes).
 - State: S3 bucket `cf-tfstate-134584031874-apse2`, key `vms/<platform>/<name>/terraform.tfstate`, S3 native
   locking (`use_lockfile = true`). The workflow passes the key through `-backend-config`.
 
-### 4.3 `compute-factory-idp` (Backstage)
+### 4.3 `vendy-idp` (Backstage)
 
 ```
 backstage/                     # npx @backstage/create-app@latest
@@ -326,7 +326,7 @@ backstage/                     # npx @backstage/create-app@latest
   catalog/org.yaml             # User + Group (team) entities = who may log in and their teams
   catalog/locations.yaml       # Location `cf-vms` (glob over the platform repo's vms/*/catalog-info.yaml)
   catalog/templates/ssh-cert/  # "Get SSH certificate" template
-deploy/                        # (the IDP EC2 itself is created by the compute-factory repo's infra/, see 12)
+deploy/                        # (the IDP EC2 itself is created by the vendy repo's infra/, see 12)
   docker-compose.yml           # caddy, backstage, postgres
   Caddyfile
   build.sh                     # build one linux/arm64 image, print its immutable local ID
@@ -354,7 +354,7 @@ pages retain existing authorization; team membership and admin access come from 
 - Username/password login (replaced GitHub OAuth). A small custom auth provider in the idp repo checks the
   password against scrypt hashes from env var `IDP_USERS_B64`, then signs in as the catalog `User` whose
   name equals the username. A signed HttpOnly cookie keeps the session for 12h.
-- Passwords live only as hashes in `compute-factory/.poc-users` (gitignored, persists across cycles);
+- Passwords live only as hashes in `vendy/.poc-users` (gitignored, persists across cycles);
   `./poc set-password <user>` adds or changes one.
 - `catalog/org.yaml` in the idp repo holds `User` and `Group` entities (teams, `spec.type: team`).
   Membership is `User.spec.memberOf: [team-a, team-b]`, and a user can belong to any number of teams.
@@ -435,7 +435,7 @@ Steps:
 4. Output links: "Follow Provisioning" (the run page) and "Open VM in Catalog" (`resource:default/<name>`).
 
 Backstage uses a **backend integration token** (a fine-grained PAT you create, scoped to
-`compute-factory-platform`: Actions read/write, Contents read, **Commit statuses read**, which Backstage's
+`vendy-platform`: Actions read/write, Contents read, **Commit statuses read**, which Backstage's
 GitHub URL reader needs to resolve the commit SHA; without it, url Locations fail with 403). It
 dispatches workflows and reads catalog files. Users therefore **don't need any access to the platform repo**.
 
@@ -520,7 +520,7 @@ interfaces.
 
 ### 6.1 Runs and stages
 
-The `vms` backend plugin (`compute-factory-idp/plugins/cf-backend/src/orchestrator.ts`) stores each
+The `vms` backend plugin (`vendy-idp/plugins/cf-backend/src/orchestrator.ts`) stores each
 run and its stages in its database. Stage lists are code:
 
 | Run | Stages (in order) |
@@ -677,14 +677,14 @@ pieces (§5.4). Another OS family follows the same pattern; another release of a
 ## 9. One-time manual steps (outside `./poc`)
 
 1. **You**: create a fine-grained PAT for Backstage (GitHub doesn't allow creating it via the API) and put it
-   in `compute-factory/.poc.env` (gitignored). It persists across up/down cycles.
-   Set user passwords with `./poc set-password <user>`; they're kept in `compute-factory/.poc-users`.
+   in `vendy/.poc.env` (gitignored). It persists across up/down cycles.
+   Set user passwords with `./poc set-password <user>`; they're kept in `vendy/.poc-users`.
 2. Create the 4 private repos and push the code (done once, during the build).
 3. Azure identities (done once, kept across up/down like the AWS OIDC role; need an interactive
    `az login` with Entra rights): the GitHub OIDC app `cf-github-actions` (Contributor, federated
    credentials for builder/platform `main`), the repo variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
    `AZURE_SUBSCRIPTION_ID`, `AZURE_LOCATION`, and the IDP's Reader principal `cf-idp-azure-reader`
-   whose certificate is the gitignored `compute-factory/.poc-azure-reader.pem` (expires 2028-11-18).
+   whose certificate is the gitignored `vendy/.poc-azure-reader.pem` (expires 2028-11-18).
    Laptop Terraform/`az` use the `cf-admin-local` service principal (`~/.zshrc` `ARM_*`, alias `azsp`).
    Resource providers Microsoft.Compute, Microsoft.Network and Microsoft.ResourceHealth are registered.
 
@@ -721,7 +721,7 @@ Resolved:
 - Lifecycle: `./poc up` / `./poc down` / `./poc status` (section 12).
 - GitHub repos persist across cycles; `down` only clears their variables, secrets and `vms/`.
 - `up`/`down` apply only the `idp` record in `~/projects/cloudflare/amirasyraf.dev` (`-target`).
-- A 4th repo `compute-factory` holds `./poc`, `infra/` and this doc.
+- A 4th repo `vendy` holds `./poc`, `infra/` and this doc.
 
 Open: none.
 
@@ -750,7 +750,7 @@ for the same domain). Caddy renews it itself when it's within 30 days of expiry.
 ### 12.1 What lives where
 
 ```
-compute-factory/                 # 4th repo: the "home" of the POC
+vendy/                           # 4th repo: the "home" of the POC
   DESIGN.md
   poc                            # bash entrypoint: up [--images-only] | down [--keep-images] | status
   .poc.env                       # gitignored: Backstage PAT (from 9)
@@ -770,7 +770,7 @@ compute-factory/                 # 4th repo: the "home" of the POC
                                  #   (recovery_window_in_days = 0) + SSM parameter /compute-factory/ssh-ca-pub
       gallery.tf                 #   Azure gallery cf-images/cfimages + image definition ubuntu (cf:module=images)
       outputs.tf                 #   includes ssh_ca_fingerprint (SHA256:..., the images' cf:ssh-ca-fingerprint)
-  ../compute-factory-idp, ../compute-factory-builder, ../compute-factory-platform   # sibling clones
+  ../vendy-idp, ../vendy-builder, ../vendy-platform   # sibling clones
 ```
 
 - The CA key is created by Terraform, so it exists only in local state and Secrets Manager. Golden
@@ -846,7 +846,7 @@ and `bake.yml` to their previous state; while the POC is down they are closed ag
 cloud cleanliness, so use it on a POC that is up or was taken down with `down`/`down --keep-images`.
 
 Routine `./poc deploy-idp [<image-id>]` skips infrastructure setup and image cleanup. Build with
-`compute-factory-idp/deploy/build.sh`, smoke-test that local image ID, and pass the same ID to deploy
+`vendy-idp/deploy/build.sh`, smoke-test that local image ID, and pass the same ID to deploy
 without rebuilding. The existing host runs the packaged Compose/Caddy config and is health-checked.
 Run `./poc prune-idp-images` separately when the dedicated host needs disk space; the registry pauses
 for garbage collection but the running application stays up.
@@ -913,7 +913,7 @@ so you can check before or after `up`/`down`.
   Packer sets `tags`, `run_tags`, `run_volume_tags` and `snapshot_tags` with `cf:poc = "true"` and
   `cf:bake-run = <run id>-<attempt>-<matrix row>`. A failed, cancelled or timed-out bake job deletes its
   own build instance, `packer_*` security group and key pair, or Azure `pkr-*` group by that tag
-  (`compute-factory-builder/scripts/cleanup-build.sh`); teardown remains the backstop.
+  (`vendy-builder/scripts/cleanup-build.sh`); teardown remains the backstop.
   Azure has no provider default tags: every Azure resource and resource group sets the `cf:*` tags
   itself (Packer `azure_tags` tags its temporary build group).
 - No resource may be created outside Terraform or Packer, apart from Packer's temporary key pairs and

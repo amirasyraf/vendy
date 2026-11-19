@@ -1,6 +1,7 @@
-# Compute Factory (POC)
+# Vendy (POC)
 
-An IDP (Backstage) for self-service products across platforms. Home groups visible resources by product.
+Vendy is an internal developer platform built on Backstage. Users request and manage self-service
+products, and Home groups their visible resources by product.
 The first product, **Compute → Virtual Machines**, runs on **AWS and Azure** (Ubuntu 26.04 and Windows
 Server 2025, the latter with browser Remote Desktop over SSH) with
 Packer, Terraform and Ansible on GitHub Actions. Users choose a platform and an image release before
@@ -19,10 +20,10 @@ and no automatic reconciliation on Git edits. See `CONTRACTS.md` §7 for the val
 
 | Repo | Purpose |
 |---|---|
-| `compute-factory` (this) | design, `./poc` lifecycle, shared AWS infra (`infra/`), SSH CA + image gallery (`infra/images/`) |
-| `compute-factory-idp` | Backstage app + deployment |
-| `compute-factory-builder` | bake: golden images (Packer + Ansible) |
-| `compute-factory-platform` | provision + fry: Terraform, Ansible, GHA workflows, VM inventory, templates |
+| `vendy` (this) | design, `./poc` lifecycle, shared AWS infra (`infra/`), SSH CA + image gallery (`infra/images/`) |
+| `vendy-idp` | Backstage app + deployment |
+| `vendy-builder` | bake: golden images (Packer + Ansible) |
+| `vendy-platform` | provision + fry: Terraform, Ansible, GHA workflows, VM inventory, templates |
 
 ## Lifecycle
 
@@ -47,7 +48,7 @@ cp poc.env.example .poc.env   # once: Backstage PAT
 ./poc down --keep-images      # the same, but keep the SSH CA and golden images for the next up
 ```
 
-For an application change, [build and smoke-check one local image](../compute-factory-idp/README.md#checks)
+For an application change, [build and smoke-check one local image](../vendy-idp/README.md#checks)
 and pass its image ID to `./poc deploy-idp`. Routine releases use the existing DNS and Caddy storage,
 do not run image cleanup, and report stage timings. Start with the hot-reload dev server for layout
 iterations.

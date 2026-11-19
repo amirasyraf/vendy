@@ -1,4 +1,4 @@
-# Compute Factory — Build Contracts
+# Vendy — Build Contracts
 
 This file pins every cross-repo interface. `DESIGN.md` explains *why*; this file fixes *exact names*.
 If you need to change anything here, **stop and escalate to the orchestrator**. Don't invent a
@@ -6,14 +6,21 @@ variant, because other repos depend on these values.
 
 ## 0. Repos and local paths
 
-| Repo (GitHub; private except `compute-factory-platform`, public for free Actions minutes) | Local path | Owner |
+| Repo (GitHub; root private, other repos public) | Local path | Owner |
 |---|---|---|
-| `amirasyraf/compute-factory` | `~/projects/compute-factory` | orchestrator: `infra/`, `poc`, docs |
-| `amirasyraf/compute-factory-builder` | `~/projects/compute-factory-builder` | Agent A |
-| `amirasyraf/compute-factory-platform` | `~/projects/compute-factory-platform` | Agent A owns `ansible/` + `requirements-ansible.txt`; Agent B owns everything else |
-| `amirasyraf/compute-factory-idp` | `~/projects/compute-factory-idp` | Agent C |
+| `amirasyraf/vendy` | `~/projects/vendy` | orchestrator: `infra/`, `poc`, docs |
+| `amirasyraf/vendy-builder` | `~/projects/vendy-builder` | Agent A |
+| `amirasyraf/vendy-platform` | `~/projects/vendy-platform` | Agent A owns `ansible/` + `requirements-ansible.txt`; Agent B owns everything else |
+| `amirasyraf/vendy-idp` | `~/projects/vendy-idp` | Agent C |
 
 Default branch: `main`. Commit directly to `main`, with no PRs (POC). Use `git pull --rebase` before pushing.
+
+Vendy is the current project and repository name. The portal remains `https://idp.amirasyraf.dev`.
+Existing machine identifiers are not branding: keep the `cf:*` tags, `cf/*` annotations, `cf:`
+action IDs, `computeFactory` config, `compute-factory-workflows` token subject, session identifiers,
+`compute-factory/…` secret/SSM/guest paths, Windows `ComputeFactory` paths, and the
+`compute-factory-idp` image tag and artifact label. The lifecycle lock also keeps its original path,
+`~/.cache/compute-factory/lifecycle.lock`, so old and new checkouts cannot mutate the POC concurrently.
 
 ## 1. AWS constants
 
@@ -39,7 +46,7 @@ AWS remains the shared base (SSH CA, Terraform state bucket, IDP host); Azure ho
 |---|---|
 | Tenant / subscription | `c26545da-80fa-4c31-9a8f-a4ae475bd17e` / `74b39a79-f79d-4adb-8ae0-fe9118fc564a` |
 | Location | `australiaeast` |
-| GHA identity (OIDC) | Entra app `cf-github-actions` (`2e6cce7d-…`), Contributor on the subscription; federated subjects `repo:amirasyraf@15522007/compute-factory-{builder@1458285691,platform@1458285776}:ref:refs/heads/main` |
+| GHA identity (OIDC) | Entra app `cf-github-actions` (`2e6cce7d-…`), Contributor on the subscription; federated subjects `repo:amirasyraf@15522007/vendy-{builder@1458285691,platform@1458285776}:ref:refs/heads/main` |
 | GHA repo variables (builder + platform) | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_LOCATION` |
 | Image gallery | resource group `cf-images`, gallery `cfimages`, one definition per OS release (`ubuntu`: Ubuntu 26.04, Linux; `windows-2025`: Windows Server 2025, Windows; both Gen2, x64, NVMe + SCSI); the group (tag `cf:module=images`), gallery and definitions are created by `infra/images/gallery.tf` |
 | Per-VM resources | resource group `cf-vm-<name>`; VNet, subnet, NSG (tcp/22 from anywhere; never 3389), static Standard public IP, NIC and VM all named `cf-<name>` (a Linux or Windows VM resource by OS family) |
@@ -146,7 +153,7 @@ Tooling versions (pin these):
 
 ## 4. Teams and users (Backstage `org.yaml`, idp repo)
 
-- `compute-factory-idp/catalog/org.yaml` is the sole roster of users, teams and memberships.
+- `vendy-idp/catalog/org.yaml` is the sole roster of users, teams and memberships.
 - Teams are `Group` entities with `spec.type: team`; users declare membership in `spec.memberOf`.
 - Usernames must match the password entries managed by `./poc set-password`.
 - Group names are bare (`alpha`). The owner ref is `group:default/alpha`, and the principal is `team-alpha`.
@@ -296,7 +303,7 @@ metadata:
     cf/ready-at: "2026-11-15T12:03:00Z" # first readiness only; absent until ready
     # cf/failed-at is set on first recorded failure; neither timestamp is reset by later runs
     cf/run-id: "1234567890"        # last stage.yml run that wrote this file
-    cf/run-url: https://github.com/amirasyraf/compute-factory-platform/actions/runs/1234567890
+    cf/run-url: https://github.com/amirasyraf/vendy-platform/actions/runs/1234567890
 spec:
   type: vm
   owner: group:default/alpha
@@ -386,9 +393,9 @@ spec:
   `location:default/cf-vms`.
 - Catalog locations (idp `app-config.production.yaml`, or `catalog/locations.yaml`):
   - Location entity **named `cf-vms`**, type `url`, `presence: optional`, target
-    `https://github.com/amirasyraf/compute-factory-platform/blob/main/vms/*/catalog-info.yaml`
+    `https://github.com/amirasyraf/vendy-platform/blob/main/vms/*/catalog-info.yaml`
     (optional so an empty `vms/` succeeds and the last destroyed VM is deleted, not retained);
-  - templates: `https://github.com/amirasyraf/compute-factory-platform/blob/main/catalog/templates/*/template.yaml`;
+  - templates: `https://github.com/amirasyraf/vendy-platform/blob/main/catalog/templates/*/template.yaml`;
   - org and the ssh-cert template come from the idp repo itself.
 - `catalog.orphanStrategy: delete`. Catalog processing interval should be short (POC).
 - **Launch** (IDP `/launch`; `/create` still works): the IDP product registry groups registered products
@@ -695,10 +702,10 @@ type ObservedVm = {
 - EC2: Ubuntu 26.04 **arm64** (t4g.medium). Cloud-init installs Docker Engine + compose plugin, puts
   `ubuntu` in the `docker` group, and creates `/opt/idp` owned by `ubuntu`. IMDSv2 has hop limit 2.
 - SSH: `ssh -i ~/.ssh/id_ed25519 ubuntu@<ip>` (EC2 key pair from that key).
-- `compute-factory-idp/deploy/build.sh` builds and type-checks a local `linux/arm64` image, tags it
+- `vendy-idp/deploy/build.sh` builds and type-checks a local `linux/arm64` image, tags it
   `compute-factory-idp:latest`, and prints the full `sha256:` image ID on stdout (logs and timings on
   stderr). `IDP_IMAGE=<image-id>` pins the local smoke check to that image.
-- `compute-factory-idp/deploy/deploy.sh <host> <env-file> [<image-id>]`:
+- `vendy-idp/deploy/deploy.sh <host> <env-file> [<image-id>]`:
   - ships a supplied local IDP image directly; if omitted, builds first using `deploy/build.sh`;
   - copies the image's packaged `docker-compose.yml` and `Caddyfile`, plus `<env-file>` as `.env`, to `/opt/idp`;
   - starts the host-local `registry` service (`127.0.0.1:15000` on the host only) and pushes the
@@ -715,7 +722,7 @@ type ObservedVm = {
 | Key | Source |
 |---|---|
 | `IDP_DOMAIN` | `idp.amirasyraf.dev` |
-| `IDP_USERS_B64` | base64 of `compute-factory/.poc-users` (`username:hash` lines; hash from `compute-factory-idp/deploy/hash-password.mjs`) |
+| `IDP_USERS_B64` | base64 of `vendy/.poc-users` (`username:hash` lines; hash from `vendy-idp/deploy/hash-password.mjs`) |
 | `GITHUB_TOKEN` | user's fine-grained PAT (integration: catalog reads + workflow dispatch) |
 | `POSTGRES_PASSWORD` | random |
 | `BACKSTAGE_TOKEN` | random (static external access token) |

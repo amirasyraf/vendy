@@ -1,9 +1,9 @@
-# Compute Factory project instructions
+# Vendy project instructions
 
 ## POC scope and verification
 
 This is a POC: KISS. Do not add, restore, or recreate unit tests, unit-test suites, mocks or unit-test
-scaffolding in any Compute Factory repository, including equivalent coverage under new filenames.
+scaffolding in any Vendy repository, including equivalent coverage under new filenames.
 Previously removed unit tests must stay removed. Verify changes with appropriate static checks,
 existing offline integration checks and focused browser/end-to-end smoke checks instead. Do not
 introduce speculative abstractions or test infrastructure without an explicit user request.
@@ -75,7 +75,7 @@ store it there (or another gitignored file) immediately. Never commit or echo th
   task page is blank but `task_events` has rows, the problem is delivery to the browser, not the task.
 - Check who the client is early: `whois` the client IP. Corporate TLS-inspecting proxies (Netskope at
   `24.239.130.53` was observed) buffer long-lived responses. That is why the task page long-polls
-  `/events` instead of SSE `/eventstream` (`compute-factory-idp/packages/app/src/taskEventPolling.ts`;
+  `/events` instead of SSE `/eventstream` (`vendy-idp/packages/app/src/taskEventPolling.ts`;
   revert steps are in that file and the IDP README). Prefer short, completing HTTP requests over
   SSE/WebSockets for user-facing live updates.
 - After a frontend deploy, open tabs show a "new version" banner within a minute or on focus; a

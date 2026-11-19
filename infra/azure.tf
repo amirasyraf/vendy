@@ -28,7 +28,7 @@ variable "azure_reader_cert_path" {
 
 resource "aws_secretsmanager_secret" "azure_reader" {
   name                    = "compute-factory/azure-reader"
-  description             = "Compute Factory IDP read-only Azure credential (service principal certificate)"
+  description             = "Vendy IDP read-only Azure credential (service principal certificate)"
   recovery_window_in_days = 0
 }
 
