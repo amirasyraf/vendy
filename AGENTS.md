@@ -10,7 +10,10 @@ introduce speculative abstractions or test infrastructure without an explicit us
 
 ## Living documentation
 
-Documentation is living, breathing project material and must be kept current at all times.
+`README.md` is for people: explain what the repo does, how to start, and where to look next.
+`AGENTS.md` is for coding agents: give repo-specific constraints, boundaries, and verification rules.
+Put details in their existing reference docs rather than duplicating them. Prune stale or generic
+docs when their useful content has a better home.
 
 - Treat stale or contradictory documentation as a defect, not as a follow-up task.
 - Before editing code, inspect the relevant documentation in this repository and the affected
@@ -39,7 +42,8 @@ resume independent work.
 Implementation is not complete when code is merely committed. After an implementation change is
 verified and pushed, deploy the affected live environment and verify the deployed behavior before
 reporting completion. For IDP changes, use `./poc deploy-idp` against the existing POC host; do not
-tear down or recreate infrastructure just to deploy an application change.
+tear down or recreate infrastructure just to deploy an application change. Docs-only work does not
+need a deployment. Respect explicit instructions to leave the POC down.
 
 ## POC credentials
 
@@ -61,27 +65,15 @@ store it there (or another gitignored file) immediately. Never commit or echo th
   is stuck. Cancel it and diagnose; do not wait for the timeout.
 - Never destroy, stop or replace a user-visible VM (including test VMs the user may be using) without
   asking first.
+- Tag authorized, disposable POC cloud resources with `cf:poc=true` wherever the resource supports
+  tagging. Clean them up after verification; never use POC cleanup against unrelated resources.
 
-## Troubleshooting lessons
+## Troubleshooting boundaries
 
-- Start with `./poc logs [backstage|caddy|postgres|all] [since]` and `./poc task <task-id>` (read-only).
-  Backstage logs browser-side failures as `Browser <kind>: ...` (`type: clientEvent`, with user, IP and
-  bundle hash); Caddy's JSON access log has client IP, status and duration for every request.
-- Ad-hoc host access: `ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-  ubuntu@$(terraform -chdir=infra output -raw idp_ip) bash -s <<'EOF' ... EOF` (the IP is reused across
-  `./poc` cycles, so known_hosts entries go stale). Stack is `/opt/idp`. Add `</dev/null` to
-  `docker compose exec -T` inside a here-doc, or it consumes the rest of the script.
-- Scaffolder task state is in Postgres DB `backstage_plugin_scaffolder` (`tasks`, `task_events`). If the
-  task page is blank but `task_events` has rows, the problem is delivery to the browser, not the task.
-- Check who the client is early: `whois` the client IP. Corporate TLS-inspecting proxies (Netskope at
-  `24.239.130.53` was observed) buffer long-lived responses. That is why the task page long-polls
-  `/events` instead of SSE `/eventstream` (`vendy-idp/packages/app/src/taskEventPolling.ts`;
-  revert steps are in that file and the IDP README). Prefer short, completing HTTP requests over
-  SSE/WebSockets for user-facing live updates.
-- After a frontend deploy, open tabs show a "new version" banner within a minute or on focus; a
-  `Browser stale-bundle` log line means a user is still on the old bundle. Rule that out before
-  concluding a deployed fix "didn't work".
-- The static `BACKSTAGE_TOKEN` is restricted to `catalog` and `vms`; it cannot read scaffolder tasks or runs.
-- VM orchestration state (runs, stages, attempts, GitHub run IDs) is in Postgres DB `backstage_plugin_vms`
-  (`vm_runs`, `vm_run_stages`); read it with `./poc run <run-id>`. Backstage log lines `VM run <id> ...`
-  trace dispatches, failed attempts, retries and outcomes; the stage's GitHub run title ends in `[<run>.<stage>.<attempt>]`.
+- Start with the read-only diagnostics in [OPERATIONS.md](OPERATIONS.md#diagnose-before-retrying).
+  Do not treat `./poc status` output as proof that a destructive command is safe.
+- Keep user-facing progress and sessions on short HTTP requests. The observed Netskope proxy at
+  `24.239.130.53` buffered SSE; see `vendy-idp/packages/app/src/taskEventPolling.ts` and the IDP
+  reference for the reason and revert steps.
+- Leave `BACKSTAGE_TOKEN` restricted to catalog and the VM cleanup check. Do not use it to read tasks
+  or runs. Preserve the `[<run>.<stage>.<attempt>]` suffix used for dispatch recovery.

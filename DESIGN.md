@@ -1,11 +1,13 @@
 # Vendy — POC Design
 
-Status: draft for review · Date: 2026-11-15
+Current POC architecture. See [CONTRACTS.md](CONTRACTS.md) for exact interfaces and
+[OPERATIONS.md](OPERATIONS.md) for setup, recovery, and verification.
 
 ## 1. Goal and scope
 
-An Internal Developer Platform (IDP) where a user logs in, requests a VM, watches it get
-built, and connects to it over SSH. Every VM is created the same way:
+An internal developer platform for requesting and managing self-service products. Its first product
+lets users request a VM, follow provisioning, and connect over SSH or, on Windows, Remote Desktop
+through SSH. Every VM is created the same way:
 
 ```
 Bake (golden image)  ->  Provision (Terraform)  ->  Fry (Ansible stages)  ->  Ready (SSH via CA cert)
@@ -31,8 +33,9 @@ The IDP organizes products independently of the cloud where they run. Home group
 by category and product; Resources stays a searchable inventory. **Launch** starts at product
 categories. **Compute → Virtual Machines** leads to platform and image release cards, then the VM form (5.2).
 
-Out of scope for the POC: real AD, Vault, HA, production-grade security, cost controls,
-image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
+Out of scope for the POC: real AD, Vault, HA, production-grade security, guaranteed spend limits,
+and a GitHub Actions pipeline to deploy the IDP. Image lifecycle cleanup and optional demo expiry
+are implemented; neither guarantees a cost ceiling.
 
 ## 2. Fixed decisions
 
@@ -40,14 +43,14 @@ image lifecycle cleanup, and a GHA pipeline to deploy the IDP.
 |---|---|
 | AWS account | `amirasyraf` profile, `134584031874` (one AWS account for all AWS resources; Azure is in section 2's Azure rows) |
 | Region | `ap-southeast-2` (Sydney) |
-| GHA -> AWS | Existing OIDC role `arn:aws:iam::134584031874:role/github-aws-role` (trusts `repo:amirasyraf/*`). No static keys. |
+| GHA -> AWS | Existing OIDC role `arn:aws:iam::134584031874:role/github-aws-role` accepts both legacy and owner-ID-qualified subjects under `amirasyraf`. No static keys. |
 | Repos (user `amirasyraf`; root private, IDP, builder and platform public) | `vendy` (this doc, `./poc`, shared AWS infra), `vendy-idp`, `vendy-builder`, `vendy-platform` |
 | Lifecycle | `./poc up` creates everything; `./poc down` removes everything, including user VMs (section 12) |
-| Tagging | Every AWS resource, from Terraform, Packer or anywhere else, gets the tag `cf:poc=true`; `down` checks that none remain |
-| IDP | Backstage (latest, v1.56.x at time of writing) on a single EC2, Docker Compose, Caddy TLS, `idp.amirasyraf.dev` |
+| Tagging | POC-owned taggable resources carry `cf:poc=true`; `down` checks ownership and absence in the configured scope |
+| IDP | Backstage 1.56.0 (see `vendy-idp/backstage.json`) on a single EC2, Docker Compose, Caddy TLS, `idp.amirasyraf.dev` |
 | IDP deploy | Manual script from the laptop. No GHA. |
 | Base image | Azure: Canonical's Marketplace image `ubuntu-26_04-lts/server` (section 4.1). AWS: Canonical's official Ubuntu AMI, looked up through the public SSM parameter `/aws/service/canonical/ubuntu/server/<ver>/stable/current/amd64/hvm/ebs-gp3/ami-id`. These are the same official images the Marketplace lists, without needing a Marketplace subscription. |
-| Bake trigger | GHA in the builder repo, on push to `main` |
+| Bake trigger | GHA in the builder repo, on selected paths pushed to `main` or manual dispatch, subject to the maintenance gate |
 | Provision/Fry engine | GHA in the platform repo, triggered by Backstage |
 | Software install | `apt` on Ubuntu; winget (the `Microsoft.WinGet.Client` PowerShell module, as SYSTEM) on Windows. Same role interface. |
 | VM access | SSH for every OS and platform, authenticated with SSH user certificates signed by a mock CA. Windows adds Remote Desktop, only through SSH port forwarding (browser RDP via guacd, or a native client), with one shared login per VM |
@@ -90,29 +93,8 @@ Each VM has a folder `vms/<name>/` in `vendy-platform` that the stage workflow w
 
 That's all. No user keys or certs are stored per VM (see 7).
 
-Example `catalog-info.yaml`:
-
-```yaml
-apiVersion: backstage.io/v1alpha1
-kind: Resource
-metadata:
-  name: demo-vm-1
-  annotations:
-    cf/status: frying            # provisioning | frying | ready | failed | destroying
-    cf/request-id: "<scaffolder task id>"   # VM incarnation, checked by every stage
-    cf/public-ip: 3.25.x.x
-    cf/ssh-user: ubuntu
-    cf/requested-by: user:default/alice
-    cf/run-id: "1234567890"
-spec:
-  type: vm
-  owner: group:default/team-a    # the TEAM owns the VM
-  lifecycle: poc
-  compute: {platform: aws, os: ubuntu, size: S}
-  configuration: {software: [git, nginx], adJoin: false}
-  billing: {costCenter: CC-1234, projectCode: PROJ-5678}
-  cloudTags: {environment: test}
-```
+See [the inventory contract](CONTRACTS.md#7-vm-inventory-platform-repo-vmsname) for the full file
+example, spec validation, and annotation names.
 
 The request template serializes desired spec as JSON, keeping requester identity and team claims
 separate. The `register` stage validates/normalizes it and commits the entity before provisioning.
@@ -124,8 +106,8 @@ stored as desired state. Editing Git alone does not trigger an apply.
 
 The request form has one **Tags** table: `cost_center` and `project_code` (fixed keys, required
 values, stored as `spec.billing`) plus optional extra tags (`spec.cloudTags`). They are self-reported
-informational AWS tags, not trusted billing authorization. Custom tags cannot override
-platform-controlled `Name`, `cost_center`, `project_code`, `cf:`, `aws:` or `billing:` keys. See
+informational cloud tags, not trusted billing authorization. Custom tags cannot override
+platform-controlled keys or prefixes, including each cloud's reserved tag prefixes. See
 `CONTRACTS.md` §7 for types, validation and bounds. Future enterprise sections require explicit
 validation and consumers; Backstage's permissive custom-spec storage is not itself validation.
 
@@ -137,8 +119,9 @@ removes its entity.
 Why: it works the same way on every platform, it gives an audit trail for free, and Backstage
 already knows how to read it. Only fast-changing orchestration state (stages, attempts, retries) is
 kept out of Git, in the IDP orchestrator's database.
-Trade-off: concurrent stage commits for different VMs can race, so the commit step uses a
-`pull --rebase` retry loop. That's fine at POC volume.
+Trade-offs: concurrent stage commits can race, so the workflow uses a `pull --rebase` retry loop.
+The platform repo is public: inventory, public addresses, request metadata, and Git history are
+not protected by the portal's team policy. Deleting inventory does not erase earlier commits.
 
 ## 4. Repositories
 
@@ -237,9 +220,9 @@ vms/                           # inventory (written by stage runs only)
 | Stage | When | What it does |
 |---|---|---|
 | `baseline` | always | Hostname set to the VM name, `/etc/hosts`, login banner (VM, team, requester, platform), `/etc/compute-factory/vm-info.json` |
-| `software` | if any software picked | Installs the picks using `software-catalog.json`; in a Modify run also removes unchecked catalog packages |
-| `ad-join` | if picked (mock) | Writes `/etc/compute-factory/ad-join.json` (domain `corp.example.local`, OU, timestamp), adds a banner line, logs "joined CORP.EXAMPLE.LOCAL". No real AD. When Modify turns AD join off, removes them again. |
-| `access` | always, last | Writes `team-<owning team>` into the login user's principals file. Linux: turns off `authorized_keys` logins (Azure requires an admin key at launch; only CA certs log in afterwards), then `sshd -t` and reload. Windows: sets the login user's password to the team's shared one (Secrets Manager `compute-factory/vm/<name>`, created once per VM by the workflow) |
+| `software` | if selected on provision/reapply, or the list changed on Modify | Installs picks using `software-catalog.json`; Modify can remove packages even if the new list is empty |
+| `ad-join` | if selected on provision/reapply, or the setting changed on Modify | Writes mock join metadata and a banner line, or removes them when turned off. No real AD. |
+| `access` | last fry stage on provision and reapply; not run on Modify | Writes the owning team's SSH principal. Linux disables `authorized_keys`, checks `sshd -t`, and reloads. Windows sets the shared login password, from the secret for this VM incarnation. |
 
 Windows equivalents: baseline sets the computer name (cut to 15 characters; one reboot), UTC, the SSH
 banner file `C:\ProgramData\ComputeFactory\banner.txt` and `vm-info.json`; the mock AD join writes
@@ -250,17 +233,8 @@ not a fry stage: Linux runs a full `apt` upgrade, then reboots only if `/var/run
 exists; Windows installs updates of every category with `win_updates`, rebooting as needed (the job
 allows 40 minutes).
 
-**Software catalog** (`ansible/software-catalog.json`). The POC set:
-
-| Key | Label | linux (apt) | windows (winget) |
-|---|---|---|---|
-| `git` | Git | `git` | `Git.Git` |
-| `htop` | htop | `htop` | — |
-| `nginx` | nginx | `nginx` | — |
-| `docker` | Docker | `docker.io` | — |
-| `vscode` | VS Code | — | `Microsoft.VisualStudioCode` |
-| `firefox` | Firefox | — | `Mozilla.Firefox` |
-| `7zip` | 7-Zip | — | `7zip.7zip` |
+**Software catalog.** `vendy-platform/ansible/software-catalog.json` is the allowlist. A package
+is offered only if its entry has a package ID for the VM's OS family.
 
 - On Linux the stage installs the `linux` names with `apt`. On Windows it uses the
   `Microsoft.WinGet.Client` PowerShell module as SYSTEM in PowerShell 7 (baked; Windows PowerShell 5.1 is
@@ -317,29 +291,28 @@ allows 40 minutes).
 ### 4.3 `vendy-idp` (Backstage)
 
 ```
-backstage/                     # npx @backstage/create-app@latest
+vendy-idp/                     # repository root
   app-config.yaml              # base
   app-config.production.yaml   # prod: domain, postgres, password auth, integration, catalog locations
   plugins/vm-status/           # custom frontend plugin: full VM pipeline/status card (see 5.3)
-  plugins/cf-backend/          # backend: permission policy (5.1a), `cf:ssh:sign` (7), the `vms` plugin
+  plugins/cf-backend/           # backend: permission policy (5.1a), `cf:ssh:sign` (7), the `vms` plugin
                                # (VM orchestrator + demo mode, see 6) and the VM scaffolder actions
   catalog/org.yaml             # User + Group (team) entities = who may log in and their teams
   catalog/locations.yaml       # Location `cf-vms` (glob over the platform repo's vms/*/catalog-info.yaml)
   catalog/templates/ssh-cert/  # "Get SSH certificate" template
-deploy/                        # (the IDP EC2 itself is created by the vendy repo's infra/, see 12)
-  docker-compose.yml           # caddy, backstage, postgres
-  Caddyfile
-  build.sh                     # build one linux/arm64 image, print its immutable local ID
-  deploy.sh                    # ship a prebuilt image or build if omitted; verify the remote image ID
-  .env.example                 # IDP_USERS_B64 (password hashes), integration token, PG password,
-                               # static token for the GHA -> catalog refresh call
-                               # (no CA key here; it's read from Secrets Manager via the instance role)
+  deploy/                      # (the IDP EC2 itself is created by the vendy repo's infra/, see 12)
+    docker-compose.yml         # caddy, backstage, guacd, postgres, registry
+    Caddyfile
+    build.sh                   # build one linux/arm64 image, print its immutable local ID
+    deploy.sh                  # ship a prebuilt image or build if omitted; verify the remote image ID
+    .env.example               # IDP_USERS_B64, integration token, PG password, static workflow token,
+                               # and AWS region/secret IDs (not the secret values)
 ```
 
-- The image is built on the laptop (Apple Silicon, so arm64 matches t4g natively) and shipped over SSH.
-  That avoids ECR and building on a small box.
+- The image is built locally for arm64 and shipped to a loopback-only registry on the host via SSH.
+  That avoids ECR and building on the IDP host.
 - DNS: `idp.tf` in `~/projects/cloudflare/amirasyraf.dev` creates an A record to the EIP with `proxied = false`,
-  so Caddy can get a Let's Encrypt cert. Leave it DNS-only, or switch to proxied after the cert is issued.
+  so Caddy can get and renew its certificate. The POC manages this record as DNS-only.
 
 ## 5. Backstage design
 
@@ -354,8 +327,9 @@ pages retain existing authorization; team membership and admin access come from 
 - Username/password login (replaced GitHub OAuth). A small custom auth provider in the idp repo checks the
   password against scrypt hashes from env var `IDP_USERS_B64`, then signs in as the catalog `User` whose
   name equals the username. A signed HttpOnly cookie keeps the session for 12h.
-- Passwords live only as hashes in `vendy/.poc-users` (gitignored, persists across cycles);
-  `./poc set-password <user>` adds or changes one.
+- `./poc set-password <user>` writes hashes to gitignored `vendy/.poc-users` and plaintext POC test
+  logins to gitignored `vendy/.poc-passwords`; both persist across cycles and must stay private.
+  Only the hashes are deployed. Changing the hash set invalidates existing password sessions.
 - `catalog/org.yaml` in the idp repo holds `User` and `Group` entities (teams, `spec.type: team`).
   Membership is `User.spec.memberOf: [team-a, team-b]`, and a user can belong to any number of teams.
   A user needs both an org.yaml entry and a password to log in. `catalog/org.yaml` is the
@@ -369,7 +343,7 @@ pages retain existing authorization; team membership and admin access come from 
 ### 5.1a Authorization model (team-scoped VMs)
 
 Rule: **a VM is owned by exactly one team. A user can see and manage a VM only if they are a member of
-its owning team** (or of `platform-admins`). VMs of other teams don't exist as far as that user is concerned.
+its owning team** (or of `platform-admins`) **through the IDP**. This does not hide public Git inventory.
 
 Enforced in three places:
 
@@ -404,10 +378,11 @@ Form fields:
 | Name | `^[a-z][a-z0-9-]{2,20}$` | Must be unique; the workflow validates |
 | Team | one of the user's teams | Becomes `spec.owner`; preselected if the user is in exactly one team |
 | Platform | `aws`, `azure` (chosen on a Launch card; vSphere marked "Coming Soon") | Picks `terraform/platforms/<p>`; shown on the form with a "Change" link |
-| Image | Ubuntu 26.04 (one card per offered OS/release) | Persists OS and `imageVersion`; selects the latest bake of the chosen release, not a newer release |
+| Image | Ubuntu 26.04 or Windows Server 2025 (one card per offered OS/release) | Persists OS and `imageVersion`; selects the latest bake of the chosen release, not a newer release |
 | Size | XS / S / M / L or an Advanced instance type | Mapped per platform |
-| Software | checkboxes: git, htop, nginx, docker (from the software catalog, filtered by OS) | None picked = `software` stage skipped |
+| Software | checkboxes from the software catalog for the chosen OS family | None picked = `software` stage skipped for provisioning |
 | AD join | checkbox (mock) | baseline + access always run |
+| Tags | required `cost_center` and `project_code`; optional custom tags | Self-reported metadata, not billing authorization |
 
 How users get there: **Launch → Compute → Virtual Machines → Platform → Image**. The product page can
 start at Platform. Images come from `GET /api/vm-sizes/platforms`; Continue prefills the template with
@@ -505,8 +480,9 @@ to one VM's run, and would expose runs through a shared token regardless of team
     so a second person takes over the first one's desktop. `CONTRACTS.md` §8.5.
 - Rules: a running run blocks every action except Destroy; a failed (incomplete) provision must be
   retried, skipped or destroyed first; any new action supersedes a failed day-2 run. Modify, Reboot,
-  OS updates and Re-apply need a running VM; the backend refuses them (and a redundant start/stop) when
-  the health check says otherwise.
+  OS updates and Re-apply need a running VM. The backend rejects them when a fresh health check
+  shows otherwise; the UI can still offer some actions during a transition. The OS-update dialog
+  currently mentions Ubuntu even on Windows; the workflow selects the actual OS-specific updater.
 - **Health check**: the IDP polls each cloud every 30 seconds (EC2 `DescribeInstances`/
   `DescribeInstanceStatus`; Azure VM power state, Resource Health and public IPs with the Reader
   principal; read-only, tag `cf:poc=true`), so a VM stopped or deleted outside the IDP shows as
@@ -520,17 +496,11 @@ interfaces.
 
 ### 6.1 Runs and stages
 
-The `vms` backend plugin (`vendy-idp/plugins/cf-backend/src/orchestrator.ts`) stores each
-run and its stages in its database. Stage lists are code:
-
-| Run | Stages (in order) |
-|---|---|
-| provision | `servicenow` (mock ServiceNow request, runs in the IDP) → `register` (validate + commit inventory) → `provision` (Terraform) → `baseline` → `software` (if picked) → `ad-join` (if picked, mock) → `access` → `finalize` (`cf/status: ready`) |
-| modify | `configure` (persist the new desired compute and configuration) → `provision` (if size changed) → `software` (if changed) → `ad-join` (if changed) → `finalize` |
-| reapply | `baseline` → `software` (if any) → `ad-join` (if enabled) → `access` → `finalize` |
-| power | `start`, `stop` or `reboot` (one stage; no `finalize`, `cf/status` unchanged) |
-| update | `os-update` (no `finalize`, `cf/status` unchanged) |
-| destroy | `destroy` (guards, `cf/status: destroying`, `terraform destroy`, delete state and inventory) → `finalize` (failure path only) |
+The `vms` backend plugin (`vendy-idp/plugins/cf-backend/src/orchestrator.ts`) stores runs and stages
+in Postgres. Provisioning starts with the mock ServiceNow request, then registers inventory,
+creates the VM, and configures it. Modify persists new desired configuration before applying the
+changes. Power and OS updates are single-stage runs. [The orchestration
+contract](CONTRACTS.md#82-vm-orchestrator-vms-backend-plugin) lists the exact stage order by run kind.
 
 Each stage runs either inside the IDP (non-VM business steps such as the mock ServiceNow request;
 future approvals or CMDB updates would go here) or as a `stage.yml` dispatch (everything that
@@ -541,15 +511,15 @@ inventory (host, spec, provenance), so stages share no runner state and any one 
 ### 6.2 Failure handling
 
 - **Automatic retry**: up to 4 attempts per stage, waiting 30 s, 2 min and 8 min. An attempt still
-  running 45 minutes after dispatch is cancelled and counts as failed. Failures in the stage's
-  `Validate inputs` step, broken workflow files and rejected dispatches are permanent and are not
-  retried.
-- **Giving up**: the orchestrator runs `finalize` with `outcome: failed` (`cf/status: failed`,
+  running 45 minutes after dispatch is cancelled best-effort and counts as failed. Failures in the
+  stage's `Validate inputs` step, `startup_failure` and dispatch rejections other than 429 or 5xx
+  are permanent. See [CONTRACTS.md §8.2](CONTRACTS.md#82-vm-orchestrator-vms-backend-plugin).
+- **Giving up**: for runs with a finalizer, the orchestrator runs `finalize` with `outcome: failed` (`cf/status: failed`,
   `cf/failed-at`) and marks the run failed. Retried transient failures never reach the inventory, so
   they don't start demo-mode failure timers. The VM is kept for debugging; destroy cleans up.
 - **Manual**: on a failed run, team members and admins can **Retry** the failed stage (fresh attempt
-  budget, then the run continues) or **Skip** it (`software` and `ad-join` only; the desired spec is
-  unchanged). Everything else is retried or destroyed.
+  budget, then the run continues). **Skip** is available only for `software` or `ad-join` in provision
+  and reapply runs and never changes desired spec.
 - **Transient IDP failures**: run state and due times are in the database, so a backend restart loses
   nothing. Every attempt is stored with its run key (`<run>.<stage>.<attempt>`, the end of the GitHub
   run title) before dispatch; a lost dispatch response is recovered by finding that title rather than
@@ -580,10 +550,10 @@ the reboot check compares the last boot time instead of `/proc/sys/kernel/random
 
 ### 6.5 `bake.yml` (builder repo)
 
-On push to `main` (paths `packer/**`, `ansible/**`, `images.yaml`): matrix over `images.yaml`, then AWS
-OIDC (always: the CA public key is in SSM) and Azure OIDC for Azure rows, then `packer init` and
-`packer build -only=<amazon-ebs|azure-arm>.ubuntu packer/ubuntu`. Packer's `ansible` provisioner
-runs from the runner over SSH to the temporary build instance.
+`bake.yml` runs on manual dispatch or changes to Packer, Ansible, the matrix, requirements, or the
+workflow on `main`. It loads `images.yaml` and uses AWS OIDC for the CA public key, plus Azure OIDC
+for Azure rows. It runs `packer init "packer/$CF_OS"` and selects the row's source and OS. Ansible
+connects to the temporary build guest over SSH for Ubuntu and WinRM HTTPS for Windows.
 
 ## 7. SSH CA (mock)
 
@@ -597,20 +567,19 @@ store anyone's public key.
 - **Public key**: SSM parameter `/compute-factory/ssh-ca-pub`. Bake reads it and puts it into every image,
   and tags every image `cf:ssh-ca-fingerprint` with its SHA256 fingerprint. `up` reuses an image only if
   that tag matches the current CA.
-- **Private key**: stored in **one place**, the AWS Secrets Manager secret `compute-factory/ssh-ca`
-  (ap-southeast-2). Two signers fetch it at signing time and keep it only in memory, never on disk:
-  - the Backstage backend signs user certs. It reads the secret through the IDP EC2 instance role, which
-    has `secretsmanager:GetSecretValue` on that secret ARN and on `compute-factory/vm/*` (Windows VM
-    login passwords, shown to the owning team and used for browser RDP);
-  - `stage.yml` (fry stages) signs the pipeline's throwaway certs. It reads the secret through the existing OIDC role.
-- Rotation means updating the secret and re-baking with the new public key. Moving to Vault later only
-  replaces the signing function in those two places.
+- **Private key**: persisted in the image-tier Terraform state and AWS Secrets Manager
+  (`compute-factory/ssh-ca`). The IDP instance role reads it for user and browser-session signing;
+  the workflow reads it through AWS OIDC. Both signers stage the CA in restricted temporary files
+  for `ssh-keygen` and remove those files during normal cleanup. It is not baked or committed.
+- Rotating the CA changes which certificates a guest trusts. Rebaking alone does not update existing
+  VMs; the POC does not provide an in-place CA rotation workflow for them.
 
 | Who | Principals in cert | Validity | Issued by |
 |---|---|---|---|
 | Pipeline (fry) | `cf-automation` | 1h | `stage.yml`, ephemeral keypair per stage run |
 | User | `team-<t>` for each team they're in, e.g. `team-a`, `team-b` | 12h | Backstage "Get SSH certificate" |
 | Admin | adds `team-platform-admins` | 12h | same |
+| Browser terminal / RDP | one VM team, or `team-platform-admins` for an admin outside the team | 5 min for the handshake | IDP, key stays on the IDP |
 
 On each VM, `/etc/ssh/auth_principals/<login user>` (`ubuntu`) lists `cf-automation` and `team-platform-admins` (baked)
 plus `team-<owning team>` (written by the `access` fry stage). A cert therefore opens exactly the VMs of
@@ -632,7 +601,6 @@ signed. The difference is that the pipeline's key is throwaway.
   VM request form doesn't ask for it.
 - The alternative, where the IDP generates a keypair and hands the user the private key, means private
   keys pass through the IDP. That's bad practice even for a POC, so I don't propose it.
-- The browser remembers the last public key, so renewing is one click.
 
 ### 7.2 How a user connects
 
@@ -652,7 +620,7 @@ signed. The difference is that the pipeline's key is throwaway.
 
 Check a cert with `ssh-keygen -L -f ~/.ssh/id_ed25519-cert.pub` (shows principals and expiry).
 
-## 8. Adding Windows / vSphere later
+## 8. Extending products, platforms, and images
 
 | To add | Add |
 |---|---|
@@ -676,56 +644,24 @@ pieces (§5.4). Another OS family follows the same pattern; another release of a
 
 ## 9. One-time manual steps (outside `./poc`)
 
-1. **You**: create a fine-grained PAT for Backstage (GitHub doesn't allow creating it via the API) and put it
-   in `vendy/.poc.env` (gitignored). It persists across up/down cycles.
-   Set user passwords with `./poc set-password <user>`; they're kept in `vendy/.poc-users`.
-2. Create the 4 private repos and push the code (done once, during the build).
-3. Azure identities (done once, kept across up/down like the AWS OIDC role; need an interactive
-   `az login` with Entra rights): the GitHub OIDC app `cf-github-actions` (Contributor, federated
-   credentials for builder/platform `main`), the repo variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
-   `AZURE_SUBSCRIPTION_ID`, `AZURE_LOCATION`, and the IDP's Reader principal `cf-idp-azure-reader`
-   whose certificate is the gitignored `vendy/.poc-azure-reader.pem` (expires 2028-11-18).
-   Laptop Terraform/`az` use the `cf-admin-local` service principal (`~/.zshrc` `ARM_*`, alias `azsp`).
-   Resource providers Microsoft.Compute, Microsoft.Network and Microsoft.ResourceHealth are registered.
+See [setup and credentials](OPERATIONS.md#setup-and-credentials) for local prerequisites, the
+Backstage PAT, and the persistent AWS and Azure identities. Bootstrap wires the temporary
+workflow variables and token; it does not create OAuth apps, workload identities, or local credentials.
 
-Everything else is done by `./poc up` (section 12).
+## 10. Cost and retention
 
-End-to-end test after `up`, on each platform (AWS, Azure): get cert → Launch a VM → watch stages → SSH in
-→ teammate SSH in → other team can't see it or SSH in → day-2 actions (stop/start/reboot, OS updates,
-Modify) → destroy → `./poc down` → check that nothing is left on either cloud.
+While up, budget for the IDP host, its disk and public IP, guest compute and disks, Azure static
+IPs, and the image tier. Windows rates include the license. Stopping or deallocating a VM does not
+delete its storage; Azure also keeps its static IP. `down --keep-images` retains the CA secret,
+AMI snapshots and Azure gallery versions. `NOT CLEAN` can mean billable resources remain; a clean
+result only covers the POC's configured account, subscription and scope, not account-wide billing.
 
-## 10. Rough cost (running 24/7)
+VMs do not expire by default. Enabling demo mode adds a per-requester quota and cleanup runs;
+expiry is an eligibility trigger, not a deletion SLA or a budget cap. See `CONTRACTS.md` §8.1.
 
-IDP t4g.medium about $30/mo plus EIP/EBS. Each test VM (t3.small) costs about $0.03/hr. Windows
-instances include the licence: roughly 1.5–2× the Linux price of the same type, and the Windows sizes
-are larger (S = t3.large, about $0.13/hr on AWS). Browser RDP adds a `guacd` container on the IDP host
-(1 GiB memory limit; per-session load to be measured on the first Windows VM; move the host to
-t4g.large if 4 GiB proves too small). AMI snapshots
-cost cents. An Azure test VM (2 vCPU v6) is roughly $0.10/hr plus a static IP and disk while it
-exists; a deallocated one pays only those. Gallery storage costs cents. After `./poc down` the cost is
-$0: no AWS or Azure resources remain. After `./poc down --keep-images` only the image tier remains:
-the CA secret (about $0.40/month), AMI snapshots and gallery versions (cents).
+## 11. Implementation evidence and limits
 
-## 11. Open questions
-
-Resolved:
-- Ubuntu: latest LTS, 26.04.
-- Day-2 actions: start/stop/reboot, Modify (size, software install/uninstall, AD join), OS updates,
-  re-apply configuration, destroy; SSH access via personal certs.
-- Team-owned VMs only; no personal VMs.
-- VMs never expire; they're removed only through destroy.
-- SSH: per-user, team-scoped certs from Backstage (instant, 12h). No per-VM access step.
-- CA private key: single copy in AWS Secrets Manager, read by Backstage (instance role) and GHA (OIDC).
-- Software: users pick from a fixed catalog in the request form (POC set: git, htop, nginx, docker).
-
-- Lifecycle: `./poc up` / `./poc down` / `./poc status` (section 12).
-- GitHub repos persist across cycles; `down` only clears their variables, secrets and `vms/`.
-- `up`/`down` apply only the `idp` record in `~/projects/cloudflare/amirasyraf.dev` (`-target`).
-- A 4th repo `vendy` holds `./poc`, `infra/` and this doc.
-
-Open: none.
-
-Verified during build:
+Backstage integration behaviors verified against the pinned implementation and existing checks:
 - `catalog:fetch` runs with the initiating user's credentials (`ctx.getInitiatorCredentials()`, Backstage
   v1.56 source).
 - Catalog search filters by the same catalog read permission (v1.56 source). A browser check is part of E2E.
@@ -741,20 +677,21 @@ Verified during build:
 ## 12. Lifecycle: `./poc up` / `./poc down`
 
 Goal: one command creates the whole POC from nothing, and one command removes all of it, including VMs
-users launched. Every run assumes a clean slate. Existing resources and values are disposable, and
-nothing is carried over between cycles except the code in Git, the two manual GitHub credentials (9),
-Caddy's TLS storage and, only after `down --keep-images`, the image tier (SSH CA and golden images). `down` saves that to `.generated/caddy-data.tgz` on the laptop (gitignored) and `up`
-restores it onto the new host, so a cycle doesn't request a new Let's Encrypt certificate (limit: 5 per week
-for the same domain). Caddy renews it itself when it's within 30 days of expiry.
+users launched. A clean `up` needs empty shared state and VM inventory; `up --resume` is the
+exception for completing a gated bootstrap. Git history, local credentials, and manually managed
+cloud identities survive. `down` saves Caddy TLS storage to `.generated/caddy-data.tgz` when it
+can read it from the host, and `up` restores it when available. `down --keep-images` additionally
+retains the CA, images, and Azure gallery. The host's database is not carried across full cycles.
 
 ### 12.1 What lives where
 
 ```
 vendy/                           # 4th repo: the "home" of the POC
   DESIGN.md
-  poc                            # bash entrypoint: up [--images-only] | down [--keep-images] | status
+  poc                            # bash entrypoint; see README.md for commands
   .poc.env                       # gitignored: Backstage PAT (from 9)
   .poc-users                     # gitignored: username:scrypt-hash lines (./poc set-password)
+  .poc-passwords                 # gitignored: plaintext POC logins, never deployed
   infra/                         # shared Terraform root, LOCAL state (gitignored), applied only by ./poc
     main.tf                      #   default_tags { cf:poc = "true", cf:module = "infra" } on the AWS provider
     state-bucket.tf              #   S3 bucket for VM Terraform state; never force-empty
@@ -762,13 +699,13 @@ vendy/                           # 4th repo: the "home" of the POC
                                  #   read-only EC2 describe for sizes and the VM health check)
     azure.tf                     #   Azure reader secret compute-factory/azure-reader (from .poc-azure-reader.pem)
                                  #   + host-role read
-    tokens.tf                    #   random_password: backend secret, PG password, BACKSTAGE_TOKEN
+    tokens.tf                    #   random_password: PG password, BACKSTAGE_TOKEN
     outputs.tf
     images/                      # image tier root, its own LOCAL state; kept by down --keep-images
       main.tf                    #   AWS default_tags { cf:poc = "true", cf:module = "images" }; azurerm provider
       ssh-ca.tf                  #   tls_private_key (ed25519) -> Secrets Manager secret compute-factory/ssh-ca
                                  #   (recovery_window_in_days = 0) + SSM parameter /compute-factory/ssh-ca-pub
-      gallery.tf                 #   Azure gallery cf-images/cfimages + image definition ubuntu (cf:module=images)
+      gallery.tf                 #   Azure gallery cf-images/cfimages + ubuntu and windows-2025 definitions
       outputs.tf                 #   includes ssh_ca_fingerprint (SHA256:..., the images' cf:ssh-ca-fingerprint)
   ../vendy-idp, ../vendy-builder, ../vendy-platform   # sibling clones
 ```
@@ -860,7 +797,7 @@ for garbage collection but the running application stays up.
    if stopping fails and the workflow freeze is proven.
 2. **Protect VM recovery state**: inspect the POC-tagged S3 bucket and validate state and lock keys.
    A recent/unreadable lock blocks sweeping. After the freeze, a lock older than the platform's
-   20-minute runner limit may be unlocked through Terraform by its recorded ID. From a temporary clone
+   20-minute state-lock threshold may be unlocked through Terraform by its recorded ID. From a temporary clone
    of platform `main`, populate a provider mirror serially, then run the workers in parallel (default
    5, `PARALLEL_DESTROYS` supports 1–20). Delete a VM's state object only after successful Terraform
    destroy. Keep the bucket, the image tier and inventory on a VM failure or if objects/versions
@@ -903,9 +840,9 @@ ownership rules may still incur charges. Never clear state just to obtain `CLEAN
 
 ### 12.4 `./poc status`
 
-A read-only tag sweep plus `gh run list`. It shows what currently exists (IDP up?, the SSH CA
-fingerprint, AMIs and gallery versions with their CA fingerprint and git SHA, VMs, running pipelines),
-so you can check before or after `up`/`down`.
+A read-only snapshot of local state, portal readiness, image tier, tagged instances and Azure resource
+groups, VM state keys, and non-completed runs among each repo's latest 20. The Actions list is
+best-effort; no output does not prove quiescence. The lifecycle commands verify that separately.
 
 ### 12.5 Rules this puts on the rest of the design
 
@@ -914,8 +851,8 @@ so you can check before or after `up`/`down`.
   `cf:bake-run = <run id>-<attempt>-<matrix row>`. A failed, cancelled or timed-out bake job deletes its
   own build instance, `packer_*` security group and key pair, or Azure `pkr-*` group by that tag
   (`vendy-builder/scripts/cleanup-build.sh`); teardown remains the backstop.
-  Azure has no provider default tags: every Azure resource and resource group sets the `cf:*` tags
-  itself (Packer `azure_tags` tags its temporary build group).
+  Azure has no provider default tags: taggable resources and resource groups set `cf:*` explicitly
+  (Packer `azure_tags` also tags its temporary build group).
 - No resource may be created outside Terraform or Packer, apart from Packer's temporary key pairs and
   security groups. Teardown detects any remaining named Packer temporary resources and fails closed
   rather than deleting by an unowned name prefix.

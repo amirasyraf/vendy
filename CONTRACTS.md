@@ -1,17 +1,17 @@
 # Vendy — Build Contracts
 
-This file pins every cross-repo interface. `DESIGN.md` explains *why*; this file fixes *exact names*.
-If you need to change anything here, **stop and escalate to the orchestrator**. Don't invent a
-variant, because other repos depend on these values.
+This file records cross-repo interfaces. [DESIGN.md](DESIGN.md) explains the architecture and
+[OPERATIONS.md](OPERATIONS.md) covers operator tasks. Coordinate changes with every producer and
+consumer; do not introduce an undocumented variant.
 
 ## 0. Repos and local paths
 
-| Repo (GitHub; root private, other repos public) | Local path | Owner |
+| Repo (GitHub; root private, other repos public) | Local path | Responsibility |
 |---|---|---|
 | `amirasyraf/vendy` | `~/projects/vendy` | orchestrator: `infra/`, `poc`, docs |
-| `amirasyraf/vendy-builder` | `~/projects/vendy-builder` | Agent A |
-| `amirasyraf/vendy-platform` | `~/projects/vendy-platform` | Agent A owns `ansible/` + `requirements-ansible.txt`; Agent B owns everything else |
-| `amirasyraf/vendy-idp` | `~/projects/vendy-idp` | Agent C |
+| `amirasyraf/vendy-builder` | `~/projects/vendy-builder` | Golden image builds |
+| `amirasyraf/vendy-platform` | `~/projects/vendy-platform` | Terraform, Ansible, templates, VM stage workflow and inventory |
+| `amirasyraf/vendy-idp` | `~/projects/vendy-idp` | Portal, orchestration, auth and deployment |
 
 Default branch: `main`. Commit directly to `main`, with no PRs (POC). Use `git pull --rebase` before pushing.
 
@@ -31,7 +31,7 @@ action IDs, `computeFactory` config, `compute-factory-workflows` token subject, 
 | Local AWS profile | `amirasyraf` |
 | GHA role (OIDC) | repo variable `AWS_ROLE_ARN` = `arn:aws:iam::134584031874:role/github-aws-role` (already set on builder + platform) |
 | GHA region | repo variable `AWS_REGION` = `ap-southeast-2` (already set on builder + platform) |
-| Mandatory tag | `cf:poc = "true"` on **every** AWS and Azure resource (AWS Terraform `default_tags`; Packer `tags`, `run_tags`, `run_volume_tags`, `snapshot_tags`, `azure_tags`; Azure Terraform per resource) |
+| Mandatory tag | `cf:poc = "true"` on POC-owned, taggable AWS and Azure resources (AWS Terraform `default_tags`; Packer `tags`, `run_tags`, `run_volume_tags`, `snapshot_tags`, `azure_tags`; Azure Terraform per resource). Azure child resources such as subnets and NIC/NSG associations do not carry their own tags; teardown uses the owning group. |
 | TF state bucket | `cf-tfstate-134584031874-apse2` (repo variable `TF_STATE_BUCKET` on platform) |
 | VM state key | `vms/<platform>/<name>/terraform.tfstate`, e.g. `vms/aws/demo-1/terraform.tfstate` |
 | CA private key | Secrets Manager secret id `compute-factory/ssh-ca`; `SecretString` = OpenSSH-format ed25519 private key. Created by `infra/images` (tag `cf:module=images`); `infra/` grants the IDP role read access by name (`compute-factory/ssh-ca-??????`) |
@@ -55,11 +55,11 @@ AWS remains the shared base (SSH CA, Terraform state bucket, IDP host); Azure ho
 
 Tooling versions (pin these):
 - Terraform `>= 1.10` (S3 `use_lockfile`), AWS provider `~> 6.0`.
-- Packer latest 1.x with plugins `amazon`, `azure` (`>= 2.6, < 3`) + `ansible`. azurerm provider `~> 4.0`.
-- `ansible-core`: one exact pinned version, chosen by Agent A, recorded in both repos' `requirements-ansible.txt`
+- Builder workflow: Packer 1.16.2 with `amazon`, `azure` and `ansible` plugin ranges in the Packer files. azurerm provider `~> 4.0`.
+- `ansible-core`: the same exact version in both repos' `requirements-ansible.txt`
   (the builder adds `pywinrm` for the Windows bake). Collection `ansible.windows` is
   pinned in both repos' `ansible/requirements.yml` and installed by the workflows.
-- Node 24 for Backstage.
+- Node 24 is pinned by `vendy-idp/mise.toml` and used by its Docker image. The package engine also accepts Node 22.
 
 ## 2. Golden image (bake → provision)
 
@@ -139,8 +139,9 @@ Tooling versions (pin these):
   already has `AuthorizedKeysFile none`; sshd is not restarted). The team shares the login user's
   password for Remote Desktop: `access` sets it from Secrets Manager `compute-factory/vm/<name>`
   (`SecretString` `{username, password, requestId}`, tags `cf:poc=true`, `cf:vm`, `cf:request-id`; created once per
-  incarnation by `scripts/vm-password.sh`, deleted by `destroy`, swept by `./poc down`). The IDP shows it
-  only to the owning team and admins (§8.2) and uses it for browser RDP.
+  incarnation by `scripts/vm-password.sh`, deleted by `destroy`, swept by `./poc down`). Windows
+  sets `password_never_expires: true`; this is a shared POC credential, not a per-user or rotating
+  password. The IDP shows it only to the owning team and admins (§8.2) and uses it for browser RDP.
 - The fry stage `access` writes the **whole** `/etc/ssh/auth_principals/<login user>` file with exactly
   three lines: `cf-automation`, `team-platform-admins` and `team-<owning team>`, and the drop-in
   `/etc/ssh/sshd_config.d/01-compute-factory-certificates-only.conf` (`AuthorizedKeysFile none`), so
@@ -200,6 +201,8 @@ All inputs are strings and required unless noted.
 | `params_json` | `{}` | optional, default `{}`; stage-specific JSON object (below); max 40 KiB |
 
 - Job timeout: 20 minutes; 40 for `os-update` (Windows updates).
+- Inside the 40 KiB dispatch envelope, `spec.py` separately accepts up to 32,768 characters of
+  serialized spec input. This also applies when validating the merged spec on Modify.
 
 - `run-name: "stage <stage> <name> by <requested_by> [<run_key>]"`. The orchestrator recovers a lost
   dispatch response by this exact `[<run_key>]` suffix, so it must stay the end of the title.
@@ -242,14 +245,14 @@ first checks that `vms/<name>/catalog-info.yaml` exists with `cf/request-id == r
 | `configure` | Replace `spec.compute` and `spec.configuration` with `params_json` (platform/OS unchanged) through `spec.py`; other spec sections and provenance are kept. No VM contact. |
 | `software` (removal) | Besides installing `cf_software`, removes `params_json.remove` minus anything still desired (`apt` `state: absent`; data and configuration files are kept). |
 | `ad-join` (leave) | With `adJoin: false` in the persisted spec (Modify turned it off) the mock join record and banner line are removed. |
-| `start`, `stop`, `reboot` | Instance from `cf/instance-id` (matching the platform's `instanceIdPattern`); it must carry `cf:vm=<name>`, `cf:request-id=<request_id>`, `cf:poc=true`. Cloud calls come from `terraform/platforms/<p>/power.sh`. `stop`: stop and wait (Azure: deallocate, also for a guest-stopped VM that is still allocated), then `cf/public-ip: ""`. `start`: start and wait, record the current `cf/public-ip`, wait for SSH. `reboot`: requires `running`; cloud reboot, then wait until the guest's boot ID changes (10 min). Already in the target state → success. `cf/status` is not changed. |
+| `start`, `stop`, `reboot` | Instance from `cf/instance-id` (matching the platform's `instanceIdPattern`); it must carry `cf:vm=<name>`, `cf:request-id=<request_id>`, `cf:poc=true`. Cloud calls come from `terraform/platforms/<p>/power.sh`. `stop`: stop and wait (Azure: deallocate, also for a guest-stopped VM that is still allocated), then `cf/public-ip: ""`. `start`: start and wait, record the current `cf/public-ip`, wait for SSH. `reboot`: requires a valid inventory SSH target and a running instance; it requests a reboot and checks for a changed boot ID. The retry loop targets 10 minutes, but an established SSH command can overrun it; the job is capped at 20 minutes. `cf/status` is not changed. |
 | `os-update` | Requires a public IP. Runs `ansible/maintain/os-update.yml`: Linux full `apt` upgrade, reboot only if `/var/run/reboot-required`; Windows `win_updates` of every category, rebooting as needed. `cf/status` is not changed. |
 | `destroy` | Inventory missing → success (already destroyed). With `demoGeneration`: the existing fail-closed cleanup check (`GET $BACKSTAGE_URL/api/vms/cleanup-check/<name>?generation=…&request_id=…`); ineligible → success without changes. Otherwise identity check, `cf/status: destroying`, `terraform destroy`, delete the state object, delete this incarnation's `compute-factory/vm/<name>` password secret if any, delete the inventory directory. A retry after partial completion converges. |
 | `finalize` | Inventory missing or a different request ID → success without changes. `ready` → `cf/status: ready`, `cf/ready-at` (first time only). `failed` → `cf/status: failed`, `cf/failed-at` (first time only). |
 
 Team guard: the persisted (or, for `register`, desired) `spec.owner` group must be in `requester_teams`;
 `platform-admins` passes every guard. Authorization context is never part of the spec.
-### 6.3 Ansible invocation contract (Agent B calls, Agent A implements)
+### 6.3 Ansible invocation contract
 
 ```
 ansible-playbook -i "<host>," -u <ssh_user> \
@@ -371,8 +374,8 @@ spec:
   provenance are preserved. Power state is not desired state: it is observed (§8.3), never stored in
   spec.
 - Status updates never rewrite spec. Direct Git edits do not trigger reconciliation or a Terraform
-  update. New enterprise sections require explicit validation/consumer changes. Legacy inventory is
-  not migrated; this change rolls out against an empty inventory after VM teardown.
+  update. New sections require explicit validation and consumer changes. `poc up` refuses nonempty
+  inventory; a running environment has no generic inventory migration command.
 
 - `cf/status` is the coarse, catalog-visible lifecycle written by stages (§6.2). Per-stage state,
   attempts, retries and errors live only in the IDP orchestrator database (§8.2); `cf/stages`,
@@ -380,6 +383,8 @@ spec:
   `outcome: failed`, after the orchestrator has given up on a stage, so transient failures that are
   being retried never start demo-mode failure timers.
 - `vms/.gitkeep` always exists.
+- `vendy-platform` is public. Deleting an inventory file does not erase its Git history. Portal
+  team visibility does not protect the public file, including its metadata, billing fields and tags.
 
 ## 8. Backstage ↔ platform integration
 
@@ -545,7 +550,7 @@ one of their groups.
 | `POST /runs` | `{operation, vm, requestKey, compute?, software?, adJoin?}` → `{runId, runUrl}`. 400 invalid, not the platform's instance type, or (Modify) nothing to change, 403 other team or demo-disallowed instance type, 404 unknown VM, 409 conflict, 503 automation off or platform/size files unreadable |
 | `GET /observed/:name?platform=<p>` | `{ enabled, checkedAt, error, vm: ObservedVm \| null }` (§8.3); `checkedAt`/`error` are that platform's (all platforms without `platform`) |
 | `POST /terminal` | `{vm, cols, rows}` → `{id, host, user}` (§8.4); 409 not running / no IP, 429 two sessions already open, 503 automation off |
-| `GET /password/:name` | Windows: `{username, password}` from `compute-factory/vm/<name>`, only when its `requestId` is the VM entity's `cf/request-id` (team or admin; logged `VM password of <vm> shown to <user>`; `Cache-Control: no-store`); 404 none yet |
+| `GET /password/:name` | `{username, password}` from `compute-factory/vm/<name>`, only when its `requestId` is the VM entity's `cf/request-id` (team or admin; logged `VM password of <vm> shown to <user>`; `Cache-Control: no-store`); 404 if none matches. Only Windows `access` creates this secret; the handler does not separately check OS family. |
 | `POST /rdp` | `{vm, width, height, dpi, timezone}` → `{id, host, user}` (§8.5); 400 not Windows, 409 not running / no IP / no password, 429 one session already open, 502 tunnel or guacd failure, 503 automation off |
 | `GET /rdp/:id/output?after=<seq>` | `{seq, data, closed}`; `data` is Guacamole instructions; `after` acknowledges (frees) earlier output; waits up to 25 s |
 | `POST /rdp/:id/input` | `{data}` (≤ 512 KiB of Guacamole instructions) → `{}` |
@@ -565,7 +570,9 @@ the run's request ID and its owner group the run's team. `requestKey` (`^[a-zA-Z
 Scaffolder task ID or a browser UUID) makes a repeated submit return the first run. Modify sends the
   complete new `compute` (`{platform, os, imageVersion?, size | instanceType}`, platform/image unchanged), `software`
 (catalog keys) and `adJoin`; the backend diffs them against the entity spec to plan the run, and
-computes the packages to remove. While the VM platform's health check is fresh (under 2 minutes), it refuses (409)
+   computes the packages to remove. The API validates explicit `instanceType`; the stage validator
+   checks named `size` values against the OS size map at `configure`. The normal UI offers only
+   mapped sizes. While the VM platform's health check is fresh (under 2 minutes), it refuses (409)
 what cannot work: any operation but destroy when no instance of this incarnation exists, `start` on a
 running VM, `stop` on a stopped one, and everything else unless the VM is running.
 
@@ -697,7 +704,7 @@ type ObservedVm = {
   `localhost:33389`; the password comes from "Show Password" (`GET /password/:name`).
 - Only where `computeFactory.demoAutomation` is on (production); otherwise 503.
 
-## 9. IDP runtime (orchestrator infra ↔ Agent C deploy)
+## 9. IDP runtime
 
 - EC2: Ubuntu 26.04 **arm64** (t4g.medium). Cloud-init installs Docker Engine + compose plugin, puts
   `ubuntu` in the `docker` group, and creates `/opt/idp` owned by `ubuntu`. IMDSv2 has hop limit 2.
@@ -728,11 +735,12 @@ type ObservedVm = {
 | `BACKSTAGE_TOKEN` | random (static external access token) |
 | `AWS_REGION` | `ap-southeast-2` |
 | `SSH_CA_SECRET_ID` | `compute-factory/ssh-ca` |
-| `AZURE_READER_SECRET_ID` | `compute-factory/azure-reader` (unset: Azure specs, picker and health check report "not configured") |
+| `AZURE_READER_SECRET_ID` | `compute-factory/azure-reader`; required by `poc` and `deploy.sh`. An independently started backend with it unset reports Azure as unconfigured. |
 
 - Compose services: `caddy`, `backstage`, `guacd` (§8.5; `network_mode: service:backstage`, 1 GiB
   memory limit, pulled from Docker Hub, multi-arch), `postgres`, `registry`. The host role may read
-  Secrets Manager `compute-factory/ssh-ca` and `compute-factory/vm/*` (Windows VM passwords).
+  Secrets Manager `compute-factory/ssh-ca`, `compute-factory/azure-reader`, and `compute-factory/vm/*`
+  (Windows VM passwords).
 
 - Caddy terminates TLS for `IDP_DOMAIN` and proxies to the backstage container on port 7007.
   It rewrites only `/mock-rest/servicenow` to the authenticated `/api/mock-rest/servicenow` plugin route;
@@ -780,7 +788,7 @@ type ObservedVm = {
   refused with 503, when the files cannot be read), for requests and Modify; sizes are allowed.
 - A changed `size`/`instance_type` is an in-place update (stop, modify, start); the provision plan still
   refuses any delete or replacement.
-- Resources are tagged `cf:poc=true`, `cf:vm=<name>`, `cf:team=<team>`, and `cf:request-id=<request_id>`
+- Taggable resources are tagged `cf:poc=true`, `cf:vm=<name>`, `cf:team=<team>`, and `cf:request-id=<request_id>`
   when set. No key pair (the CA is used). The instance ignores AMI changes after creation, so a retry after
   a newer bake never replaces it.
 - `./poc down` runs, for each key under `vms/<p>/*/terraform.tfstate`:
@@ -807,11 +815,6 @@ type ObservedVm = {
 - `GET /api/vm-sizes/software` → `{software: [{id, label, families}]}` from `ansible/software-catalog.json`
   on `main` (cached 5 minutes); `families` lists the OS families with a non-null package.
 
-## 11. Ground rules for all agents
+## 11. Contributor instructions
 
-- Only touch your own repo or paths. Never run `./poc down`, `terraform destroy` on infra you didn't create,
-  or anything against other AWS resources in the account.
-- Every AWS resource you create, including test ones, carries `cf:poc=true`. Clean up your own test resources.
-- Long-running commands (builds, `yarn install`, waiting on GHA runs) use the shell tool's background mode,
-  not `nohup`/`&`, and no sleep-polling. `gh run watch` in background mode is fine.
-- No secrets in Git. `.env` files are gitignored.
+See [AGENTS.md](AGENTS.md) for agent scope, verification, and infrastructure safety.
