@@ -103,7 +103,10 @@ Tooling versions (pin these):
   `Administrator`); firewall rule `OpenSSH-Server-In-TCP` for every profile (the built-in rule is Private-only; cloud NICs are Public); UTC; Remote Desktop allowed
   (`fDenyTSConnections=0`; reached only through SSH, §8.5); `C:\ProgramData\ComputeFactory\image-info.json`;
   PowerShell 7.6.10 LTS (MSI, pinned SHA-256; as SYSTEM the WinGet module works only there), the
-  `Microsoft.WinGet.Client` PowerShell module for all users and `Repair-WinGetPackageManager -AllUsers`.
+  `Microsoft.WinGet.Client` PowerShell module for all users, and WinGet (App Installer v1.29.380 from
+  the winget-cli release, pinned SHA-256) provisioned for all users and installed for the build user
+  (the Azure base image has none). Azure sysprep first removes app packages installed for a user but
+  not provisioned for all users (e.g. the WinGet source), which sysprep refuses (0x80073cf2).
   No Windows updates are applied at bake time (the bases are patched monthly; OS Updates installs the rest).
   The build's WinRM listener and port-5986 firewall rule stay in the image; no security group opens it.
   On Azure the Packer build user (`packer`, random password) also survives sysprep; it has no principals

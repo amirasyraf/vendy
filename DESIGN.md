@@ -826,7 +826,7 @@ commands use the default workspace and reject ambient `TF_CLI_ARGS*` / `TF_VAR_*
 `./poc status` and `.generated/logs/{images-apply,infra-apply,bake,idp}.log`. An exact dispatch ID is saved in
 `.generated/bake-run-id`. `./poc watch-bake <run-id>` only monitors the run: it returns 0 for success,
 1 for a completed non-success conclusion, and 2 if the outcome is unknown. The monitor polls every
-30 seconds with a two-hour limit (a Windows bake job may run 90 minutes) and stops after 10 consecutive failed status reads. It does not
+30 seconds with a two-hour limit (bake jobs are capped at 60 minutes) and stops after 10 consecutive failed status reads. It does not
 verify artifacts, publish DNS, or deploy the IDP. `./poc up --resume <run-id>` completes an interrupted
 bootstrap given a successful `bake.yml` dispatch on builder `main`. It checks that both resource
 workflows are idle, the platform gate is still closed, inventory is empty, and Terraform points to

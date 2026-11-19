@@ -49,6 +49,19 @@ maintains it alongside the hashes in `.poc-users`). Use them for signed-in live 
 IDP change instead of stopping at fixture checks or asking. When a new credential is created or shared,
 store it there (or another gitignored file) immediately. Never commit or echo them into docs/logs.
 
+## Pipeline time is the user's time
+
+- Never use a GitHub Actions bake or stage run to discover bugs. Before dispatching, run every new or
+  changed in-guest step (Ansible, Packer provisioner commands, sysprep, ec2launch) on a disposable
+  scratch instance of the same OS/cloud, and run full `packer validate` (not `-syntax-only`).
+- Every wait or poll loop (scripts, Packer inline PowerShell, workflows) must have a deadline and fail
+  with the underlying error (e.g. sysprep's `setuperr.log`). Job timeouts are set from measured
+  durations, not generous guesses; a hung step must fail in minutes, not at the job timeout.
+- While a run is in progress, check its log for progress; a step repeating the same output means it
+  is stuck. Cancel it and diagnose; do not wait for the timeout.
+- Never destroy, stop or replace a user-visible VM (including test VMs the user may be using) without
+  asking first.
+
 ## Troubleshooting lessons
 
 - Start with `./poc logs [backstage|caddy|postgres|all] [since]` and `./poc task <task-id>` (read-only).
