@@ -6,7 +6,7 @@ import re
 import shutil
 import sys
 
-from .core import SHUTDOWN, Fatal, acquire_lock, configure_environment, die, error, prepare_lifecycle, terminate_children
+from .core import Fatal, acquire_lock, cancel_background, configure_environment, die, error, prepare_lifecycle
 
 USAGE = ("usage: ./poc up [--images-only | --resume <run-id>]|down [--keep-images]|status|deploy-idp [<image-id>]|"
          "prune-idp-images|set-password <user>|watch-bake <run-id>|logs [service] [since]|task <task-id>|run <run-id>")
@@ -79,6 +79,4 @@ def main(argv: list[str]) -> int:
         error("interrupted")
         return 130
     finally:
-        # Stop background work: subprocesses are terminated and waits return at once.
-        SHUTDOWN.set()
-        terminate_children()
+        cancel_background()

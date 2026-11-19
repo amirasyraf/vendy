@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from pathlib import Path
 from .core import (
     AWS_ACCOUNT, AWS_REGION, CADDY_BACKUP, CADDY_VOLUME, CF_DNS_DIR, DOMAIN, GEN, HEALTH_URL, IDP_DIR, INFRA_DIR, LOGS,
     POC_ENV, USERS_FILE, Unknown, aws, aws_json, die, echo, info, nonempty, pause, poc_env_github_token, run,
-    show_tail, spawn, ssh, tf, tf_output, tls_backup_has_cert, warn,
+    show_tail, spawn, ssh, terminate_group, tf, tf_output, tls_backup_has_cert, warn,
 )
 
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
@@ -195,9 +196,13 @@ def deploy_idp(ip: str, mode: str, image: str | None = None, project_dir: Path =
         return False
     finally:
         env_file.unlink(missing_ok=True)
-        if build is not None and not build.done():
-            for proc in build_proc:
-                proc.terminate()
+        if build is not None:
+            # Stop the whole build (yarn, docker) and wait for it before the caller removes the checkout.
+            if not build.done():
+                for proc in build_proc:
+                    terminate_group(proc)
+            with contextlib.suppress(Exception):
+                build.result()
 
 
 def existing_idp_ip() -> str:

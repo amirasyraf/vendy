@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -194,18 +195,41 @@ def parallel(fn: Callable[[T], R], items: Iterable[T], workers: int = 8) -> list
     def task(item: T) -> Callable[[], R]:
         return _bound(lambda: fn(item))
 
-    with ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
+    pool = ThreadPoolExecutor(max_workers=min(workers, len(items)))
+    try:
         futures = [pool.submit(task(item)) for item in items]
         return [future.result() for future in futures]
+    except BaseException:
+        # Stop the other workers before joining them, so they cannot start further steps.
+        cancel_background()
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
-# Set when the command is exiting: no new subprocesses start and every wait returns at once.
+# Set when the command is failing or exiting: background threads start no new subprocesses and
+# their waits return at once. The main thread keeps working (for example to restore gates).
 SHUTDOWN = threading.Event()
 
 
+def _in_main_thread() -> bool:
+    return threading.current_thread() is threading.main_thread()
+
+
 def pause(seconds: float) -> bool:
-    """Sleep; True when the command is exiting (the caller should give up)."""
+    """Sleep; True when a background thread should give up. The main thread sleeps normally (Ctrl-C
+    interrupts it directly)."""
+    if _in_main_thread():
+        time.sleep(seconds)
+        return False
     return SHUTDOWN.wait(seconds)
+
+
+def cancel_background() -> None:
+    """Stop background work: no new subprocesses in worker threads, and every running child process
+    group (including grandchildren such as yarn, docker or terraform providers) is terminated."""
+    SHUTDOWN.set()
+    terminate_children()
 
 
 def wait_seconds(seconds: float, stop: threading.Event | None) -> bool:
@@ -252,8 +276,8 @@ def run(
 ) -> Result:
     """Run a command. Captured output is returned; with capture=False it goes to this thread's
     streams, and with log= both streams go to that file. Stdin is /dev/null unless given."""
-    if SHUTDOWN.is_set():
-        return Result(130, "", f"{cmd[0]}: not started; ./poc is exiting")
+    if SHUTDOWN.is_set() and not _in_main_thread():
+        return Result(130, "", f"{cmd[0]}: not started; background work was cancelled")
     log_file = open(log, "a" if append else "w") if log else None
     try:
         if log_file:
@@ -283,6 +307,8 @@ def run(
                 env=full_env,
                 # Children keep the lifecycle lock until they exit, like the workers they may start.
                 pass_fds=(_lock_fd,) if _lock_fd is not None else (),
+                # Its own process group, so cancellation reaches everything it starts.
+                start_new_session=True,
                 text=True,
                 errors="replace",
             )
@@ -312,8 +338,13 @@ def terminate_children() -> None:
     with _children_lock:
         children = list(_children)
     for proc in children:
-        if proc.poll() is None:
-            proc.terminate()
+        terminate_group(proc)
+
+
+def terminate_group(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGTERM)
 
 
 def require(result: Result, what: str) -> str:

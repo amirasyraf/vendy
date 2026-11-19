@@ -18,7 +18,8 @@ from .cloud import (
 )
 from .core import (
     AWS_REGION, AZURE_READER_PEM, BUILDER_REPO, CA_FINGERPRINT_RE, CF_DNS_DIR, DOMAIN, GEN, IMAGES_DIR, INFRA_DIR, LOGS,
-    MAINTENANCE_VARIABLE, OWNER, PLATFORM_REPO, POC_ENV, SSH_KEY, STATE_BUCKET, USERS_FILE, WORKFLOWS, Unknown, die,
+    MAINTENANCE_VARIABLE, OWNER, PLATFORM_REPO, POC_ENV, SSH_KEY, STATE_BUCKET, USERS_FILE, WORKFLOWS, Unknown,
+    cancel_background, die,
     gh_read, images_apply_or_destroy, infra_apply_or_destroy, info, last_line, log, nonempty, poc_env_github_token,
     require, require_image_tools, require_split_layout, require_terraform_azure_auth, require_tools, root_state, run,
     show_tail, spawn, success, tf, tf_output, warn,
@@ -86,8 +87,9 @@ def cmd_up(resume: str | None) -> None:
     stop = threading.Event()
     pending: list[Future] = []
     try:
-        clone = spawn(lambda: _clone_idp(tmp / "idp"))
-        pending.append(clone)
+        # Before any mutation: bootstrap cannot succeed without it.
+        if not _clone_idp(tmp / "idp"):
+            die("could not clone vendy-idp main; nothing was changed")
         bake, bake_log = None, LOGS / "bake.log"
         images = None
 
@@ -182,9 +184,9 @@ def cmd_up(resume: str | None) -> None:
             die("platform gate changed; refusing to publish the IDP")
         idp_log = LOGS / "idp.log"
         info(f"live log: {idp_log}")
-        idp_ok = clone.result()
-        if idp_ok:
-            idp_ok = spawn(lambda: deploy_idp(ip, "bootstrap", None, tmp / "idp"), log_path=idp_log).result()
+        deploy = spawn(lambda: deploy_idp(ip, "bootstrap", None, tmp / "idp"), log_path=idp_log)
+        pending.append(deploy)
+        idp_ok = deploy.result()
         if not idp_ok:
             show_tail(idp_log, 35)
             warn("IDP bootstrap failed; the platform remains gated. Inspect the log before retrying.")
@@ -227,8 +229,11 @@ def cmd_up(resume: str | None) -> None:
         info(f"IDP:          https://{DOMAIN}")
         info(f"SSH CA:       {fp}")
         info(f"IDP host:     ssh ubuntu@{ip}")
+    except BaseException:
+        # Stop background work before joining it; the bake itself continues on GitHub.
+        cancel_background()
+        raise
     finally:
-        # A failed bootstrap must not leave a watcher behind; the bake itself continues on GitHub.
         stop.set()
         wait_futures(pending)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -278,6 +283,9 @@ def cmd_images_only() -> None:
         log("Images")
         report_images(images)
         succeeded = True
+    except BaseException:
+        cancel_background()  # the main thread still restores the gate below
+        raise
     finally:
         log(f"Restore builder gate ({MAINTENANCE_VARIABLE}={previous_gate}, bake.yml {previous_workflow})")
         if previous_workflow == "disabled_manually":
@@ -290,7 +298,8 @@ def cmd_images_only() -> None:
                 warn("if the bake is still running, ./poc down cancels it and sweeps its build resources")
 
 
-def _destroy_root(label: str, root: Path, init_log: str, destroy_log: str, destroy, needs_azure: bool) -> bool:
+def _destroy_root(label: str, root: Path, init_log: str, destroy_log: str, destroy, needs_azure: bool,
+                  azure_ok: bool = True) -> bool:
     """Init and destroy one Terraform root when its state is nonempty. True when a destroy was attempted
     (so its state can be reconciled again after the fallback sweeps)."""
     if not tf(root, "init", "-input=false", "-lockfile=readonly", log=LOGS / init_log).ok:
@@ -302,7 +311,7 @@ def _destroy_root(label: str, root: Path, init_log: str, destroy_log: str, destr
         state = []
     if not state:
         return True
-    if needs_azure and not require_terraform_azure_auth():
+    if needs_azure and not azure_ok:
         return False
     if not destroy("destroy", log=LOGS / destroy_log).ok:
         show_tail(LOGS / destroy_log, 30)
@@ -370,11 +379,14 @@ def cmd_down(keep_images_requested: bool) -> None:
         # The two roots share no Terraform references (infra/ names the CA secret only), so they are
         # destroyed concurrently.
         log("Destroy shared infra" + (" and image tier (SSH CA, Azure gallery)" if versions_ok else ""))
+        # Set the Azure environment before the threads start: os.environ must not change while
+        # another thread copies it for a subprocess.
+        azure_auth = require_terraform_azure_auth() if versions_ok else False
         infra = (spawn(lambda: _destroy_root("shared", INFRA_DIR, "infra-init.log", "infra-destroy.log",
                                              infra_apply_or_destroy, False))
                  if not keep_bucket else None)
         images = (spawn(lambda: _destroy_root("image tier", IMAGES_DIR, "images-init.log", "images-destroy.log",
-                                              images_apply_or_destroy, True))
+                                              images_apply_or_destroy, True, azure_auth))
                   if versions_ok else None)
         infra_tf = bool(infra and infra.result())
         images_tf = bool(images and images.result())
@@ -435,5 +447,8 @@ def cmd_down(keep_images_requested: bool) -> None:
                     "verified; the SSH CA and golden images above remain.")
         else:
             success("CLEAN: POC cloud resources, DNS, Terraform state, GitHub wiring and inventory verified.")
+    except BaseException:
+        cancel_background()
+        raise
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
