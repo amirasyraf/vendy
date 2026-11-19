@@ -778,6 +778,9 @@ cmd_up() (
     run_bake "$fp" >"$bake_log" 2>&1 &
     bake_pid=$!
   fi
+  # A failed bootstrap must not leave the watcher holding the lifecycle lock; the bake itself continues.
+  # shellcheck disable=SC2064
+  [[ -z "$bake_pid" ]] || trap "kill $bake_pid 2>/dev/null; rm -rf '$tmp'" EXIT
   [[ -n "$bake_pid" ]] || report_images "$images"
 
   log "GitHub wiring"
@@ -803,6 +806,7 @@ cmd_up() (
     log "Wait for golden images"
     info "live log: $bake_log"
     wait "$bake_pid" || bake_rc=$?
+    trap 'rm -rf "$tmp"' EXIT
     if (( bake_rc != 0 )); then
       tail -30 "$bake_log" >&2
       warn "bake not verified; platform remains gated. Check the exact bake run; after success use ./poc up --resume <run-id>."
