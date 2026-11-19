@@ -100,7 +100,7 @@ Tooling versions (pin these):
   `AuthorizedPrincipalsFile __PROGRAMDATA__/ssh/auth_principals/%u`, `AuthorizedKeysFile none`,
   `PasswordAuthentication no`, `AllowTcpForwarding yes`, `Banner __PROGRAMDATA__/ComputeFactory/banner.txt`;
   principals file for the login user (`Administrator` on AWS, `cfadmin` on Azure, which forbids
-  `Administrator`); firewall rule `OpenSSH-Server-In-TCP`; UTC; Remote Desktop allowed
+  `Administrator`); firewall rule `OpenSSH-Server-In-TCP` for every profile (the built-in rule is Private-only; cloud NICs are Public); UTC; Remote Desktop allowed
   (`fDenyTSConnections=0`; reached only through SSH, §8.5); `C:\ProgramData\ComputeFactory\image-info.json`;
   PowerShell 7.6.10 LTS (MSI, pinned SHA-256; as SYSTEM the WinGet module works only there), the
   `Microsoft.WinGet.Client` PowerShell module for all users and `Repair-WinGetPackageManager -AllUsers`.
