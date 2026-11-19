@@ -53,7 +53,7 @@ do not run image cleanup, and report stage timings. Start with the hot-reload de
 iterations.
 
 Bake monitoring polls GitHub every 30 seconds and retries status-read errors. A temporary API timeout
-does not mean the workflow failed. Monitoring stops after 10 consecutive read errors or one hour,
+does not mean the workflow failed. Monitoring stops after 10 consecutive read errors or two hours,
 reporting an **unknown outcome**, not a failed bake. Only a completed run with conclusion `success`
 counts as a successful bake. `watch-bake` exits 0 for success, 1 for a completed non-success conclusion,
 or 2 when monitoring cannot determine the outcome.

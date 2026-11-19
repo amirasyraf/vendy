@@ -474,7 +474,7 @@ EOF
 }
 
 watch_bake() {
-  local id="${1:-}" result status conclusion errors=0 deadline=$((SECONDS + 3600))
+  local id="${1:-}" result status conclusion errors=0 deadline=$((SECONDS + 7200))
   [[ "$id" =~ ^[1-9][0-9]*$ ]] || die "usage: $0 watch-bake <run-id>"
   echo "bake run: https://github.com/$BUILDER_REPO/actions/runs/$id"
   while (( SECONDS < deadline )); do
@@ -504,7 +504,7 @@ watch_bake() {
     fi
     sleep 30
   done
-  warn "bake outcome unknown: monitoring stopped after repeated API errors or the one-hour limit"
+  warn "bake outcome unknown: monitoring stopped after repeated API errors or the two-hour limit"
   warn "monitoring did not cancel the workflow; resume with: ./poc watch-bake $id"
   return 2
 }
