@@ -228,8 +228,7 @@ def pause(seconds: float) -> bool:
 def cancel_background() -> None:
     """Stop background work: no new subprocesses in worker threads, and every running child process
     group (including grandchildren such as yarn, docker or terraform providers) is terminated."""
-    SHUTDOWN.set()
-    terminate_children()
+    terminate_children()  # sets SHUTDOWN under the start/registration lock
 
 
 def wait_seconds(seconds: float, stop: threading.Event | None) -> bool:
@@ -272,12 +271,12 @@ def run(
     env: dict[str, str | None] | None = None,
     cwd: Path | None = None,
     timeout: float | None = None,
-    started: Callable[[subprocess.Popen[str]], None] | None = None,
+    group: ProcessGroup | None = None,
 ) -> Result:
     """Run a command. Captured output is returned; with capture=False it goes to this thread's
-    streams, and with log= both streams go to that file. Stdin is /dev/null unless given."""
-    if SHUTDOWN.is_set() and not _in_main_thread():
-        return Result(130, "", f"{cmd[0]}: not started; background work was cancelled")
+    streams, and with log= both streams go to that file. Stdin is /dev/null unless given.
+    The child gets its own process group; if this call is interrupted, that group is stopped and
+    reaped before the exception propagates."""
     log_file = open(log, "a" if append else "w") if log else None
     try:
         if log_file:
@@ -297,34 +296,42 @@ def run(
                     full_env.pop(key, None)
                 else:
                     full_env[key] = value
-        try:
-            proc = subprocess.Popen(
-                [str(part) for part in cmd],
-                stdin=subprocess.PIPE if input is not None else (stdin if stdin is not None else subprocess.DEVNULL),
-                stdout=stdout if stdout is not None else subprocess.PIPE,
-                stderr=stderr if stderr is not None else subprocess.PIPE,
-                cwd=cwd,
-                env=full_env,
-                # Children keep the lifecycle lock until they exit, like the workers they may start.
-                pass_fds=(_lock_fd,) if _lock_fd is not None else (),
-                # Its own process group, so cancellation reaches everything it starts.
-                start_new_session=True,
-                text=True,
-                errors="replace",
-            )
-        except OSError as exc:
-            return Result(127, "", f"{cmd[0]}: {exc}")
+        # Starting and registering happen under the same lock that cancellation takes, so a process
+        # either is refused or is visible to the canceller.
         with _children_lock:
+            if (SHUTDOWN.is_set() and not _in_main_thread()) or (group is not None and group.cancelled):
+                return Result(130, "", f"{cmd[0]}: not started; background work was cancelled")
+            try:
+                proc = subprocess.Popen(
+                    [str(part) for part in cmd],
+                    stdin=subprocess.PIPE if input is not None else (stdin if stdin is not None else subprocess.DEVNULL),
+                    stdout=stdout if stdout is not None else subprocess.PIPE,
+                    stderr=stderr if stderr is not None else subprocess.PIPE,
+                    cwd=cwd,
+                    env=full_env,
+                    # Children keep the lifecycle lock until they exit, like the workers they may start.
+                    pass_fds=(_lock_fd,) if _lock_fd is not None else (),
+                    # Its own process group, so cancellation reaches everything it starts.
+                    start_new_session=True,
+                    text=True,
+                    errors="replace",
+                )
+            except OSError as exc:
+                return Result(127, "", f"{cmd[0]}: {exc}")
             _children.add(proc)
+            if group is not None:
+                group.procs.append(proc)
         try:
-            if started:
-                started(proc)
             try:
                 out_text, err_text = proc.communicate(input, timeout=timeout)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                _signal_group(proc, signal.SIGKILL)
                 out_text, err_text = proc.communicate()
                 return Result(124, out_text or "", f"{err_text or ''}\n{cmd[0]} timed out after {timeout}s")
+            except BaseException:
+                # Ctrl-C reaches only ./poc (the child has its own session): stop the child's group here.
+                _stop_group(proc)
+                raise
         finally:
             with _children_lock:
                 _children.discard(proc)
@@ -334,17 +341,43 @@ def run(
             log_file.close()
 
 
+class ProcessGroup:
+    """Processes started by run(group=...) that can be cancelled together, including ones not yet started."""
+
+    def __init__(self) -> None:
+        self.cancelled = False
+        self.procs: list[subprocess.Popen[str]] = []
+
+    def cancel(self) -> None:
+        with _children_lock:
+            self.cancelled = True
+            procs = list(self.procs)
+        for proc in procs:
+            _signal_group(proc, signal.SIGTERM)
+
+
+def _signal_group(proc: subprocess.Popen[str], sig: int) -> None:
+    # Signal the group even if its leader has exited: background descendants keep the group alive,
+    # and a registered child's group ID cannot be reused while any member remains.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, sig)
+
+
+def _stop_group(proc: subprocess.Popen[str]) -> None:
+    _signal_group(proc, signal.SIGTERM)
+    try:
+        proc.wait(timeout=10)
+    except BaseException:  # still running after 10s, or interrupted again
+        _signal_group(proc, signal.SIGKILL)
+        proc.wait()
+
+
 def terminate_children() -> None:
     with _children_lock:
+        SHUTDOWN.set()
         children = list(_children)
     for proc in children:
-        terminate_group(proc)
-
-
-def terminate_group(proc: subprocess.Popen[str]) -> None:
-    if proc.poll() is None:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, signal.SIGTERM)
+        _signal_group(proc, signal.SIGTERM)
 
 
 def require(result: Result, what: str) -> str:

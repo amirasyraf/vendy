@@ -8,15 +8,14 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import time
 from pathlib import Path
 
 from .core import (
     AWS_ACCOUNT, AWS_REGION, CADDY_BACKUP, CADDY_VOLUME, CF_DNS_DIR, DOMAIN, GEN, HEALTH_URL, IDP_DIR, INFRA_DIR, LOGS,
-    POC_ENV, USERS_FILE, Unknown, aws, aws_json, die, echo, info, nonempty, pause, poc_env_github_token, run,
-    show_tail, spawn, ssh, terminate_group, tf, tf_output, tls_backup_has_cert, warn,
+    POC_ENV, USERS_FILE, ProcessGroup, Unknown, aws, aws_json, die, echo, info, nonempty, pause, poc_env_github_token,
+    run, show_tail, spawn, ssh, tf, tf_output, tls_backup_has_cert, warn,
 )
 
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
@@ -139,10 +138,10 @@ def restore_caddy_data(ip: str) -> bool:
         return ssh(ip, remote, stdin=stream, capture=False).ok
 
 
-def _build_image(project_dir: Path, holder: list[subprocess.Popen[str]]) -> str | None:
+def _build_image(project_dir: Path, group: ProcessGroup) -> str | None:
     """Build the IDP artifact with the checkout's build.sh; progress goes to idp-build.log."""
     with open(LOGS / "idp-build.log", "w") as log_file:
-        result = run(["bash", str(project_dir / "deploy/build.sh")], stderr=log_file, started=holder.append)
+        result = run(["bash", str(project_dir / "deploy/build.sh")], stderr=log_file, group=group)
     lines = result.out.strip().splitlines()
     image = lines[-1].strip() if result.ok and lines else ""
     return image if IMAGE_ID.fullmatch(image) else None
@@ -155,12 +154,12 @@ def deploy_idp(ip: str, mode: str, image: str | None = None, project_dir: Path =
     os.close(fd)
     env_file = Path(name)
     build = None
-    build_proc: list[subprocess.Popen[str]] = []
+    build_group = ProcessGroup()
     try:
         if mode == "bootstrap":
             if image is None:
                 echo(f"building the IDP image while the host initializes; log: {LOGS / 'idp-build.log'}")
-                build = spawn(lambda: _build_image(project_dir, build_proc))
+                build = spawn(lambda: _build_image(project_dir, build_group))
             if not wait_for_ssh_ready(ip):
                 return False
             echo("host ready")
@@ -199,8 +198,7 @@ def deploy_idp(ip: str, mode: str, image: str | None = None, project_dir: Path =
         if build is not None:
             # Stop the whole build (yarn, docker) and wait for it before the caller removes the checkout.
             if not build.done():
-                for proc in build_proc:
-                    terminate_group(proc)
+                build_group.cancel()  # also refuses a build that has not started yet
             with contextlib.suppress(Exception):
                 build.result()
 
