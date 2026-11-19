@@ -352,8 +352,7 @@ class ProcessGroup:
         with _children_lock:
             self.cancelled = True
             procs = list(self.procs)
-        for proc in procs:
-            _signal_group(proc, signal.SIGTERM)
+        _stop_groups(procs)
 
 
 def _signal_group(proc: subprocess.Popen[str], sig: int) -> None:
@@ -363,21 +362,45 @@ def _signal_group(proc: subprocess.Popen[str], sig: int) -> None:
         os.killpg(proc.pid, sig)
 
 
-def _stop_group(proc: subprocess.Popen[str]) -> None:
-    _signal_group(proc, signal.SIGTERM)
+def _group_alive(proc: subprocess.Popen[str]) -> bool:
+    proc.poll()  # reap the leader, so a zombie leader does not count as a live member
     try:
-        proc.wait(timeout=10)
-    except BaseException:  # still running after 10s, or interrupted again
-        _signal_group(proc, signal.SIGKILL)
-        proc.wait()
+        os.killpg(proc.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stop_groups(procs: list[subprocess.Popen[str]], grace: float = 10) -> None:
+    """SIGTERM each group, wait until every member of every group has exited, and SIGKILL the
+    groups still alive after the grace period (or on a second interrupt)."""
+    for proc in procs:
+        _signal_group(proc, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    try:
+        while any(_group_alive(p) for p in procs) and time.monotonic() < deadline:
+            time.sleep(0.2)
+    except BaseException:
+        pass
+    for proc in procs:
+        if _group_alive(proc):
+            _signal_group(proc, signal.SIGKILL)
+    for proc in procs:
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=5)
+
+
+def _stop_group(proc: subprocess.Popen[str]) -> None:
+    _stop_groups([proc])
 
 
 def terminate_children() -> None:
     with _children_lock:
         SHUTDOWN.set()
         children = list(_children)
-    for proc in children:
-        _signal_group(proc, signal.SIGTERM)
+    _stop_groups(children)
 
 
 def require(result: Result, what: str) -> str:
