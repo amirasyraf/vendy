@@ -408,10 +408,11 @@ spec:
   **Compute → Virtual Machines** maps to `Resource` / `spec.type: vm` and `template:default/vm-request`
   (`product` tag, `cf/product: Virtual Machines`, `cf/launch-flow: platform-image`). VM platform cards
   (`/launch/compute/virtual-machines`, from `GET /api/vm-sizes/platforms`) lead to image release cards
-  (`/launch/compute/virtual-machines/<platform>`). Continue opens
+   (`/launch/compute/virtual-machines/<platform>`). Unavailable releases are greyed out; Continue opens
   `/create/templates/default/vm-request?formData={"compute":{"platform":…,"os":…,"imageVersion":…}}`.
-  Admission requires a release. For a client that omitted it, the IDP may infer the only
-  configured release for that OS/platform; ambiguous input is rejected. Old `/launch/vm-request[/<platform>]`
+   Admission requires a release and verifies current image availability. For a client that omitted
+   it, the IDP may infer the only configured release for that OS/platform; ambiguous input is rejected.
+   Old `/launch/vm-request[/<platform>]`
   links redirect. Home groups visible catalog Resources by category/product; the VM product page is
   `/products/compute/virtual-machines`, and `/catalog` remains the full inventory.
 - Template names (`metadata.name`): `vm-request`, `vm-modify` (platform repo) and
@@ -802,6 +803,12 @@ type ObservedVm = {
 - `GET /api/vm-sizes/platforms` → `{platforms: [{id, label, available, os: [{id, label, versions, family, minMemoryMiB}],
   reservedTagPrefixes, forbiddenTagKeyCharacters, staticPublicIp, error}]}`: `aws`, `azure` from `platform.json` on
   `main` (cached 5 minutes), plus `{id: vsphere, label: vSphere, available: false}` ("Coming soon").
+- `GET /api/vm-sizes/image-availability?platform=<p>` → `{images: [{os, version, available}]}` for
+  configured releases. The IDP role's `describe-images` policy permits `ec2:DescribeImages` for the
+  newest account-owned, managed AMI matching OS and release; it must be tagged `cf:poc=true` and
+  be `available`. The Azure Reader checks the latest eligible POC-managed gallery version and
+  region replication. Cloud lookup failures are unavailable to the picker; a new request is rejected
+  with 503 when the lookup fails, or 409 when no usable image is found.
 - `GET /api/vm-sizes/sizes?platform=<p>&os=<os>` (defaults `aws`, Linux) → `{platform, label, family,
   minMemoryMiB, reservedTagPrefixes, sizes: [{size, instanceType, specs}], error}`: the OS family's map. Specs: AWS `ec2:DescribeInstanceTypes`; Azure the
   Resource SKUs API (`2021-07-01`, location filter) with `quotaOk`.

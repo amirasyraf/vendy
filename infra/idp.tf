@@ -95,6 +95,21 @@ resource "aws_iam_role_policy" "idp_observe_vms" {
   })
 }
 
+# The launch picker and request admission verify account-owned golden AMIs.
+# DescribeImages does not support resource-level scoping.
+resource "aws_iam_role_policy" "idp_describe_images" {
+  name = "describe-images"
+  role = aws_iam_role.idp.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "ec2:DescribeImages"
+      Resource = "*"
+    }]
+  })
+}
+
 resource "aws_iam_role_policy_attachment" "idp_ssm" {
   role       = aws_iam_role.idp.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
