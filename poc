@@ -594,15 +594,17 @@ verify_bake_images() (
 
 # The catalog keeps entities in Postgres across redeploys; re-read every location now so changes to
 # org.yaml (new users/teams) take effect immediately instead of on the next processing cycle.
-refresh_catalog_locations() {
+refresh_catalog_locations() { # $1 = IDP host IP
   local token refs ref payload
+  # Pin the host: a resolver may still cache the NXDOMAIN from the pre-bootstrap DNS check.
+  local -a pin=(--resolve "$DOMAIN:443:$1")
   token="$(tf_infra output -raw backstage_token)" || return 1
-  refs="$(curl -fsS --max-time 10 -H "Authorization: Bearer $token" \
+  refs="$(curl "${pin[@]}" -fsS --max-time 10 -H "Authorization: Bearer $token" \
     "https://$DOMAIN/api/catalog/entities?filter=kind=location" \
     | jq -er 'select(type == "array" and length > 0) | .[] | "location:\(.metadata.namespace // "default")/\(.metadata.name)"')" || return 1
   while IFS= read -r ref; do
     payload="$(jq -nc --arg ref "$ref" '{entityRef:$ref}')" || return 1
-    curl -fsS --max-time 10 -o /dev/null -X POST -H "Authorization: Bearer $token" \
+    curl "${pin[@]}" -fsS --max-time 10 -o /dev/null -X POST -H "Authorization: Bearer $token" \
       -H 'Content-Type: application/json' -d "$payload" "https://$DOMAIN/api/catalog/refresh" || return 1
   done <<<"$refs"
   echo "catalog refresh requested"
@@ -632,8 +634,8 @@ deploy_idp() (
   deadline=$((SECONDS + 600))
   echo "waiting for $HEALTH_URL"
   while (( SECONDS < deadline )); do
-    if code="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 "$HEALTH_URL" 2>/dev/null)" \
-      && [[ "$code" == 200 ]] && refresh_catalog_locations; then
+    if code="$(curl --resolve "$DOMAIN:443:$ip" -fsS -o /dev/null -w '%{http_code}' --max-time 5 "$HEALTH_URL" 2>/dev/null)" \
+      && [[ "$code" == 200 ]] && refresh_catalog_locations "$ip"; then
       echo "IDP healthy; readiness and catalog reachable after $((SECONDS - start))s"
       return 0
     fi
