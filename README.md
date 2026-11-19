@@ -39,7 +39,7 @@ Fill in `GITHUB_TOKEN`, then use the command that matches what you want to do:
 | `./poc up` | Bring up the POC from empty shared state. |
 | `./poc status` | See resources, readiness, and recent pipeline runs. |
 | `./poc watch-bake <run-id>` | Check an existing bake without dispatching another. |
-| `./poc up --resume <run-id>` | Finish a gated bootstrap after a successful bake. |
+| `./poc up --resume <run-id>` | Finish a gated bootstrap using a dispatched bake; the IDP deploys while that bake finishes. |
 | `./poc up --images-only` | Rebuild and verify golden images, then prune superseded images. |
 | `./poc deploy-idp [<image-id>]` | Update the app on the existing host. |
 | `./poc prune-idp-images` | Clean up unused IDP images and registry blobs. |

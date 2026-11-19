@@ -757,7 +757,9 @@ commands use the default workspace and reject ambient `TF_CLI_ARGS*` / `TF_VAR_*
    Wait for host initialization, apply the targeted Cloudflare DNS record, restore the TLS backup
    unless Caddy is already running, and deploy from a temporary clone of IDP `main`. Sibling checkouts
    are not rebased or used as bootstrap sources. Require HTTP 200 and authenticated catalog access/refresh
-   before opening `stage.yml` and the platform gate.
+   before opening `stage.yml` and the platform gate. The IDP does not consume golden images, so a
+   needed bake runs in the background during step 5's wiring and bootstrap; the platform gate opens
+   only after both the IDP checks and the bake verification succeed.
 
 `up` never clears inventory and has no force option. Failed bootstrap retains resources; check
 `./poc status` and `.generated/logs/{images-apply,infra-apply,bake,idp}.log`. An exact dispatch ID is saved in
@@ -765,10 +767,10 @@ commands use the default workspace and reject ambient `TF_CLI_ARGS*` / `TF_VAR_*
 1 for a completed non-success conclusion, and 2 if the outcome is unknown. The monitor polls every
 30 seconds with a two-hour limit (bake jobs are capped at 60 minutes) and stops after 10 consecutive failed status reads. It does not
 verify artifacts, publish DNS, or deploy the IDP. `./poc up --resume <run-id>` completes an interrupted
-bootstrap given a successful `bake.yml` dispatch on builder `main`. It checks that both resource
-workflows are idle, the platform gate is still closed, inventory is empty, and Terraform points to
-an owned running IDP, an owned empty bucket and the existing SSH CA. It verifies that run's manifests
-and current images before continuing at step 5, and never reapplies infrastructure, dispatches or
+bootstrap given a `bake.yml` dispatch on builder `main` that is running or has succeeded. It checks
+that no resource workflow run other than that bake is active, the platform gate is still closed, inventory is empty, and Terraform points to
+an owned running IDP, an owned empty bucket and the existing SSH CA. It continues at step 5 while
+watching that run and verifying its manifests and current images in the background, and never reapplies infrastructure, dispatches or
 prunes. It is not a repair command for a partial apply or a failed bake. `down` is intentional
 teardown, not recovery for a failed verification read.
 

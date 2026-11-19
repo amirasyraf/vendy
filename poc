@@ -702,7 +702,7 @@ cmd_up() (
   [[ -s "$USERS_FILE" ]] || die "no IDP users; run ./poc set-password <user> first"
   # One-time Azure setup that survives down (DESIGN.md section 9).
   [[ -s "$ROOT/.poc-azure-reader.pem" ]] || die "missing $ROOT/.poc-azure-reader.pem (IDP Azure reader certificate; DESIGN.md section 9)"
-  local state ip bucket tmp fp images bake_needed=0 active keys
+  local state ip bucket tmp fp images bake_needed=0 active keys bake_pid="" bake_log="" bake_rc=0 idp_rc=0
   check_repo_variables "$BUILDER_REPO" "$PLATFORM_REPO"
   tf_infra init -input=false -lockfile=readonly >/dev/null
   state="$(infra_state)" || die "cannot read local Terraform state; refusing to apply"
@@ -720,7 +720,10 @@ cmd_up() (
   if [[ -n "$resume" ]]; then
     log "Check existing bootstrap"
     verify_maintenance_gate 1 "$PLATFORM_REPO" || die "platform is not gated; cannot resume a running POC"
-    active="$(active_runs)" && [[ -z "$active" ]] || die "cannot prove both resource workflows are idle"
+    # The resumed bake may still be running; nothing else may be.
+    active="$(active_runs)" || die "cannot read resource workflow runs"
+    [[ -z "$active" || "$active" == "$BUILDER_REPO:$resume" ]] \
+      || die "resource workflow runs other than bake $resume are active: $(tr '\n' ' ' <<<"$active")"
     ip="$(existing_idp_ip)" || die "cannot verify the existing IDP host"
     bucket="$(tf_infra output -raw state_bucket)"
     [[ "$bucket" == "$STATE_BUCKET" ]] || die "unexpected state bucket in Terraform outputs"
@@ -757,19 +760,23 @@ cmd_up() (
 
   log "Golden images"
   if [[ -n "$resume" ]]; then
-    verify_bake_images "$resume" "$fp" 0 >"$GEN/logs/bake-resume.log" 2>&1 \
-      || { tail -30 "$GEN/logs/bake-resume.log" >&2; die "existing bake $resume not verified; nothing was dispatched or pruned"; }
-    images="$(current_images "$fp" main)" || die "could not verify current images for builder main; platform remains gated"
+    # The bake may still be running; watch and verify it alongside the IDP bootstrap. Never prune.
+    bake_log="$GEN/logs/bake-resume.log"
+    info "verifying bake $resume in the background; live log: $bake_log"
+    { watch_bake "$resume" && verify_bake_images "$resume" "$fp" 0; } >"$bake_log" 2>&1 &
+    bake_pid=$!
   elif [[ "$bake_needed" == 1 ]]; then
     set_maintenance_gate 0 "$BUILDER_REPO"
     verify_maintenance_gate 0 "$BUILDER_REPO" || die "builder maintenance gate did not open"
     workflow_action enable "$BUILDER_REPO:bake.yml"
-    info "baking every images.yaml row; live log: $GEN/logs/bake.log"
-    run_bake "$fp" >"$GEN/logs/bake.log" 2>&1 \
-      || { tail -30 "$GEN/logs/bake.log" >&2; die "bake not verified; platform remains gated. Check the exact bake run; after success use ./poc up --resume <run-id>."; }
-    images="$(current_images "$fp" main)" || die "could not verify current images for builder main; platform remains gated. Use ./poc up --resume <run-id>."
+    # The IDP does not consume images; bake alongside the IDP bootstrap. The platform gate stays
+    # closed until both succeed.
+    bake_log="$GEN/logs/bake.log"
+    info "baking every images.yaml row in the background; live log: $bake_log"
+    run_bake "$fp" >"$bake_log" 2>&1 &
+    bake_pid=$!
   fi
-  report_images "$images"
+  [[ -n "$bake_pid" ]] || report_images "$images"
 
   log "GitHub wiring"
   gh variable set TF_STATE_BUCKET -R "$PLATFORM_REPO" -b "$bucket"
@@ -782,8 +789,29 @@ cmd_up() (
   log "Bootstrap IDP"
   verify_maintenance_gate 1 "$PLATFORM_REPO" || die "platform gate changed; refusing to publish the IDP"
   info "live log: $GEN/logs/idp.log"
-  deploy_idp "$ip" bootstrap "" "$tmp/idp" >"$GEN/logs/idp.log" 2>&1 \
-    || { tail -35 "$GEN/logs/idp.log" >&2; die "IDP bootstrap failed; the platform remains gated. Inspect the log before retrying."; }
+  deploy_idp "$ip" bootstrap "" "$tmp/idp" >"$GEN/logs/idp.log" 2>&1 || idp_rc=$?
+  if (( idp_rc != 0 )); then
+    tail -35 "$GEN/logs/idp.log" >&2
+    warn "IDP bootstrap failed; the platform remains gated. Inspect the log before retrying."
+  else
+    info "IDP healthy"
+  fi
+
+  if [[ -n "$bake_pid" ]]; then
+    log "Wait for golden images"
+    info "live log: $bake_log"
+    wait "$bake_pid" || bake_rc=$?
+    if (( bake_rc != 0 )); then
+      tail -30 "$bake_log" >&2
+      warn "bake not verified; platform remains gated. Check the exact bake run; after success use ./poc up --resume <run-id>."
+    elif ! images="$(current_images "$fp" main)"; then
+      bake_rc=1
+      warn "could not verify current images for builder main; platform remains gated. Use ./poc up --resume <run-id>."
+    else
+      report_images "$images"
+    fi
+  fi
+  (( idp_rc == 0 && bake_rc == 0 )) || die "bootstrap incomplete; the platform remains gated"
 
   log "Enable VM stages"
   workflow_action enable "$PLATFORM_REPO:stage.yml"
