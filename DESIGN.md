@@ -738,8 +738,9 @@ commands use the default workspace and reject ambient `TF_CLI_ARGS*` / `TF_VAR_*
 1. **Preflight**: check Docker/buildx, CLI tools, the AWS account, Azure subscription, certificate,
    SSH key, Cloudflare configuration, `.poc.env`, and repository AWS/Azure wiring. Refuse to apply
    if `infra/` state is unreadable/nonempty or platform `main` does not have an empty inventory.
-   Gate and disable resource workflows; verify they are quiescent and the POC cloud/DNS scope is clean,
-   except for a kept image tier (`cf:module=images` resources, the `cf-images` group and its contents,
+   Gate and disable resource workflows; verify they are quiescent and the POC cloud/DNS scope is clean
+   (retried like `down`'s final verification, §12.3 step 5, because a just-finished teardown can leave
+   cached DNS and stale tag-index entries), except for a kept image tier (`cf:module=images` resources, the `cf-images` group and its contents,
    and AMIs/snapshots tagged `cf:managed=true`).
 2. **Image tier**: apply `infra/images` (creates the CA and gallery if missing, otherwise no change) and
    require the SSM public key to match the CA fingerprint in its state.

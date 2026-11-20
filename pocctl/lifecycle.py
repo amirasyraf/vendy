@@ -123,11 +123,11 @@ def cmd_up(resume: str | None) -> None:
             workflow_action("disable", WORKFLOWS)
             if not verify_quiescent():
                 die("cannot verify bootstrap freeze and workflow quiescence")
-            if not verify_cloud_clean(True):
+            # Retried like down's final check: right after a down, cached DNS and stale tag-index
+            # entries can fail a single pass. Quiescence is rechecked around every attempt.
+            if not verify_clean(True):
                 die("cannot prove a clean cloud/DNS starting point (only the SSH CA and golden images may remain); "
                     "inspect the checks above")
-            if not verify_quiescent():
-                die("resource workflows changed during preflight; refusing to apply")
 
             log("Image tier (SSH CA, Azure gallery)")
             fp = apply_images_root() or die(f"image tier not ready (see {LOGS / 'images-apply.log'})")
