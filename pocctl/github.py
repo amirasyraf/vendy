@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 from .core import (
     AWS_ACCOUNT, AWS_REGION, AZURE_LOCATION, AZURE_SUBSCRIPTION, AZURE_TENANT, MAINTENANCE_VARIABLE, OWNER,
@@ -15,25 +18,48 @@ from .core import (
 
 WIRING = ("TF_STATE_BUCKET", "BACKSTAGE_URL", "BACKSTAGE_TOKEN")
 REPO_VARIABLES = ("AWS_ROLE_ARN", "AWS_REGION", "AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_SUBSCRIPTION_ID", "AZURE_LOCATION")
+SETTLE_SECONDS = 90
+
+T = TypeVar("T")
+
+
+def settle(read: Callable[[], T], done: Callable[[T], bool]) -> T | None:
+    """GitHub reads can trail its own writes (a read right after a successful write may return the old
+    value, and later reads can still hit a lagging replica). Every check of state that this command or a
+    recent write changed polls until done(value) or SETTLE_SECONDS pass. Returns the last value read,
+    or None when it was unreadable. A real mismatch still fails, just after the window."""
+    deadline = time.monotonic() + SETTLE_SECONDS
+    while True:
+        try:
+            value: T | None = read()
+        except Unknown:
+            value = None
+        if (value is not None and done(value)) or time.monotonic() >= deadline or pause(3):
+            return value
+
+
+def _gate(repo: str) -> str:
+    result = gh_read("variable", "get", MAINTENANCE_VARIABLE, "-R", repo)
+    if not result.ok:
+        raise Unknown(f"could not read {MAINTENANCE_VARIABLE} on {repo}")
+    return result.out.strip()
 
 
 def set_maintenance_gate(value: str, *repos: str) -> None:
     for repo in repos:
         result = run(["gh", "variable", "set", MAINTENANCE_VARIABLE, "-R", repo, "-b", value])
-        if result.ok:
-            continue
-        warn(f"could not confirm setting {MAINTENANCE_VARIABLE}={value} on {repo} ({last_line(result.err)}); checking current value")
+        if not result.ok:
+            warn(f"setting {MAINTENANCE_VARIABLE}={value} on {repo} reported an error ({last_line(result.err)}); checking current value")
         if not verify_maintenance_gate(value, repo):
             die(f"could not confirm {MAINTENANCE_VARIABLE}={value} on {repo}; refusing to continue")
 
 
 def verify_maintenance_gate(expected: str, *repos: str) -> bool:
     for repo in repos:
-        result = gh_read("variable", "get", MAINTENANCE_VARIABLE, "-R", repo)
-        if not result.ok:
+        value = settle(functools.partial(_gate, repo), lambda v: v == expected)
+        if value is None:
             warn(f"could not read {MAINTENANCE_VARIABLE} on {repo}")
             return False
-        value = result.out.strip()
         if value != expected:
             warn(f"{MAINTENANCE_VARIABLE} on {repo} is '{value}', expected {expected}")
             return False
@@ -68,43 +94,25 @@ def _workflow_state(repo: str, workflow: str) -> str:
 
 
 def workflow_action(action: str, specs: tuple[tuple[str, str], ...] | list[tuple[str, str]]) -> None:
+    """Always write, then wait for the state to settle: deciding to skip from a read that may be stale
+    could leave a workflow in the wrong state. Enabling an active workflow succeeds; disabling an
+    inactive one returns HTTP 403 "not active", which the settled state read then confirms."""
+    expected = "active" if action == "enable" else "disabled_manually"
     for repo, workflow in specs:
-        listing = gh_read("workflow", "list", "--all", "-R", repo, "--json", "path,state")
-        if not listing.ok:
-            die(f"could not inspect {repo}/{workflow}; refusing to continue")
-        try:
-            states = [w["state"] for w in json.loads(listing.out) if w.get("path") == f".github/workflows/{workflow}"]
-        except (ValueError, TypeError, KeyError):
-            die(f"could not inspect {repo}/{workflow}; refusing to continue")
-        if not states:
-            die(f"{repo}/{workflow} was not found; refusing to continue")
-        if action == "disable" and states[0] == "disabled_manually":
-            info(f"{repo}/{workflow} already disabled ({states[0]})")
-            continue
-        if action == "enable" and states[0] == "active":
-            info(f"{repo}/{workflow} already enabled")
-            continue
-        result = run(["gh", "workflow", action, workflow, "-R", repo])
-        if not result.ok:
-            warn(f"could not confirm {action} of {repo}/{workflow} from the write response; checking current state")
-        try:
-            state = _workflow_state(repo, workflow)
-        except Unknown:
-            die(f"could not confirm {action} of {repo}/{workflow}")
-        if (action == "enable" and state != "active") or (action == "disable" and state != "disabled_manually"):
-            die(f"could not confirm {action} of {repo}/{workflow} (state: {state})")
-        info(f"{action} {repo}/{workflow}")
+        result = run(["gh", "api", "-X", "PUT", f"repos/{repo}/actions/workflows/{workflow}/{action}"])
+        if not result.ok and "not active" not in result.err:
+            warn(f"{action} {repo}/{workflow} reported an error ({last_line(result.err)}); checking current state")
+        state = settle(functools.partial(_workflow_state, repo, workflow), lambda s: s == expected)
+        if state != expected:
+            die(f"could not confirm {action} of {repo}/{workflow} after {SETTLE_SECONDS}s (state: {state or 'unreadable'})")
+        info(f"{repo}/{workflow}: {state}")
 
 
 def verify_workflows_disabled() -> bool:
     for repo, workflow in WORKFLOWS:
-        try:
-            state = _workflow_state(repo, workflow)
-        except Unknown as exc:
-            warn(str(exc))
-            return False
-        if not state:
-            warn(f"{repo}/{workflow} was not found")
+        state = settle(functools.partial(_workflow_state, repo, workflow), lambda s: s == "disabled_manually")
+        if state is None:
+            warn(f"could not inspect {repo}/{workflow}")
             return False
         if state != "disabled_manually":
             warn(f"{repo}/{workflow} is not manually disabled (state: {state})")
@@ -161,9 +169,9 @@ def cancel_runs() -> None:
 def verify_quiescent() -> bool:
     if not verify_frozen():
         return False
-    try:
-        active = active_runs()
-    except Unknown:
+    # Runs cancelled moments ago can still be listed as in progress.
+    active = settle(active_runs, lambda runs: not runs)
+    if active is None:
         warn("could not verify workflow quiescence")
         return False
     if active:
@@ -210,6 +218,10 @@ def reset_inventory(checkout: Path) -> bool:
         if not git("commit", "-qm", "poc: reset VM inventory") or not git("push", "-q", "origin", "HEAD:main"):
             return False
         info("inventory reset")
+    inventory = settle(verify_inventory_empty, lambda state: state == "empty")
+    if inventory != "empty":
+        warn(f"platform main's VM inventory is {inventory or 'unreadable'} after the reset")
+        return False
     return True
 
 
@@ -239,10 +251,18 @@ def clear_platform_wiring() -> bool:
         for name in WIRING:
             if name in present and not run(["gh", kind, "delete", name, "-R", PLATFORM_REPO]).ok:
                 warn(f"could not delete platform {kind} {name}; confirming current state")
-    try:
-        return not platform_wiring()
-    except Unknown:
+    return verify_wiring_cleared()
+
+
+def verify_wiring_cleared() -> bool:
+    names = settle(platform_wiring, lambda found: not found)
+    if names is None:
+        warn("could not read platform GitHub wiring")
         return False
+    if names:
+        warn(f"platform GitHub wiring remains: {' '.join(names)}")
+        return False
+    return True
 
 
 def ensure_repos() -> None:

@@ -21,6 +21,8 @@ ROW_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
 GALLERY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 BUILDERS = {"aws": "amazon-ebs", "azure": "azure-arm"}
 BAKE_WATCH_SECONDS = 7200
+DISPATCH_RETRY_SECONDS = 90
+DISABLED_DISPATCH = "Cannot trigger a 'workflow_dispatch' on a disabled workflow"
 
 
 class Image(NamedTuple):
@@ -288,9 +290,18 @@ def watch_bake(run_id: str, stop: threading.Event | None = None) -> int:
 
 
 def run_bake(fp: str, stop: threading.Event | None = None) -> bool:
-    # Never retry dispatch: a lost response could still have created a run.
-    result = run(["gh", "api", f"repos/{BUILDER_REPO}/actions/workflows/bake.yml/dispatches",
-                  "-f", "ref=main", "-F", "return_run_details=true"])
+    # Never retry an ambiguous dispatch: a lost response could still have created a run. The one
+    # exception is GitHub's explicit refusal of a still-disabled workflow (HTTP 422, no run created),
+    # which happens when the dispatch endpoint has not yet seen the enable that was just verified.
+    deadline = time.monotonic() + DISPATCH_RETRY_SECONDS
+    while True:
+        result = run(["gh", "api", f"repos/{BUILDER_REPO}/actions/workflows/bake.yml/dispatches",
+                      "-f", "ref=main", "-F", "return_run_details=true"])
+        if result.ok or DISABLED_DISPATCH not in result.err or time.monotonic() >= deadline:
+            break
+        warn("bake.yml is not enabled for dispatch yet; retrying (no run was created)")
+        if wait_seconds(5, stop):
+            return False
     if not result.ok:
         warn(f"bake dispatch could not be confirmed ({last_line(result.err)}); "
              f"check https://github.com/{BUILDER_REPO}/actions before retrying")

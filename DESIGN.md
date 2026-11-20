@@ -780,7 +780,13 @@ teardown, not recovery for a failed verification read.
 
 Image verification and workflow freeze/teardown GitHub reads retry up to four times (2, 4 and 8 seconds
 between failures). A failed read cannot supply partial output; an unknown gate, run list or
-inventory is not treated as an empty one. Dispatch is never retried automatically.
+inventory is not treated as an empty one. GitHub reads can trail its own writes (a workflow read
+`active` right after a successful disable), so every check of a gate, workflow state, active-run
+list, platform wiring or inventory polls for up to 90 seconds until it shows the expected value;
+a genuine mismatch still fails after that window. Workflow enable/disable always writes through the
+REST API and is then confirmed by that settled read, never skipped on an earlier read. Dispatch is
+never retried, except on GitHub's explicit refusal of a still-disabled workflow (HTTP 422, no run
+created), for up to 90 seconds.
 
 `./poc up --images-only` rebakes without touching anything else, whether the POC is up or down: it
 applies `infra/images`, opens the builder gate and `bake.yml`, runs and verifies the bake as in step 4

@@ -25,9 +25,9 @@ from .core import (
     show_tail, spawn, success, tf, tf_output, warn,
 )
 from .github import (
-    active_runs, cancel_runs, check_repo_variables, clear_platform_wiring, ensure_repos, platform_wiring,
-    reset_inventory, set_maintenance_gate, verify_frozen, verify_inventory_empty, verify_maintenance_gate,
-    verify_quiescent, workflow_action,
+    active_runs, cancel_runs, check_repo_variables, clear_platform_wiring, ensure_repos, reset_inventory,
+    set_maintenance_gate, verify_frozen, verify_inventory_empty, verify_maintenance_gate, verify_quiescent,
+    verify_wiring_cleared, workflow_action,
 )
 from .idp import deploy_idp, dns_apply, existing_idp_ip
 from .images import (
@@ -426,18 +426,13 @@ def cmd_down(keep_images_requested: bool) -> None:
         if inventory == "empty":
             info("inventory already empty")
         elif inventory == "nonempty":
-            if (not (platform_dir / ".git").is_dir() or not reset_inventory(platform_dir)
-                    or verify_inventory_empty() != "empty"):
+            if not (platform_dir / ".git").is_dir() or not reset_inventory(platform_dir):
                 die("NOT CLEAN: could not reset and verify platform main's VM inventory")
         else:
             die("NOT CLEAN: could not read platform main's VM inventory; it was not reset. Rerun down to verify.")
         if not verify_quiescent():
             die("NOT CLEAN: resource workflows are no longer quiescent")
-        try:
-            wiring = platform_wiring()
-        except Unknown:
-            wiring = ["unreadable"]
-        if wiring:
+        if not verify_wiring_cleared():
             die("NOT CLEAN: platform GitHub wiring remains or could not be read")
         if keep_images_requested:
             log("Kept image tier")
