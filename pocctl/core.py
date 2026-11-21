@@ -577,8 +577,11 @@ def require_tools(*extra: str) -> None:
         die("cannot verify GitHub authentication; check gh auth status")
     # The sweeps use the az CLI. Terraform's azurerm provider needs ARM_* only for `up` and for
     # destroying an existing local infra state; see DESIGN.md §9.
-    if run(["az", "account", "show", "--query", "id", "-o", "tsv"]).out.strip() != AZURE_SUBSCRIPTION:
-        die(f"az CLI not logged in to subscription {AZURE_SUBSCRIPTION} (run azsp)")
+    az_account = run(["az", "account", "show", "--query", "id", "-o", "tsv"])
+    if not az_account.ok:
+        die(f"az CLI failed: {last_line(az_account.err)} (broken install? try `az version`; not logged in? run azsp)")
+    if az_account.out.strip() != AZURE_SUBSCRIPTION:
+        die(f"az CLI is on subscription {az_account.out.strip()}, expected {AZURE_SUBSCRIPTION} (run azsp)")
 
 
 def require_terraform_azure_auth() -> bool:
