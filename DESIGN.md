@@ -32,6 +32,7 @@ workflow's cloud login step, the bake's source selector, the IDP's per-cloud spe
 The IDP organizes products independently of the cloud where they run. Home groups visible resources
 by category and product; Resources stays a searchable inventory. **Launch** starts at product
 categories. **Compute → Virtual Machines** leads to platform and image release cards, then the VM form (5.2).
+**Compute → Containers** runs container images on a k3s cluster whose control plane is on the IDP host (section 13).
 
 Out of scope for the POC: real AD, Vault, HA, production-grade security, guaranteed spend limits,
 and a GitHub Actions pipeline to deploy the IDP. Image lifecycle cleanup and optional demo expiry
@@ -696,8 +697,9 @@ vendy/                           # 4th repo: the "home" of the POC
   infra/                         # shared Terraform root, LOCAL state (gitignored), applied only by ./poc
     main.tf                      #   default_tags { cf:poc = "true", cf:module = "infra" } on the AWS provider
     state-bucket.tf              #   S3 bucket for VM Terraform state; never force-empty
-    idp.tf                       #   IDP EC2 (t4g.medium), EIP, SG, instance role (read the CA secret by name;
-                                 #   read-only EC2 describe for sizes and the VM health check)
+    idp.tf                       #   IDP EC2 (t4g.large), EIP, SG, instance role (read the CA secret by name;
+                                 #   read-only EC2 describe for sizes and the VM health check; worker ASG resize)
+    workers.tf, workers-azure.tf #   container worker pools (ASGs, Azure group cf-workers with two scale sets)
     azure.tf                     #   Azure reader secret compute-factory/azure-reader (from .poc-azure-reader.pem)
                                  #   + host-role read
     tokens.tf                    #   random_password: PG password, BACKSTAGE_TOKEN
@@ -874,3 +876,101 @@ best-effort; no output does not prove quiescence. The lifecycle commands verify 
 - `down` removes only Terraform-tracked or POC-owned AWS/Azure resources, the targeted Cloudflare
   `idp` record, and the POC's GitHub wiring and `vms/`. Unrelated Azure groups may remain.
   The Azure identities and `AZURE_*` variables (9) persist like the AWS OIDC role.
+
+## 13. Containers
+
+**Compute → Containers** is a managed container service from the user's side: supply an image and a
+few settings, get an HTTPS URL. Kubernetes is never exposed; there are no raw manifests or Compose
+files. Exact interfaces: [CONTRACTS.md §12](CONTRACTS.md#12-containers-compute--containers).
+
+### 13.1 Request and day-2
+
+The `container-request` template (Launch card → form) asks for name, team, image, port, platform
+(AWS/Azure), architecture (amd64/arm64), size (XS/S/M CPU and memory presets), replicas (1–2), a
+public URL switch, non-secret env vars and the tags table. The container page shows status, URL,
+pods with their nodes, logs and the latest run, and offers Change (image, port, size, replicas,
+public, env), Restart and Delete. Platform and architecture are fixed after creation.
+
+### 13.2 Inventory and runs (the VM model)
+
+Each container is `containers/<name>/catalog-info.yaml` in `vendy-platform` (`Resource`,
+`spec.type: container`), read by the `cf-containers` Location and filtered by owner like VMs (§5.1a).
+Spec is desired state; replicas, pods and logs are read live from the cluster.
+
+Runs use the VM orchestrator engine (§6) as a second instance with its own tables, workflow
+(`container-stage.yml`), concurrency group and run pages (`/containers/runs/<id>`), so VM and container
+names never share run state. Git writes (`register`, `configure`, `destroy`, `finalize`) are workflow
+stages; cluster changes are in-process stages, because the k3s API is on the IDP host and its
+credential never leaves it. `deploy` applies a Deployment and Service; `rollout` waits, across
+orchestrator ticks, until the Deployment is available, showing "Provisioning capacity" while a worker
+starts, and fails permanently on image pull errors or a crash loop.
+
+All containers share the namespace `apps` (one quota, Pod Security `baseline`); names are unique,
+and team isolation is the IDP's authorization, not Kubernetes RBAC.
+
+### 13.3 Cluster
+
+- **Control plane**: a k3s server on the IDP host next to Docker Compose (separate containerd). The
+  host is a `t4g.large` (8 GiB). The server is tainted so user pods never run there; k3s system pods,
+  the autoscalers and CoreDNS tolerate the taint. `deploy/cluster-install.sh` installs and updates it on
+  every IDP deploy and only restarts k3s when its version or configuration changes.
+- **Workers**: four pools, each 0–2 instances and created at 0: `aws-amd64` (`t3.micro`), `aws-arm64`
+  (`t4g.micro`), `azure-amd64` (`Standard_B2ats_v2`), `azure-arm64` (`Standard_B2pts_v2`), all 1 GiB.
+  Pods select `vendy.io/pool=<platform>-<arch>`. Workers boot plain Ubuntu and join with a provider ID
+  read from instance metadata and the pool label.
+- **No cloud controller**: real cloud controllers delete nodes they cannot find in their own cloud, so a
+  two-cloud cluster keeps k3s's stub controller, which keeps the kubelet-supplied provider ID.
+- **Cross-cloud network**: k3s's embedded multicloud mode (WireGuard between every node's public IP;
+  the server uses the EIP). TCP 6443, UDP 51820 and TCP 10250 are open. A worker's address is fixed for
+  its lifetime because workers are replaced, never stopped.
+
+### 13.4 Autoscaling
+
+One Cluster Autoscaler per cloud on the server (`--cloud-provider` takes one value), each with its own
+leader lease, status config map and explicit node groups. Each skips nodes whose provider ID is not
+its own. Running one per cloud is not documented as supported upstream; a user reports the same
+setup on k3s ([kubernetes/autoscaler#10140](https://github.com/kubernetes/autoscaler/issues/10140)).
+`--max-bulk-soft-taint-count` stays at its non-zero default, since at 0 one instance's cleanup touches
+the other's nodes (#5544).
+
+- Scale from zero: label template tags on each ASG and scale set; CA derives the architecture from
+  the instance type.
+- Credentials: the AWS autoscaler uses the host role (resize and terminate on the worker ASGs only).
+  The Azure autoscaler uses `cf-idp-azure-reader`, which `infra/` makes Contributor on the
+  `cf-workers` group only; no new identity is needed.
+- Scale-down: an idle worker is removed after about 2 minutes unneeded (shortened from 10), and a node
+  first judged unremovable is rechecked after 1 minute instead of 5. With no
+  cloud controller nothing deletes its Node object, so a host timer deletes nodes the autoscaler
+  marked and that stopped reporting.
+
+### 13.5 URLs and TLS
+
+`*.apps.idp.amirasyraf.dev` → the IDP EIP (DNS-only), applied with the `idp` record. Caddy serves the
+wildcard with on-demand TLS: before requesting a certificate for a host it asks the IDP, which
+answers only for an existing public container. It proxies to the container's Service through the
+cluster DNS on the host. No ingress controller, DNS API token or custom Caddy build is involved.
+Let's Encrypt's weekly limit for `amirasyraf.dev` covers these certificates too.
+
+### 13.6 Lifecycle
+
+`up` creates the worker pools (empty) with shared infra and installs the cluster during the IDP
+deploy; it refuses a nonempty `containers/` like `vms/`. `down` destroys the pools with shared infra
+(terminating any running worker; the Azure group's deletion is the fallback) and resets
+`containers/` with `vms/`. Shared infra now needs the Azure credentials for both apply and destroy.
+
+### 13.7 Cost
+
+Idle: only the IDP host. Each running worker adds about US$0.011–0.013/h (list prices of the four
+sizes), only while it runs.
+
+### 13.8 Evidence and limits
+
+- Scratch Azure environment (k3s v1.37.2, CA v1.37.0, 2026-11-23): both scale sets went 0→1 for a
+  pending pod (pod running 66–85 s after apply), the provider ID matched exactly with correct `arch`
+  and pool labels, and both went back to 0. Two full cycles passed with the node cleanup timer
+  (stale nodes deleted seconds after capacity reached 0). With a 30 s recheck timeout, scale-down
+  took about 1.5 minutes instead of 6.
+- The full path (AWS pools, cross-cloud WireGuard to Azure, Caddy routing through the cluster DNS,
+  on-demand TLS) is proven only by a live `./poc up` with a deployed container per pool.
+- Workers have public IPs and the k3s API is open to the internet behind its join token; there is no
+  secret store, no private registry and no persistent storage.

@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 from .core import (
-    AWS_ACCOUNT, AWS_REGION, CADDY_BACKUP, CADDY_VOLUME, CF_DNS_DIR, DOMAIN, GEN, HEALTH_URL, IDP_DIR, INFRA_DIR, LOGS,
+    AWS_ACCOUNT, AWS_REGION, AZURE_READER_CLIENT_ID, AZURE_READER_PEM, AZURE_SUBSCRIPTION, AZURE_TENANT, CADDY_BACKUP, CADDY_VOLUME, CF_DNS_DIR, DOMAIN, GEN, HEALTH_URL, IDP_DIR, INFRA_DIR, LOGS,
     POC_ENV, USERS_FILE, ProcessGroup, Unknown, aws, aws_json, die, echo, info, nonempty, pause, poc_env_github_token,
     run, show_tail, spawn, ssh, tf, tf_output, tls_backup_has_cert, warn,
 )
@@ -38,7 +38,7 @@ def dns_apply(ip: str) -> bool:
     """Point the targeted Cloudflare record at ip, or remove it when ip is empty."""
     path = LOGS / "dns.log"
     ok = tf(CF_DNS_DIR, "apply", "-auto-approve", "-input=false", "-target=cloudflare_dns_record.idp",
-            "-var", f"idp_ip={ip}", log=path).ok
+            "-target=cloudflare_dns_record.idp_apps", "-var", f"idp_ip={ip}", log=path).ok
     if not ok:
         show_tail(path)
     return ok
@@ -48,15 +48,25 @@ def write_idp_env(path: Path) -> bool:
     token = poc_env_github_token()
     users = base64.b64encode(USERS_FILE.read_bytes()).decode() if nonempty(USERS_FILE) else ""
     outputs = {name: tf_output(INFRA_DIR, name) for name in
-               ("postgres_password", "backstage_token", "ssh_ca_secret_id", "azure_reader_secret_id")}
-    if not token or not users or not all(outputs.values()):
+               ("postgres_password", "backstage_token", "ssh_ca_secret_id", "azure_reader_secret_id", "idp_ip",
+                "k3s_version", "cluster_autoscaler_version", "k3s_token", "aws_worker_groups", "azure_workers_rg",
+                "azure_worker_scale_sets")}
+    if not token or not users or not all(outputs.values()) or not nonempty(AZURE_READER_PEM):
         warn("IDP configuration has missing required values")
         return False
+    # The Azure container autoscaler signs in as cf-idp-azure-reader (Contributor on the worker group).
+    reader_cert = base64.b64encode(AZURE_READER_PEM.read_bytes()).decode()
     content = (
         f"IDP_DOMAIN={DOMAIN}\nIDP_USERS_B64={users}\nGITHUB_TOKEN={token}\n"
         f"POSTGRES_PASSWORD={outputs['postgres_password']}\nBACKSTAGE_TOKEN={outputs['backstage_token']}\n"
         f"AWS_REGION={AWS_REGION}\nSSH_CA_SECRET_ID={outputs['ssh_ca_secret_id']}\n"
         f"AZURE_READER_SECRET_ID={outputs['azure_reader_secret_id']}\n"
+        f"K3S_VERSION={outputs['k3s_version']}\nCA_VERSION={outputs['cluster_autoscaler_version']}\n"
+        f"K3S_TOKEN={outputs['k3s_token']}\nIDP_PUBLIC_IP={outputs['idp_ip']}\n"
+        f"AWS_WORKER_GROUPS={outputs['aws_worker_groups']}\n"
+        f"AZURE_SUBSCRIPTION_ID={AZURE_SUBSCRIPTION}\nAZURE_TENANT_ID={AZURE_TENANT}\n"
+        f"AZURE_WORKERS_RG={outputs['azure_workers_rg']}\nAZURE_WORKER_SCALE_SETS={outputs['azure_worker_scale_sets']}\n"
+        f"AZURE_AUTOSCALER_CLIENT_ID={AZURE_READER_CLIENT_ID}\nAZURE_AUTOSCALER_CERT_B64={reader_cert}\n"
     )
     fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_CREAT, 0o600)
     with os.fdopen(fd, "w") as stream:

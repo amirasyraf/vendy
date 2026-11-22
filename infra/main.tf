@@ -1,8 +1,9 @@
 terraform {
   required_version = ">= 1.10"
   required_providers {
-    aws    = { source = "hashicorp/aws", version = "~> 6.0" }
-    random = { source = "hashicorp/random", version = "~> 3.6" }
+    aws     = { source = "hashicorp/aws", version = "~> 6.0" }
+    random  = { source = "hashicorp/random", version = "~> 3.6" }
+    azurerm = { source = "hashicorp/azurerm", version = "~> 4.0" }
   }
   # Local state on purpose: nothing remote may outlive `./poc down`. The SSH CA and image gallery
   # are in the separate images/ root, which `./poc down --keep-images` keeps.
@@ -31,8 +32,20 @@ variable "aws_profile" {
 }
 
 variable "idp_instance_type" {
+  type = string
+  # 8 GiB: Backstage and Postgres plus the k3s control plane for Containers (DESIGN.md §13.3).
+  default = "t4g.large"
+}
+
+# Containers cluster versions. The autoscaler's minor version must match k3s's.
+variable "k3s_version" {
   type    = string
-  default = "t4g.medium"
+  default = "v1.37.2+k3s1"
+}
+
+variable "cluster_autoscaler_version" {
+  type    = string
+  default = "v1.37.0"
 }
 
 variable "admin_ssh_public_key_path" {
@@ -43,7 +56,7 @@ variable "admin_ssh_public_key_path" {
 data "aws_caller_identity" "current" {}
 
 locals {
-  account_id   = data.aws_caller_identity.current.account_id
-  state_bucket = "cf-tfstate-${local.account_id}-apse2"
+  account_id    = data.aws_caller_identity.current.account_id
+  state_bucket  = "cf-tfstate-${local.account_id}-apse2"
   ssh_ca_secret = "compute-factory/ssh-ca" # created by infra/images
 }

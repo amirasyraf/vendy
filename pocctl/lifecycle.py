@@ -81,7 +81,7 @@ def cmd_up(resume: str | None) -> None:
     if resume is not None and not state:
         die("no existing infra to resume; use ./poc up for a clean start")
     if verify_inventory_empty() != "empty":
-        die("platform main has a nonempty or unreadable VM inventory; refusing to reset it during up")
+        die("platform main has a nonempty or unreadable VM or container inventory; refusing to reset it during up")
     ensure_repos()
     tmp = Path(tempfile.mkdtemp(dir=GEN, prefix="up."))
     stop = threading.Event()
@@ -139,7 +139,7 @@ def cmd_up(resume: str | None) -> None:
             if images is not None:
                 info("reusing images that trust this CA; no bake")
 
-            log("Shared AWS infra (state bucket, IDP host, tokens)")
+            log("Shared infra (state bucket, IDP host, tokens, container worker pools)")
             if not infra_apply_or_destroy("apply", log=LOGS / "infra-apply.log").ok:
                 show_tail(LOGS / "infra-apply.log", 40)
                 die("infra apply failed")
@@ -219,8 +219,8 @@ def cmd_up(resume: str | None) -> None:
         if not (idp_ok and bake_ok):
             die("bootstrap incomplete; the platform remains gated")
 
-        log("Enable VM stages")
-        workflow_action("enable", ((PLATFORM_REPO, "stage.yml"),))
+        log("Enable VM and container stages")
+        workflow_action("enable", ((PLATFORM_REPO, "stage.yml"), (PLATFORM_REPO, "container-stage.yml")))
         set_maintenance_gate("0", PLATFORM_REPO)
         if not verify_maintenance_gate("0", PLATFORM_REPO):
             die("platform maintenance gate did not open")
@@ -380,10 +380,10 @@ def cmd_down(keep_images_requested: bool) -> None:
         # destroyed concurrently.
         log("Destroy shared infra" + (" and image tier (SSH CA, Azure gallery)" if versions_ok else ""))
         # Set the Azure environment before the threads start: os.environ must not change while
-        # another thread copies it for a subprocess.
-        azure_auth = require_terraform_azure_auth() if versions_ok else False
+        # another thread copies it for a subprocess. Shared infra holds the Azure container workers.
+        azure_auth = require_terraform_azure_auth()
         infra = (spawn(lambda: _destroy_root("shared", INFRA_DIR, "infra-init.log", "infra-destroy.log",
-                                             infra_apply_or_destroy, False))
+                                             infra_apply_or_destroy, True, azure_auth))
                  if not keep_bucket else None)
         images = (spawn(lambda: _destroy_root("image tier", IMAGES_DIR, "images-init.log", "images-destroy.log",
                                               images_apply_or_destroy, True, azure_auth))
@@ -427,9 +427,9 @@ def cmd_down(keep_images_requested: bool) -> None:
             info("inventory already empty")
         elif inventory == "nonempty":
             if not (platform_dir / ".git").is_dir() or not reset_inventory(platform_dir):
-                die("NOT CLEAN: could not reset and verify platform main's VM inventory")
+                die("NOT CLEAN: could not reset and verify platform main's VM and container inventory")
         else:
-            die("NOT CLEAN: could not read platform main's VM inventory; it was not reset. Rerun down to verify.")
+            die("NOT CLEAN: could not read platform main's VM or container inventory; it was not reset. Rerun down to verify.")
         if not verify_quiescent():
             die("NOT CLEAN: resource workflows are no longer quiescent")
         if not verify_wiring_cleared():

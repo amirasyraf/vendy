@@ -8,6 +8,11 @@ Open [idp.amirasyraf.dev](https://idp.amirasyraf.dev) when the POC is up. Sign i
 account and choose **Launch → Compute → Virtual Machines**. Use the run page to see what the
 workflow is doing. Use the VM page to connect, change its configuration, or destroy it.
 
+The second offering is **Launch → Compute → Containers**: give a public image, port, size, cloud and
+CPU architecture, and get `https://<name>.apps.idp.amirasyraf.dev`. Worker nodes start on demand on
+AWS or Azure, so the first container on an idle pool takes a few minutes. See
+[DESIGN.md §13](DESIGN.md#13-containers).
+
 ## Repositories
 
 | Repo | Purpose |
@@ -15,7 +20,7 @@ workflow is doing. Use the VM page to connect, change its configuration, or dest
 | `vendy` (this repo) | POC lifecycle, shared infrastructure, SSH CA, and Azure image gallery |
 | [`vendy-idp`](https://github.com/amirasyraf/vendy-idp) | The Backstage portal and its deployment scripts |
 | [`vendy-builder`](https://github.com/amirasyraf/vendy-builder) | Golden images built with Packer and Ansible |
-| [`vendy-platform`](https://github.com/amirasyraf/vendy-platform) | VM templates, provisioning and configuration, and Git inventory |
+| [`vendy-platform`](https://github.com/amirasyraf/vendy-platform) | VM and container templates, provisioning and configuration, and Git inventory |
 
 The platform repo is public, including its VM inventory and commit history. Portal team permissions
 do not hide those files from GitHub readers. Use dummy request metadata and never enter secrets in

@@ -451,18 +451,23 @@ def verify_absent(label: str, not_found: str, cmd: list[str]) -> bool:
 
 
 def verify_dns_absent() -> bool:
+    # The container wildcard (*.apps.<domain>) is checked through one name under it.
+    return all(_dns_name_absent(name) for name in (DOMAIN, f"dns-check.apps.{DOMAIN}"))
+
+
+def _dns_name_absent(name: str) -> bool:
     # DNS over HTTPS: networks such as the Netskope proxy block port 53 to public resolvers.
     result = run(["curl", "-fsS", "--max-time", "5", "-H", "accept: application/dns-json",
-                  f"https://cloudflare-dns.com/dns-query?name={DOMAIN}&type=A"])
+                  f"https://cloudflare-dns.com/dns-query?name={name}&type=A"])
     try:
         reply = json.loads(result.out) if result.ok else None
     except ValueError:
         reply = None
     if not isinstance(reply, dict) or reply.get("Status") not in (0, 3):
-        warn(f"could not verify DNS for {DOMAIN}: {result.out.strip() or last_line(result.err)}")
+        warn(f"could not verify DNS for {name}: {result.out.strip() or last_line(result.err)}")
         return False
     if reply.get("Answer"):
-        warn(f"DNS {DOMAIN} still resolves (may be cached; TTL 60s)")
+        warn(f"DNS {name} still resolves (may be cached; TTL 60s)")
         return False
     return True
 

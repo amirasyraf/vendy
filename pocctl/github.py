@@ -180,9 +180,19 @@ def verify_quiescent() -> bool:
     return True
 
 
+INVENTORY_DIRS = ("vms", "containers")
+
+
 def verify_inventory_empty() -> str:
-    """"empty", "nonempty" (confirmed) or "unknown" for platform main's vms/ directory."""
-    result = gh_read("api", f"repos/{PLATFORM_REPO}/contents/vms?ref=main")
+    """"empty", "nonempty" (confirmed) or "unknown" for platform main's vms/ and containers/."""
+    states = [_directory_empty(directory) for directory in INVENTORY_DIRS]
+    if "nonempty" in states:
+        return "nonempty"
+    return "empty" if all(state == "empty" for state in states) else "unknown"
+
+
+def _directory_empty(directory: str) -> str:
+    result = gh_read("api", f"repos/{PLATFORM_REPO}/contents/{directory}?ref=main")
     if not result.ok:
         return "unknown"
     try:
@@ -205,22 +215,23 @@ def reset_inventory(checkout: Path) -> bool:
             warn(f"git {args[0]} in {checkout}: {last_line(result.err)}")
         return result.ok
 
-    if not git("rm", "-rq", "--ignore-unmatch", "vms"):
-        return False
-    (checkout / "vms").mkdir(exist_ok=True)
-    (checkout / "vms/.gitkeep").touch()
-    if not git("add", "vms/.gitkeep"):
-        return False
+    for directory in INVENTORY_DIRS:
+        if not git("rm", "-rq", "--ignore-unmatch", directory):
+            return False
+        (checkout / directory).mkdir(exist_ok=True)
+        (checkout / directory / ".gitkeep").touch()
+        if not git("add", f"{directory}/.gitkeep"):
+            return False
     staged = run(["git", "diff", "--cached", "--quiet"], cwd=checkout)
     if staged.rc > 1:
         return False
     if staged.rc == 1:
-        if not git("commit", "-qm", "poc: reset VM inventory") or not git("push", "-q", "origin", "HEAD:main"):
+        if not git("commit", "-qm", "poc: reset VM and container inventory") or not git("push", "-q", "origin", "HEAD:main"):
             return False
         info("inventory reset")
     inventory = settle(verify_inventory_empty, lambda state: state == "empty")
     if inventory != "empty":
-        warn(f"platform main's VM inventory is {inventory or 'unreadable'} after the reset")
+        warn(f"platform main's VM and container inventory is {inventory or 'unreadable'} after the reset")
         return False
     return True
 

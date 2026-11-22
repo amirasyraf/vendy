@@ -707,7 +707,7 @@ type ObservedVm = {
 
 ## 9. IDP runtime
 
-- EC2: Ubuntu 26.04 **arm64** (t4g.medium). Cloud-init installs Docker Engine + compose plugin, puts
+- EC2: Ubuntu 26.04 **arm64** (t4g.large: Backstage, Postgres and the k3s control plane, §12). Cloud-init installs Docker Engine + compose plugin, puts
   `ubuntu` in the `docker` group, and creates `/opt/idp` owned by `ubuntu`. IMDSv2 has hop limit 2.
 - SSH: `ssh -i ~/.ssh/id_ed25519 ubuntu@<ip>` (EC2 key pair from that key).
 - `vendy-idp/deploy/build.sh` builds and type-checks a local `linux/arm64` image, tags it
@@ -715,7 +715,8 @@ type ObservedVm = {
   stderr). `IDP_IMAGE=<image-id>` pins the local smoke check to that image.
 - `vendy-idp/deploy/deploy.sh <host> <env-file> [<image-id>]`:
   - ships a supplied local IDP image directly; if omitted, builds first using `deploy/build.sh`;
-  - copies the image's packaged `docker-compose.yml` and `Caddyfile`, plus `<env-file>` as `.env`, to `/opt/idp`;
+  - copies the image's packaged `docker-compose.yml`, `Caddyfile` and `cluster-install.sh`, plus `<env-file>` as `.env`, to `/opt/idp`;
+  - runs `cluster-install.sh /opt/idp/.env` (§12.4) before starting the stack;
   - starts the host-local `registry` service (`127.0.0.1:15000` on the host only) and pushes the
     image to it through an SSH tunnel (only missing layers transfer);
    - verifies the pulled and deployed Backstage image IDs match the local image and brings the stack
@@ -737,13 +738,22 @@ type ObservedVm = {
 | `AWS_REGION` | `ap-southeast-2` |
 | `SSH_CA_SECRET_ID` | `compute-factory/ssh-ca` |
 | `AZURE_READER_SECRET_ID` | `compute-factory/azure-reader`; required by `poc` and `deploy.sh`. An independently started backend with it unset reports Azure as unconfigured. |
+| `K3S_VERSION`, `CA_VERSION` | `infra/` outputs `k3s_version`, `cluster_autoscaler_version` (§12.4) |
+| `K3S_TOKEN` | `infra/` output `k3s_token` (also in the worker launch templates and scale sets) |
+| `IDP_PUBLIC_IP` | `infra/` output `idp_ip` (the EIP; k3s external IP and API SAN) |
+| `AWS_WORKER_GROUPS` | `infra/` output `aws_worker_groups` (comma-separated ASG names) |
+| `AZURE_SUBSCRIPTION_ID`, `AZURE_TENANT_ID` | §1a constants |
+| `AZURE_WORKERS_RG`, `AZURE_WORKER_SCALE_SETS` | `infra/` outputs `azure_workers_rg`, `azure_worker_scale_sets` |
+| `AZURE_AUTOSCALER_CLIENT_ID`, `AZURE_AUTOSCALER_CERT_B64` | `cf-idp-azure-reader` app ID and base64 of `vendy/.poc-azure-reader.pem` |
 
 - Compose services: `caddy`, `backstage`, `guacd` (§8.5; `network_mode: service:backstage`, 1 GiB
-  memory limit, pulled from Docker Hub, multi-arch), `postgres`, `registry`. The host role may read
+  memory limit, pulled from Docker Hub, multi-arch), `postgres`, `registry`. `backstage` mounts
+  `/opt/idp/kube` read-only at `/kube` and reaches the k3s API as `https://host.docker.internal:6443` (§12). The host role may read
   Secrets Manager `compute-factory/ssh-ca`, `compute-factory/azure-reader`, and `compute-factory/vm/*`
   (Windows VM passwords).
 
-- Caddy terminates TLS for `IDP_DOMAIN` and proxies to the backstage container on port 7007.
+- Caddy terminates TLS for `IDP_DOMAIN` and proxies to the backstage container on port 7007. It also
+  serves `*.apps.<IDP_DOMAIN>` (Compose sets `IDP_APPS_DOMAIN`) for containers (§12.5).
   It rewrites only `/mock-rest/servicenow` to the authenticated `/api/mock-rest/servicenow` plugin route;
   other paths are unchanged. No new environment variable or external-access token is introduced.
 - Health URL used by `./poc up`: `https://idp.amirasyraf.dev/.backstage/health/v1/readiness` must return 200.
@@ -825,3 +835,144 @@ type ObservedVm = {
 ## 11. Contributor instructions
 
 See [AGENTS.md](AGENTS.md) for agent scope, verification, and infrastructure safety.
+
+## 12. Containers (Compute → Containers)
+
+Design: [DESIGN.md §13](DESIGN.md#13-containers). Implementation: `vendy-idp/plugins/cf-backend/src/containers.ts`
+(IDP plugin `containers`), `vendy-idp/deploy/cluster-install.sh` (host), `vendy-platform/.github/workflows/container-stage.yml`,
+`vendy-platform/scripts/{container_spec.py,container-inventory.sh}`, `vendy/infra/{workers.tf,workers-azure.tf}`.
+
+### 12.1 Inventory (platform repo `containers/<name>/catalog-info.yaml`)
+
+```yaml
+apiVersion: backstage.io/v1alpha1
+kind: Resource
+metadata:
+  name: hello
+  title: hello
+  description: nginx:alpine on aws amd64 for team alpha
+  annotations:
+    cf/status: deploying           # deploying | ready | failed
+    cf/url: https://hello.apps.idp.amirasyraf.dev   # "" when not public
+    cf/requested-by: amirasyraf
+    cf/requested-at: "2026-11-23T12:00:00Z"
+    cf/request-id: "<scaffolder task id>"           # container incarnation
+    cf/run-id: "1234567890"        # last container-stage.yml run that wrote this file
+    cf/run-url: https://github.com/amirasyraf/vendy-platform/actions/runs/1234567890
+    # cf/ready-at / cf/failed-at: first time only
+spec:
+  type: container
+  owner: group:default/alpha
+  lifecycle: poc
+  container:
+    platform: aws        # aws | azure (immutable)
+    arch: amd64          # amd64 | arm64 (immutable)
+    image: nginx:alpine  # ^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$, no ".."
+    port: 80             # container port, 1-65535
+    size: XS             # XS 100m/128Mi, S 250m/256Mi, M 500m/512Mi (requests = limits)
+    replicas: 1          # 1-2
+    public: true
+    env: {}              # <= 20 entries, keys ^[A-Za-z_][A-Za-z0-9_]{0,63}$, values <= 1024 chars
+  billing: { costCenter: CC-1, projectCode: P-1 }   # required, 1-256 chars
+  cloudTags: {}          # <= 40 entries; informational (no cloud resource is tagged)
+```
+
+- `scripts/container_spec.py` and the IDP's `normalizeSpec` apply the same rules and defaults (`arch`
+  amd64, `size` XS, `replicas` 1, `public` true, `env` {}). Unknown fields and control characters are rejected.
+- `vendy-platform` is public: env values are public. There is no secret support.
+- Location `cf-containers` (`vendy-idp/catalog/locations.yaml`, `presence: optional`) reads
+  `containers/*/catalog-info.yaml`. `containers/.gitkeep` always exists; `./poc down` resets it with `vms/`.
+- Live state (replicas, pods, nodes, logs) is read from the cluster, never stored in Git.
+
+### 12.2 `container-stage.yml` (`workflow_dispatch`)
+
+Inputs as `stage.yml` (§6.1): `stage`, `name`, `request_id`, `run_key` (`<run>.<stage>.<attempt>`,
+the end of the run title), `requested_by`, `requester_teams`, `params_json`. Concurrency group
+`container-<name>`; gated by `CF_POC_MAINTENANCE`. All validation and team guards run in the step named
+exactly `Validate inputs` (permanent failure).
+
+| Stage | `params_json` | Behaviour |
+|---|---|---|
+| `register` | `{"spec": …}` | Validate; team guard on the owner. Same request ID → no-op; another → fail. Create the file with `cf/status: deploying`. |
+| `configure` | `{"spec": …}` | Identity check; owner, platform and arch must be unchanged; replace `spec.container`, set `cf/url`, `cf/status: deploying`. |
+| `finalize` | `{"outcome": "ready"\|"failed"}` | Missing file or another request ID → no-op. Set `cf/status` and the first-time timestamp. |
+| `destroy` | `{}` | Missing file → no-op. Identity and team check, then delete `containers/<name>/`. |
+
+Each write commits, rebases and pushes (8 attempts), then requests a catalog refresh of the entity
+(and `location:default/cf-containers` on register and destroy) with `BACKSTAGE_TOKEN`.
+
+### 12.3 IDP orchestrator and API (`/api/containers`)
+
+The VM orchestrator engine (§8.2) with its own tables `container_runs` / `container_run_stages`,
+workflow `container-stage.yml` and run pages `/containers/runs/<id>`. Retries, backoff, run keys and
+dispatch recovery are the VM ones. Stage plans:
+
+| Run kind | Stages (`*` = in the IDP) |
+|---|---|
+| `provision` | `servicenow`*, `register`, `deploy`*, `rollout`*, `finalize` |
+| `modify` | `configure`, `deploy`*, `rollout`*, `finalize` |
+| `power` (`action: restart`) | `restart`*, `rollout`* |
+| `destroy` | `undeploy`*, `destroy`, `finalize` (failure path only) |
+
+- `deploy`: server-side apply (field manager `vendy-idp`) of Deployment and Service `<name>` in
+  namespace `apps`. Labels `app.kubernetes.io/name=<name>`, `vendy.io/team`; annotation
+  `vendy.io/request-id`; pod `nodeSelector: {vendy.io/pool: <platform>-<arch>}`; Service port 80 →
+  the container port, label `vendy.io/public`. A deployed object with another request ID fails permanently.
+- `rollout`: an in-process stage that returns `{waiting}` until the Deployment is fully available
+  (shown as "Provisioning capacity…" while a pod is unschedulable). Image pull failures and a crash
+  loop (≥ 3 restarts) fail permanently; an attempt still waiting after 15 minutes fails and is retried.
+- `restart`: applies `vendy.io/restarted-at` to the pod template (field manager `vendy-idp-restart`).
+- `undeploy`: deletes the Service and Deployment (absent = success).
+
+| Endpoint | Caller | Purpose |
+|---|---|---|
+| `POST /requests` `{name, specJson, requestId}` | user (via `cf:container:dispatch`) | Validate, team check, refuse an existing name, create a `provision` run (key `request:<requestId>`) → `{runId, runUrl}` |
+| `POST /runs` `{operation: modify\|restart\|destroy, container: <entity ref>, requestKey, spec?}` | user | Day-2 run on a container the caller can read in the catalog; `modify` takes a full `spec.container` |
+| `GET /runs/:id`, `GET /runs?name=`, `POST /runs/:id/retry`, `GET /summary` | user (run's team or admin) | Run views as §8.2 |
+| `GET /status/:name` | user | `{enabled, deployed, url, replicas, ready, pods: [{name, phase, node, ready, restarts, state}]}` |
+| `GET /logs/:name[?pod=]` | user | Last 200 log lines of one pod |
+| `GET /tls-ask?domain=` | unauthenticated (Caddy) | 200 only for `<name>.apps.<IDP host>` with a Service labelled `vendy.io/public=true` |
+
+`cf:container:dispatch` (scaffolder): inputs `{name, specJson}`, outputs `{runId, runUrl}`; template
+`container-request` (platform repo, tag `product`). Modify, restart and delete are on the container page.
+
+### 12.4 Cluster (IDP host, `deploy/cluster-install.sh <env-file>`)
+
+- k3s server `K3S_VERSION` (`infra/` variable `k3s_version`, currently `v1.37.2+k3s1`) with
+  `/etc/rancher/k3s/config.yaml`: `disable: [traefik, servicelb]`, taint `CriticalAddonsOnly=true:NoExecute`,
+  `node-external-ip: <EIP>`, `flannel-backend: wireguard-native`, `flannel-external-ip: true`,
+  `tls-san: [<EIP>, host.docker.internal]`. Reinstalled only when the version or config changes.
+- Namespace `apps` (Pod Security `baseline`, ResourceQuota 20 pods, 4 CPU / 4 GiB requests), service
+  account `vendy-idp` (Role: deployments and services read/write, pods, pods/log and events read). Its
+  token and CA are written to `/opt/idp/kube/{token,ca.crt}`.
+- Cluster Autoscaler `CA_VERSION` (`infra/` variable `cluster_autoscaler_version`; its minor matches k3s),
+  two Deployments in `kube-system` on the server: `cluster-autoscaler-aws` (host role credentials) and
+  `cluster-autoscaler-azure` (`cf-idp-azure-reader` certificate, secret `cluster-autoscaler-azure`,
+  `ARM_VM_TYPE=vmss`). Each has its own `--leader-elect-resource-name` and `--status-config-map-name`,
+  explicit `--nodes=0:2:<group>`, `--scan-interval=10s`, `--scale-down-unneeded-time=2m`,
+  `--scale-down-delay-after-add=2m`, `--unremovable-node-recheck-timeout=1m` (default 5m: a node
+  that joined before its pod was scheduled is otherwise not reconsidered for 5 minutes). The ClusterRole adds `resource.k8s.io` reads (needed by 1.37).
+- `k3s-node-gc.timer` (every 30 s) deletes nodes tainted `ToBeDeletedByClusterAutoscaler` that are not Ready.
+
+### 12.5 Worker pools and URLs
+
+| Pool (`vendy.io/pool`) | Group | Size | Image |
+|---|---|---|---|
+| `aws-amd64` | ASG `cf-workers-aws-amd64` | `t3.micro` | Ubuntu 26.04 amd64 (SSM) |
+| `aws-arm64` | ASG `cf-workers-aws-arm64` | `t4g.micro` | Ubuntu 26.04 arm64 (SSM) |
+| `azure-amd64` | VMSS `cf-workers-azure-amd64` (RG `cf-workers`) | `Standard_B2ats_v2` | `Canonical:ubuntu-24_04-lts:server` |
+| `azure-arm64` | VMSS `cf-workers-azure-arm64` | `Standard_B2pts_v2` | `Canonical:ubuntu-24_04-lts:server-arm64` |
+
+- Min 0, max 2, created at 0. Terraform ignores later capacity changes. ASGs are `force_delete`.
+- Workers have public IPs and join `https://<EIP>:6443` with `--node-external-ip`,
+  `--kubelet-arg=provider-id=…` (`aws:///<az>/<instance-id>`; `azure://` + the VMSS instance resource ID)
+  and `--node-label vendy.io/pool=<pool>`. Scale-from-zero label tags: ASG
+  `k8s.io/cluster-autoscaler/node-template/label/vendy.io/pool`, VMSS
+  `k8s.io_cluster-autoscaler_node-template_label_vendy.io_pool`.
+- Security: IDP SG adds TCP 6443, UDP 51820, TCP 10250 from anywhere; worker SG/NSG UDP 51820 and TCP 10250.
+- `cf-idp-azure-reader` (object ID in `infra/workers-azure.tf`) is Contributor on `cf-workers` only.
+- Instances and volumes are tagged `cf:poc=true`, `cf:module=infra` (Azure: the group). Subscription
+  quota in `australiaeast`: `standardBasv2Family` and `standardBpsv2Family` 4 vCPUs each.
+- URL `https://<name>.apps.<IDP_DOMAIN>`: Cloudflare record `*.apps.idp` (DNS-only, applied with the
+  `idp` record). Caddy site `*.apps.{$IDP_DOMAIN}` with on-demand TLS (`ask` = `/api/containers/tls-ask`)
+  proxies to `<name>.apps.svc.cluster.local:80`, resolved through the cluster DNS `10.43.0.10`.

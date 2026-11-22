@@ -27,6 +27,21 @@ resource "aws_vpc_security_group_ingress_rule" "idp" {
   to_port           = tonumber(each.key)
 }
 
+# Containers cluster (DESIGN.md §13.3): workers in both clouds join the k3s API (token-authenticated)
+# and exchange WireGuard pod traffic; worker addresses are not known in advance.
+resource "aws_vpc_security_group_ingress_rule" "idp_cluster" {
+  for_each = {
+    api       = { protocol = "tcp", port = 6443 }
+    wireguard = { protocol = "udp", port = 51820 }
+    kubelet   = { protocol = "tcp", port = 10250 }
+  }
+  security_group_id = aws_security_group.idp.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = each.value.protocol
+  from_port         = each.value.port
+  to_port           = each.value.port
+}
+
 resource "aws_vpc_security_group_egress_rule" "idp" {
   security_group_id = aws_security_group.idp.id
   cidr_ipv4         = "0.0.0.0/0"
@@ -107,6 +122,36 @@ resource "aws_iam_role_policy" "idp_describe_images" {
       Action   = "ec2:DescribeImages"
       Resource = "*"
     }]
+  })
+}
+
+# The AWS Cluster Autoscaler on the host resizes only the container worker groups.
+resource "aws_iam_role_policy" "idp_autoscale_workers" {
+  name = "autoscale-container-workers"
+  role = aws_iam_role.idp.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "autoscaling:DescribeAutoScalingGroups",
+          "autoscaling:DescribeAutoScalingInstances",
+          "autoscaling:DescribeLaunchConfigurations",
+          "autoscaling:DescribeScalingActivities",
+          "autoscaling:DescribeTags",
+          "ec2:DescribeLaunchTemplateVersions",
+          "ec2:DescribeImages",
+          "ec2:GetInstanceTypesFromInstanceRequirements",
+        ]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["autoscaling:SetDesiredCapacity", "autoscaling:TerminateInstanceInAutoScalingGroup"]
+        Resource = [for group in aws_autoscaling_group.workers : group.arn]
+      },
+    ]
   })
 }
 
