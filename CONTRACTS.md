@@ -568,7 +568,8 @@ one of their groups.
 `POST /runs`: `operation` maps to a run kind (`start`/`stop`/`reboot` → `power`, `update` → `update`,
 otherwise the same name). The VM entity is read with the caller's credentials; its `cf/request-id` is
 the run's request ID and its owner group the run's team. `requestKey` (`^[a-zA-Z0-9_-]{1,100}$`; a
-Scaffolder task ID or a browser UUID) makes a repeated submit return the first run. Modify sends the
+Scaffolder task ID or a browser UUID) makes a repeated submit return the first run. It is scoped to
+the operation and VM; the same key from another user or for another VM is a 409. Modify sends the
   complete new `compute` (`{platform, os, imageVersion?, size | instanceType}`, platform/image unchanged), `software`
 (catalog keys) and `adJoin`; the backend diffs them against the entity spec to plan the run, and
    computes the packages to remove. The API validates explicit `instanceType`; the stage validator
@@ -927,7 +928,7 @@ dispatch recovery are the VM ones. Stage plans:
 | Endpoint | Caller | Purpose |
 |---|---|---|
 | `POST /requests` `{name, specJson, requestId}` | user (via `cf:container:dispatch`) | Validate, team check, refuse an existing name, create a `provision` run (key `request:<requestId>`) → `{runId, runUrl}` |
-| `POST /runs` `{operation: modify\|restart\|destroy, container: <entity ref>, requestKey, spec?}` | user | Day-2 run on a container the caller can read in the catalog; `modify` takes a full `spec.container` |
+| `POST /runs` `{operation: modify\|restart\|destroy, container: <entity ref>, requestKey, spec?}` | user | Day-2 run on a container the caller can read in the catalog; `modify` takes a full `spec.container`. `requestKey` is scoped to the operation and container, as for VMs |
 | `GET /runs/:id`, `GET /runs?name=`, `POST /runs/:id/retry`, `GET /summary` | user (run's team or admin) | Run views as §8.2 |
 | `GET /status/:name` | user | `{enabled, deployed, url, replicas, ready, pods: [{name, phase, node, ready, restarts, state}]}` |
 | `GET /logs/:name[?pod=]` | user | Last 200 log lines of one pod |
