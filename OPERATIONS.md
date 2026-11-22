@@ -9,7 +9,7 @@ another checkout or host.
 ## Setup and credentials
 
 Bootstrap needs Terraform, Git, an authenticated `gh`, the AWS and Azure CLIs, Docker with buildx
-and Compose, Python 3.10+ with PyYAML (`./poc` is Python), `curl`, and OpenSSH (`ssh`, `scp`,
+and Compose, `uv` (`./poc` is a uv script that provisions its own Python 3.10+ and PyYAML), `curl`, and OpenSSH (`ssh`, `scp`,
 `ssh-keygen`).
 The host key pair is `~/.ssh/id_ed25519` and `.pub`. The repo pins Node via `mise` in `vendy-idp`.
 

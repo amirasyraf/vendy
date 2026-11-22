@@ -688,7 +688,7 @@ retains the CA, images, and Azure gallery. The host's database is not carried ac
 ```
 vendy/                           # 4th repo: the "home" of the POC
   DESIGN.md
-  poc                            # Python 3.10+ entrypoint; see README.md for commands
+  poc                            # uv script entrypoint (Python 3.10+, PyYAML declared inline); see README.md
   pocctl/                        #   implementation (stdlib + PyYAML); drives the aws/az/gh/terraform/ssh CLIs
   .poc.env                       # gitignored: Backstage PAT (from 9)
   .poc-users                     # gitignored: username:scrypt-hash lines (./poc set-password)

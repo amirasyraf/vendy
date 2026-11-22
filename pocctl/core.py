@@ -609,7 +609,7 @@ def require_image_tools(*extra: str) -> None:
     try:
         import yaml  # noqa: F401
     except ImportError:
-        die("python3 needs PyYAML (pip install pyyaml) to read images.yaml")
+        die("PyYAML is missing: run ./poc directly so uv provides its declared dependencies")
     if not require_terraform_azure_auth():
         die("Terraform Azure authentication is required for the image tier")
     require_split_layout()
