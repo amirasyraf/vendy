@@ -939,7 +939,7 @@ dispatch recovery are the VM ones. Stage plans:
 ### 12.4 Cluster (IDP host, `deploy/cluster-install.sh <env-file>`)
 
 - k3s server `K3S_VERSION` (`infra/` variable `k3s_version`, currently `v1.37.2+k3s1`) with
-  `/etc/rancher/k3s/config.yaml`: `disable: [traefik, servicelb]`, taint `CriticalAddonsOnly=true:NoExecute`,
+  `/etc/rancher/k3s/config.yaml`: `disable: [traefik, servicelb, gateway-api-crd]`, taint `CriticalAddonsOnly=true:NoExecute`,
   `node-external-ip: <EIP>`, `flannel-backend: wireguard-native`, `flannel-external-ip: true`,
   `tls-san: [<EIP>, host.docker.internal]`. Reinstalled only when the version or config changes.
 - Namespace `apps` (Pod Security `baseline`, ResourceQuota 20 pods, 4 CPU / 4 GiB requests), service

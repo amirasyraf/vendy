@@ -913,7 +913,9 @@ and team isolation is the IDP's authorization, not Kubernetes RBAC.
 - **Control plane**: a k3s server on the IDP host next to Docker Compose (separate containerd). The
   host is a `t4g.large` (8 GiB). The server is tainted so user pods never run there; k3s system pods,
   the autoscalers and CoreDNS tolerate the taint. `deploy/cluster-install.sh` installs and updates it on
-  every IDP deploy and only restarts k3s when its version or configuration changes.
+  every IDP deploy and only restarts k3s when its version or configuration changes. Any pending pod
+  without a pool selector makes both autoscalers start a worker, so bundled add-ons that do not
+  tolerate the taint are disabled (Traefik, ServiceLB, the Gateway API CRD job).
 - **Workers**: four pools, each 0–2 instances and created at 0: `aws-amd64` (`t3.micro`), `aws-arm64`
   (`t4g.micro`), `azure-amd64` (`Standard_B2ats_v2`), `azure-arm64` (`Standard_B2pts_v2`), all 1 GiB.
   Pods select `vendy.io/pool=<platform>-<arch>`. Workers boot plain Ubuntu and join with a provider ID
