@@ -972,7 +972,11 @@ sizes), only while it runs.
   and pool labels, and both went back to 0. Two full cycles passed with the node cleanup timer
   (stale nodes deleted seconds after capacity reached 0). With a 30 s recheck timeout, scale-down
   took about 1.5 minutes instead of 6.
-- The full path (AWS pools, cross-cloud WireGuard to Azure, Caddy routing through the cluster DNS,
-  on-demand TLS) is proven only by a live `./poc up` with a deployed container per pool.
+- Live POC (`./poc up`, 2026-11-22): one `traefik/whoami` container per pool through the
+  `container-request` template. Every pool scaled 0→1 and served its HTTPS URL (on-demand TLS, Caddy
+  through the cluster DNS, WireGuard to both clouds) about 1.5–2.5 minutes after the request. Logs,
+  restart, modify (to 2 replicas), the other-team denial and delete also passed, and all four pools
+  returned to 0. The first `up` also showed that a bundled k3s add-on whose job cannot run on the
+  tainted server scales up both clouds, which is why `gateway-api-crd` is disabled.
 - Workers have public IPs and the k3s API is open to the internet behind its join token; there is no
   secret store, no private registry and no persistent storage.

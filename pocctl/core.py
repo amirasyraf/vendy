@@ -542,7 +542,9 @@ def images_apply_or_destroy(action: str, **kwargs: Any) -> Result:
 
 # Before the image tier had its own root, infra/ held the CA and gallery. Applying the current
 # infra/ to such a state would destroy the CA, so refuse; this reads the file and needs no init.
-LEGACY_RE = re.compile(r"^(tls_private_key|aws_secretsmanager_secret(_version)?\.ssh_ca$|aws_ssm_parameter\.ssh_ca_pub$|azurerm_)")
+# Other azurerm resources (the container worker pools) belong to infra/.
+LEGACY_RE = re.compile(r"^(tls_private_key|aws_secretsmanager_secret(_version)?\.ssh_ca$|aws_ssm_parameter\.ssh_ca_pub$"
+                       r"|azurerm_shared_image|azurerm_resource_group\.images$)")
 
 
 def require_split_layout() -> None:
