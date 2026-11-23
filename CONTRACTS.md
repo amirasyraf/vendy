@@ -935,7 +935,10 @@ dispatch recovery are the VM ones. Stage plans:
 | `GET /tls-ask?domain=` | unauthenticated (Caddy) | 200 only for `<name>.apps.<IDP host>` with a Service labelled `vendy.io/public=true` |
 
 `cf:container:dispatch` (scaffolder): inputs `{name, specJson}`, outputs `{runId, runUrl}`; template
-`container-request` (platform repo, tag `product`). Modify, restart and delete are on the container page.
+`container-request` (platform repo, tag `product`). The portal's platform picker passes
+`formData.container.platform` (`aws` or `azure`) to the required `ContainerPlatform` field, which
+displays the chosen platform and links back to the picker. Modify, restart and delete are on the
+container page.
 
 ### 12.4 Cluster (IDP host, `deploy/cluster-install.sh <env-file>`)
 

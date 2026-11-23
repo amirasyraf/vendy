@@ -885,8 +885,9 @@ files. Exact interfaces: [CONTRACTS.md §12](CONTRACTS.md#12-containers-compute-
 
 ### 13.1 Request and day-2
 
-The `container-request` template (Launch card → form) asks for name, team, image, port, platform
-(AWS/Azure), architecture (amd64/arm64), size (XS/S/M CPU and memory presets), replicas (1–2), a
+Launch → Compute → Containers asks for the platform (AWS or Azure) before opening the
+`container-request` form. The form displays the selected platform and asks for name, team, image,
+port, architecture (amd64/arm64), size (XS/S/M CPU and memory presets), replicas (1–2), a
 public URL switch, non-secret env vars and the tags table. The container page shows status, URL,
 pods with their nodes, logs and the latest run, and offers Change (image, port, size, replicas,
 public, env), Restart and Delete. Platform and architecture are fixed after creation.
