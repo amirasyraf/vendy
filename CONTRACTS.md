@@ -938,7 +938,8 @@ dispatch recovery are the VM ones. Stage plans:
 `container-request` (platform repo, tag `product`). The portal's platform picker passes
 `formData.container.platform` (`aws` or `azure`) to the required `ContainerPlatform` field, which
 displays the chosen platform and links back to the picker. Modify, restart and delete are on the
-container page.
+container page. Template output links to `runUrl`; the run page links to the catalog only once the
+caller can read a container entity whose `cf/request-id` matches the run.
 
 ### 12.4 Cluster (IDP host, `deploy/cluster-install.sh <env-file>`)
 

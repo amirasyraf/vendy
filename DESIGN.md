@@ -888,15 +888,19 @@ files. Exact interfaces: [CONTRACTS.md §12](CONTRACTS.md#12-containers-compute-
 Launch → Compute → Containers asks for the platform (AWS or Azure) before opening the
 `container-request` form. The form displays the selected platform and asks for name, team, image,
 port, architecture (amd64/arm64), size (XS/S/M CPU and memory presets), replicas (1–2), a
-public URL switch, non-secret env vars and the tags table. The container page shows status, URL,
-pods with their nodes, logs and the latest run, and offers Change (image, port, size, replicas,
-public, env), Restart and Delete. Platform and architecture are fixed after creation.
+public URL switch, non-secret env vars and the tags table. The container page uses the VM
+detail layout: Connect and Activity, with Configuration and Details alongside on desktop.
+It shows the URL, logs, run history and pods with their nodes. The header offers Modify (image,
+port, size, replicas, public, env) and Restart; Delete is in the overflow menu and requires the
+container name. Platform and architecture are fixed after creation.
 
 ### 13.2 Inventory and runs (the VM model)
 
 Each container is `containers/<name>/catalog-info.yaml` in `vendy-platform` (`Resource`,
 `spec.type: container`), read by the `cf-containers` Location and filtered by owner like VMs (§5.1a).
 Spec is desired state; replicas, pods and logs are read live from the cluster.
+The deployment run links to the container page only after the matching entry is readable in the
+catalog, so users can follow progress before the resource page is ready.
 
 Runs use the VM orchestrator engine (§6) as a second instance with its own tables, workflow
 (`container-stage.yml`), concurrency group and run pages (`/containers/runs/<id>`), so VM and container
