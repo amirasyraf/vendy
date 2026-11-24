@@ -15,32 +15,12 @@ variable "azure_location" {
   default = "australiaeast"
 }
 
-# Reader service principal cf-idp-azure-reader; its certificate (PEM key + cert) is kept locally.
-variable "azure_reader_client_id" {
-  type    = string
-  default = "1a334f6b-9420-4747-8336-43aff14edb93"
-}
-
-variable "azure_reader_cert_path" {
-  type    = string
-  default = "../.poc-azure-reader.pem"
-}
-
+# Terraform owns the secret container and read policy, not the value. `poc up`
+# creates the credential and writes the value without involving Terraform state.
 resource "aws_secretsmanager_secret" "azure_reader" {
   name                    = "compute-factory/azure-reader"
   description             = "Vendy IDP read-only Azure credential (service principal certificate)"
   recovery_window_in_days = 0
-}
-
-resource "aws_secretsmanager_secret_version" "azure_reader" {
-  secret_id = aws_secretsmanager_secret.azure_reader.id
-  secret_string = jsonencode({
-    tenantId       = var.azure_tenant_id
-    clientId       = var.azure_reader_client_id
-    subscriptionId = var.azure_subscription_id
-    location       = var.azure_location
-    certificatePem = file("${path.module}/${var.azure_reader_cert_path}")
-  })
 }
 
 resource "aws_iam_role_policy" "idp_read_azure_reader" {

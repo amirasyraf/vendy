@@ -29,12 +29,12 @@ The host key pair is `~/.ssh/id_ed25519` and `.pub`. The repo pins Node via `mis
    editing local password files does not update the running portal. Treat `.poc-users` and the
    plaintext `.poc-passwords` as private, gitignored files. The old GitHub OAuth app and the legacy
    `AUTH_GITHUB_CLIENT_ID` / `AUTH_GITHUB_CLIENT_SECRET` entries are not required.
-5. For local Terraform, set `ARM_CLIENT_ID` and `ARM_CLIENT_CERTIFICATE_PATH` to your operator
-   service principal's application ID and PKCS#12 certificate; set `ARM_CLIENT_CERTIFICATE_PASSWORD`
-   if needed. The IDP's separate Azure Reader identity uses `.poc-azure-reader.pem`, a gitignored
-   certificate and private key installed into an AWS secret by Terraform. Azure CLI selection is
-   checked separately. The Entra app that Actions
-   uses authenticates by OIDC, never with either certificate. Keep the existing Cloudflare Terraform
+5. Set `ARM_CLIENT_ID` and `ARM_CLIENT_CERTIFICATE_PATH` to your operator service principal's
+   application ID and PKCS#12 certificate; set `ARM_CLIENT_CERTIFICATE_PASSWORD` if needed.
+   Full `up`/`down` also use that operator certificate for Microsoft Graph (`Application.ReadWrite.All`
+   or `Application.ReadWrite.OwnedBy` with ownership of the persistent `cf-idp-azure-reader` app).
+   Azure CLI selection is checked separately. No Reader PEM or personal browser login is required.
+   The GitHub Actions app authenticates by OIDC, never with either certificate. Keep the existing Cloudflare Terraform
    root at `~/projects/cloudflare/amirasyraf.dev`; `poc` applies only the portal record there.
 
 | Identity or credential | What it does |
@@ -46,6 +46,16 @@ The host key pair is `~/.ssh/id_ed25519` and `.pub`. The repo pins Node via `mis
 | AWS/Azure GitHub OIDC | Grants cloud access to workflow jobs. This is unrelated to GitHub OAuth sign-in. |
 | Static workflow `BACKSTAGE_TOKEN` | Lets the stage job refresh catalog entries and check demo cleanup eligibility. It cannot read task or VM run state. |
 | IDP EC2 instance role | Reads scoped AWS secrets, observes EC2, and checks golden AMI availability with `ec2:DescribeImages`; the Azure Reader secret is used for read-only Azure calls. |
+
+Full `up` generates a 364-day Reader certificate and writes the private key directly to
+`compute-factory/azure-reader` before registering the public certificate in Entra. Existing keys
+are preserved and a resumed bootstrap reuses the current secret. The portal and host-side
+autoscaler read that secret through the EC2 role; no new Reader key goes into Terraform state
+or a laptop file. Run lifecycle operations from one host at a time; don't edit the Reader app's
+Entra credentials concurrently. There is no automatic rotation. To replace an expired cycle
+credential, tear down and start a new cycle. `down --keep-images` also revokes the Reader
+certificate; it only keeps the images and their SSH CA. Any manually installed Reader certificates
+predating this flow (and their old local files or state backups) aren't removed automatically.
 
 The public platform repo contains VM inventory and its history, including request metadata and public
 addresses. Don't enter secrets or real sensitive data in a POC request. Terraform state and its
@@ -59,6 +69,7 @@ backups can contain secret material; don't copy them into tickets, logs, or Git.
 | A bake run exists but monitoring stopped | `./poc watch-bake <run-id>` is read-only. Exit `2` means unknown, not failed; it does not cancel the run. Exit `0` proves the GitHub conclusion, not artifact usability. |
 | Bootstrap stopped (or was interrupted) after an exact bake was dispatched, and that bake is running or succeeded | `./poc up --resume <run-id>` bootstraps the IDP while it waits for the bake, then verifies the original bake artifacts, current matching images, owned running host, empty VM state/inventory, and idle workflows. It does not reapply Terraform or rebake. |
 | Terraform partially applied, or the bake actually failed | Inspect `images-apply.log`, `infra-apply.log`, or `bake.log` in `.generated/logs/` as applicable. Resume is not a general repair or rerun command. Preserve state and identify the failed step first. |
+| Azure Reader provisioning or revocation failed | Check the operator certificate and Graph app permissions. Do not upload a replacement Reader PEM. A gated `up --resume` reuses the current secret when otherwise eligible; if no bake was dispatched and bootstrap cannot resume, run `down --keep-images` and start a new cycle. Rerun `down` with the same retention option if Graph revocation could not be verified. |
 | Portal inaccessible or app release failed | For a bootstrap, inspect `.generated/logs/idp.log` and `dns.log`. On an existing host, `./poc logs caddy 30m` and `./poc logs backstage 30m` separate DNS/TLS/proxy failures from backend readiness and catalog errors. A routine release does not reapply DNS. |
 | An image says **Not available** | Confirm the latest matching AMI or eligible Azure gallery version is usable (including Azure replication). If the image exists, check the IDP backend's `Image availability` warning for a cloud read failure. A new launch request is also refused when availability cannot be verified. |
 | Task page is blank or stuck | `./poc task <task-uuid>` shows the stored task and events. If events exist, inspect `/events` responses, Caddy access logs and `Browser ...` entries. If a deploy just ran, check for the new-version banner or `Browser stale-bundle`. |

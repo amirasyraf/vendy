@@ -12,7 +12,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .core import (
-    AWS_ACCOUNT, AWS_REGION, CLEAN_MAX_ATTEMPTS, CLEAN_RETRY_SECONDS, DOMAIN, GEN, INFRA_DIR, IMAGES_DIR, LOGS,
+    AWS_ACCOUNT, AWS_REGION, AZURE_READER_SECRET_ID, CLEAN_MAX_ATTEMPTS, CLEAN_RETRY_SECONDS, DOMAIN, GEN, INFRA_DIR,
+    IMAGES_DIR, LOGS,
     STATE_BUCKET, Unknown, aws, aws_cmd, aws_error, aws_ids, aws_json, az, az_cmd, az_json, delete_aws, info,
     last_line, parallel, pause, require_terraform_azure_auth, root_state, run, warn,
 )
@@ -360,7 +361,7 @@ def delete_image_versions() -> bool:
 def sweep_infra_orphans(sweep_ca: bool) -> bool:
     """Fallback when Terraform state was lost. Names are not sufficient proof of ownership."""
     ok = True
-    for secret in ("compute-factory/ssh-ca", "compute-factory/azure-reader"):
+    for secret in ("compute-factory/ssh-ca", AZURE_READER_SECRET_ID):
         module = "infra"
         if secret == "compute-factory/ssh-ca":
             if not sweep_ca:
@@ -634,7 +635,7 @@ def verify_cloud_clean(allow_images: bool) -> bool:
         ("IAM instance profile cf-idp", "NoSuchEntity", aws_cmd(
             "iam", "get-instance-profile", "--instance-profile-name", "cf-idp", "--query", "InstanceProfile.InstanceProfileName", *text)),
         ("Azure reader secret", "ResourceNotFoundException", aws_cmd(
-            "secretsmanager", "describe-secret", "--secret-id", "compute-factory/azure-reader", "--query", "ARN", *text)),
+            "secretsmanager", "describe-secret", "--secret-id", AZURE_READER_SECRET_ID, "--query", "ARN", *text)),
     ]
     if not allow_images:
         checks += [

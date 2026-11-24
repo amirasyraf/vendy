@@ -6,7 +6,7 @@ This is a POC: KISS. Do not add, restore, or recreate unit tests, unit-test suit
 scaffolding in any Vendy repository, including equivalent coverage under new filenames.
 Previously removed unit tests must stay removed. Verify changes with appropriate static checks,
 existing offline integration checks and focused browser/end-to-end smoke checks instead.
-`./poc` is a uv script (`pocctl/`, stdlib + PyYAML declared inline in `poc`, so it never depends on
+`./poc` is a uv script (`pocctl/`, dependencies declared inline in `poc`, so it never depends on
 the global `python3`): check it with `python3 -m py_compile poc pocctl/*.py`,
 `uvx ruff check poc pocctl` (repo `ruff.toml`) and `uvx mypy --check-untyped-defs --ignore-missing-imports pocctl`, then exercise changed read-only
 lookups against the live POC. Lifecycle mutations are only proven by a real `up`/`down` cycle. Do not

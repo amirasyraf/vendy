@@ -37,8 +37,8 @@ HEALTH_URL = f"https://{DOMAIN}/.backstage/health/v1/readiness"
 USERS_FILE = ROOT / ".poc-users"  # username:scrypt-hash lines, gitignored, persists across cycles
 PASSWORDS_FILE = ROOT / ".poc-passwords"  # username:plaintext, gitignored; POC test logins
 POC_ENV = ROOT / ".poc.env"
-AZURE_READER_PEM = ROOT / ".poc-azure-reader.pem"
 AZURE_READER_CLIENT_ID = "1a334f6b-9420-4747-8336-43aff14edb93"
+AZURE_READER_SECRET_ID = "compute-factory/azure-reader"
 RUN_CANCEL_TIMEOUT = 900
 CLEAN_RETRY_SECONDS = 30
 CLEAN_MAX_ATTEMPTS = 6
@@ -531,7 +531,6 @@ def _tf_vars(*extra: str) -> list[str]:
 
 def infra_apply_or_destroy(action: str, **kwargs: Any) -> Result:
     return tf(INFRA_DIR, action, "-auto-approve", "-input=false", *_tf_vars(
-        "azure_reader_cert_path=../.poc-azure-reader.pem",
         f"admin_ssh_public_key_path={Path.home()}/.ssh/id_ed25519.pub",
     ), **kwargs)
 

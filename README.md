@@ -31,6 +31,7 @@ requests, billing fields, or cloud tags.
 Read [setup and credentials](OPERATIONS.md#setup-and-credentials) before your first run. Clone
 `vendy-idp` beside this repo before setting the first password. `./poc up` can clone the other
 missing repos. It doesn't overwrite local checkouts and builds the portal from GitHub's `main`.
+Full `up` generates the portal's Azure Reader credential; there is no local Reader PEM to supply.
 
 ```bash
 test -e .poc.env || cp poc.env.example .poc.env

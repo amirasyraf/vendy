@@ -59,7 +59,7 @@ are implemented; neither guarantees a cost ceiling.
 | Azure | Subscription `amirasyraf` (`74b39a79-…`), tenant `c26545da-…`, region `australiaeast`. One resource group, VNet, NSG (22 from anywhere) and static public IP per VM |
 | Shared base for Azure | AWS stays the shared base: the SSH CA (Secrets Manager), Terraform state (S3) and the IDP host. Azure stages log in to both clouds |
 | GHA -> Azure | Entra app `cf-github-actions` with federated credentials for the builder and platform repos on `main` (immutable-subject format); Contributor on the subscription. No secrets |
-| IDP -> Azure | Reader service principal `cf-idp-azure-reader` (certificate, 2-year); its JSON credential is in Secrets Manager `compute-factory/azure-reader`, read by the IDP host role |
+| IDP -> Azure | Reader service principal `cf-idp-azure-reader`; `up` issues its cycle certificate in Secrets Manager `compute-factory/azure-reader`, read by the IDP host role |
 
 ## 3. Architecture
 
@@ -647,7 +647,8 @@ pieces (§5.4). Another OS family follows the same pattern; another release of a
 
 See [setup and credentials](OPERATIONS.md#setup-and-credentials) for local prerequisites, the
 Backstage PAT, and the persistent AWS and Azure identities. Bootstrap wires the temporary
-workflow variables and token; it does not create OAuth apps, workload identities, or local credentials.
+workflow variables and token and manages a cycle credential for the existing Azure Reader app.
+It does not create OAuth apps, workload identities, or the operator's credentials.
 
 ## 10. Cost and retention
 
@@ -689,8 +690,8 @@ retains the CA, images, and Azure gallery. The host's database is not carried ac
 ```
 vendy/                           # 4th repo: the "home" of the POC
   DESIGN.md
-  poc                            # uv script entrypoint (Python 3.10+, PyYAML declared inline); see README.md
-  pocctl/                        #   implementation (stdlib + PyYAML); drives the aws/az/gh/terraform/ssh CLIs
+  poc                            # uv script entrypoint (Python 3.10+, inline dependencies); see README.md
+  pocctl/                        #   lifecycle, Azure Reader credentials and aws/az/gh/terraform/ssh drivers
   .poc.env                       # gitignored: Backstage PAT (from 9)
   .poc-users                     # gitignored: username:scrypt-hash lines (./poc set-password)
   .poc-passwords                 # gitignored: plaintext POC logins, never deployed
@@ -700,8 +701,7 @@ vendy/                           # 4th repo: the "home" of the POC
     idp.tf                       #   IDP EC2 (t4g.large), EIP, SG, instance role (read the CA secret by name;
                                  #   read-only EC2 describe for sizes and the VM health check; worker ASG resize)
     workers.tf, workers-azure.tf #   container worker pools (ASGs, Azure group cf-workers with two scale sets)
-    azure.tf                     #   Azure reader secret compute-factory/azure-reader (from .poc-azure-reader.pem)
-                                 #   + host-role read
+    azure.tf                     #   Azure Reader secret container and host-role read (pocctl sets the value)
     tokens.tf                    #   random_password: PG password, BACKSTAGE_TOKEN
     outputs.tf
     images/                      # image tier root, its own LOCAL state; kept by down --keep-images
@@ -737,7 +737,8 @@ commands use the default workspace and reject ambient `TF_CLI_ARGS*` / `TF_VAR_*
 
 ### 12.2 `./poc up`
 
-1. **Preflight**: check Docker/buildx, CLI tools, the AWS account, Azure subscription, certificate,
+1. **Preflight**: check Docker/buildx, CLI tools, the AWS account, Azure subscription, the operator's
+   certificate and Microsoft Graph access to the persistent Reader app,
    SSH key, Cloudflare configuration, `.poc.env`, and repository AWS/Azure wiring. Refuse to apply
    if `infra/` state is unreadable/nonempty or platform `main` does not have an empty inventory.
    Gate and disable resource workflows; verify they are quiescent and the POC cloud/DNS scope is clean
@@ -752,7 +753,10 @@ commands use the default workspace and reject ambient `TF_CLI_ARGS*` / `TF_VAR_*
    current CA fingerprint, reuse them without baking; warn, but still reuse, when an image was built
    from an older builder commit than `main`. Abort before applying shared infra if availability is
    unknown rather than treating a failed lookup as a missing image.
-4. **Shared infra and bake**: apply `infra/` using the pinned AWS account. If images are missing or
+4. **Shared infra and bake**: apply `infra/` using the pinned AWS account. Save the generated
+   Reader credential to the AWS secret before registering its public certificate on the existing
+   Entra app; verify certificate authentication before starting the bake or IDP deploy. Terraform
+   owns only the empty secret container and access policy. If images are missing or
    unusable, open only `bake.yml`. Request a run ID in the dispatch response
    and never retry an ambiguous dispatch. Poll that exact run. After `completed` + `success`, download
    the Packer manifest of every row of the run's commit and require each artifact to be the current
@@ -776,7 +780,8 @@ commands use the default workspace and reject ambient `TF_CLI_ARGS*` / `TF_VAR_*
 verify artifacts, publish DNS, or deploy the IDP. `./poc up --resume <run-id>` completes an interrupted
 bootstrap given a `bake.yml` dispatch on builder `main` that is running or has succeeded. It checks
 that no resource workflow run other than that bake is active, the platform gate is still closed, inventory is empty, and Terraform points to
-an owned running IDP, an owned empty bucket and the existing SSH CA. It continues at step 5 while
+an owned running IDP, an owned empty bucket and the existing SSH CA. It reuses the Reader
+credential and continues at step 5 while
 watching that run and verifying its manifests and current images in the background, and never reapplies infrastructure, dispatches or
 prunes. It is not a repair command for a partial apply or a failed bake. `down` is intentional
 teardown, not recovery for a failed verification read.
@@ -843,7 +848,9 @@ for garbage collection but the running application stays up.
    entries only when EC2 confirms the resource is absent or the instance is terminated. Live matches,
    unsupported entries and failed lookups still block `CLEAN`. With `--keep-images` the checks allow
    the image tier (see 12.2 step 1).
-6. **GitHub cleanup**: verify deletion of platform wiring and reset `vms/` on platform `main` with a
+6. **Revoke the Reader credential and clean GitHub**: after cloud/DNS verification, remove only
+   the certificate(s) named by this lifecycle on the persistent Entra app and verify their absence.
+   This also runs with `--keep-images`. Then verify deletion of platform wiring and reset `vms/` on platform `main` with a
    normal non-force push. Verify the published inventory and workflow freeze before printing `CLEAN`,
    or `CLEAN (images retained)` with the kept CA fingerprint and images for `--keep-images`.
 

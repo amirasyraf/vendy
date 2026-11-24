@@ -50,7 +50,7 @@ AWS remains the shared base (SSH CA, Terraform state bucket, IDP host); Azure ho
 | GHA repo variables (builder + platform) | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_LOCATION` |
 | Image gallery | resource group `cf-images`, gallery `cfimages`, one definition per OS release (`ubuntu`: Ubuntu 26.04, Linux; `windows-2025`: Windows Server 2025, Windows; both Gen2, x64, NVMe + SCSI); the group (tag `cf:module=images`), gallery and definitions are created by `infra/images/gallery.tf` |
 | Per-VM resources | resource group `cf-vm-<name>`; VNet, subnet, NSG (tcp/22 from anywhere; never 3389), static Standard public IP, NIC and VM all named `cf-<name>` (a Linux or Windows VM resource by OS family) |
-| IDP reader | service principal `cf-idp-azure-reader` (Reader, certificate); Secrets Manager `compute-factory/azure-reader`, `SecretString` JSON `{tenantId, clientId, subscriptionId, location, certificatePem}` |
+| IDP reader | persistent `cf-idp-azure-reader` service principal; `up` writes `compute-factory/azure-reader` as `SecretString` JSON `{tenantId, clientId, subscriptionId, location, certificatePem, credentialId}`. The last field is the AWS version UUID and Entra `vendy-poc-reader:<uuid>` certificate name; absent on legacy credentials. |
 | Local Terraform operator | Service principal supplied through `ARM_CLIENT_ID` and `ARM_CLIENT_CERTIFICATE_PATH`; independent of the IDP and Actions identities |
 
 Tooling versions (pin these):
@@ -717,11 +717,13 @@ type ObservedVm = {
 - `vendy-idp/deploy/deploy.sh <host> <env-file> [<image-id>]`:
   - ships a supplied local IDP image directly; if omitted, builds first using `deploy/build.sh`;
   - copies the image's packaged `docker-compose.yml`, `Caddyfile` and `cluster-install.sh`, plus `<env-file>` as `.env`, to `/opt/idp`;
-  - runs `cluster-install.sh /opt/idp/.env` (§12.4) before starting the stack;
   - starts the host-local `registry` service (`127.0.0.1:15000` on the host only) and pushes the
     image to it through an SSH tunnel (only missing layers transfer);
-   - verifies the pulled and deployed Backstage image IDs match the local image and brings the stack
-     up. Fresh Caddy reads its config at startup; a reused running Caddy reloads it with bounded
+   - verifies the pulled ID before running `cluster-install.sh /opt/idp/.env <image-id>` (§12.4).
+     The installer uses a helper packaged in that image to fetch the Reader secret via the EC2 role
+     and pipe the autoscaler's Kubernetes Secret directly to `kubectl`;
+   - brings up the stack and verifies the running Backstage image ID. Fresh Caddy reads its config
+      at startup; a reused running Caddy reloads it with bounded
      retries. Garbage collection is explicit via `./poc prune-idp-images`
     (`deploy/deploy.sh --prune <host>`), not part of rollout.
   It must be idempotent and must not prompt.
@@ -745,7 +747,7 @@ type ObservedVm = {
 | `AWS_WORKER_GROUPS` | `infra/` output `aws_worker_groups` (comma-separated ASG names) |
 | `AZURE_SUBSCRIPTION_ID`, `AZURE_TENANT_ID` | §1a constants |
 | `AZURE_WORKERS_RG`, `AZURE_WORKER_SCALE_SETS` | `infra/` outputs `azure_workers_rg`, `azure_worker_scale_sets` |
-| `AZURE_AUTOSCALER_CLIENT_ID`, `AZURE_AUTOSCALER_CERT_B64` | `cf-idp-azure-reader` app ID and base64 of `vendy/.poc-azure-reader.pem` |
+| `AZURE_AUTOSCALER_CLIENT_ID` | `cf-idp-azure-reader` app ID; its certificate is read on the host from `AZURE_READER_SECRET_ID`, not sent in `.env`. |
 
 - Compose services: `caddy`, `backstage`, `guacd` (§8.5; `network_mode: service:backstage`, 1 GiB
   memory limit, pulled from Docker Hub, multi-arch), `postgres`, `registry`. `backstage` mounts
@@ -941,7 +943,7 @@ displays the chosen platform and links back to the picker. Modify, restart and d
 container page. Template output links to `runUrl`; the run page links to the catalog only once the
 caller can read a container entity whose `cf/request-id` matches the run.
 
-### 12.4 Cluster (IDP host, `deploy/cluster-install.sh <env-file>`)
+### 12.4 Cluster (IDP host, `deploy/cluster-install.sh <env-file> <image-id>`)
 
 - k3s server `K3S_VERSION` (`infra/` variable `k3s_version`, currently `v1.37.2+k3s1`) with
   `/etc/rancher/k3s/config.yaml`: `disable: [traefik, servicelb, gateway-api-crd]`, taint `CriticalAddonsOnly=true:NoExecute`,

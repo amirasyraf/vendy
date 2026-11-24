@@ -11,13 +11,14 @@ from concurrent.futures import Future
 from concurrent.futures import wait as wait_futures
 from pathlib import Path
 
+from .azure_reader import check_reader_app, ensure_reader, operator_token, revoke_reader
 from .cloud import (
     delete_image_versions, destroy_vms, prepare_vm_states, remove_empty_state_bucket, state_bucket_keys, stop_idp,
     sweep_azure, sweep_infra_orphans, sweep_tagged, verify_clean, verify_cloud_clean, verify_images_state_empty,
     verify_infra_state_empty,
 )
 from .core import (
-    AWS_REGION, AZURE_READER_PEM, BUILDER_REPO, CA_FINGERPRINT_RE, CF_DNS_DIR, DOMAIN, GEN, IMAGES_DIR, INFRA_DIR, LOGS,
+    AWS_REGION, BUILDER_REPO, CA_FINGERPRINT_RE, CF_DNS_DIR, DOMAIN, GEN, IMAGES_DIR, INFRA_DIR, LOGS,
     MAINTENANCE_VARIABLE, OWNER, PLATFORM_REPO, POC_ENV, SSH_KEY, STATE_BUCKET, USERS_FILE, WORKFLOWS, Unknown,
     cancel_background, die,
     gh_read, images_apply_or_destroy, infra_apply_or_destroy, info, last_line, log, nonempty, poc_env_github_token,
@@ -61,15 +62,17 @@ def _up_preflight() -> None:
         die(".poc.env must set GITHUB_TOKEN")
     if not nonempty(USERS_FILE):
         die("no IDP users; run ./poc set-password <user> first")
-    # One-time Azure setup that survives down (DESIGN.md section 9).
-    if not nonempty(AZURE_READER_PEM):
-        die(f"missing {AZURE_READER_PEM} (IDP Azure reader certificate; DESIGN.md section 9)")
 
 
 def cmd_up(resume: str | None) -> None:
     log("Preflight")
     _up_preflight()
     check_repo_variables(BUILDER_REPO, PLATFORM_REPO)
+    try:
+        reader_operator = operator_token()
+        check_reader_app(reader_operator, resume is not None)
+    except Unknown as exc:
+        die(f"Azure Reader preflight: {exc}")
     require(tf(INFRA_DIR, "init", "-input=false", "-lockfile=readonly"), "shared Terraform init failed")
     try:
         state = root_state(INFRA_DIR)
@@ -147,6 +150,12 @@ def cmd_up(resume: str | None) -> None:
             if not IPV4.fullmatch(ip) or bucket != STATE_BUCKET:
                 die("infra returned an unexpected host or state bucket")
         info(f"IDP host {ip}, state bucket {bucket}")
+
+        log("Provision the portal's Azure Reader credential")
+        try:
+            ensure_reader(reader_operator)
+        except Unknown as exc:
+            die(f"Azure Reader provisioning failed: {exc}")
 
         # The IDP does not consume golden images: bake (or watch a resumed bake) while the IDP bootstraps.
         # The platform gate stays closed until both succeed.
@@ -418,6 +427,12 @@ def cmd_down(keep_images_requested: bool) -> None:
         log("Verify cloud, DNS and local state")
         if not verify_clean(keep_images_requested):
             die("NOT CLEAN: teardown verification failed; see the check-specific warnings above")
+
+        log("Revoke the portal's managed Azure Reader certificate")
+        try:
+            revoke_reader()
+        except Unknown as exc:
+            die(f"NOT CLEAN: Azure Reader certificate revocation: {exc}")
 
         log("Clear and verify GitHub wiring and inventory")
         if not clear_platform_wiring():
