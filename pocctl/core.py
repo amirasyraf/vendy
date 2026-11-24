@@ -594,16 +594,16 @@ def require_terraform_azure_auth() -> bool:
     if (os.environ.get("ARM_SUBSCRIPTION_ID") or AZURE_SUBSCRIPTION) != AZURE_SUBSCRIPTION:
         warn("ARM_SUBSCRIPTION_ID is not the POC subscription")
         return False
+    cert_path = os.environ.get("ARM_CLIENT_CERTIFICATE_PATH")
+    if not os.environ.get("ARM_CLIENT_ID") or not cert_path:
+        warn("set ARM_CLIENT_ID and ARM_CLIENT_CERTIFICATE_PATH for the local Terraform Azure identity")
+        return False
+    if not os.access(cert_path, os.R_OK):
+        warn(f"Terraform Azure certificate not readable: {cert_path}")
+        return False
     os.environ["ARM_TENANT_ID"] = AZURE_TENANT
     os.environ["ARM_SUBSCRIPTION_ID"] = AZURE_SUBSCRIPTION
-    os.environ["ARM_CLIENT_ID"] = os.environ.get("ARM_CLIENT_ID") or "b6a2750b-5b51-487a-8903-d01c0a00a4e2"
-    os.environ["ARM_CLIENT_CERTIFICATE_PATH"] = (
-        os.environ.get("ARM_CLIENT_CERTIFICATE_PATH") or str(Path.home() / ".config/azure/cf-admin-local.pfx")
-    )
-    os.environ["ARM_CLIENT_CERTIFICATE_PASSWORD"] = os.environ.get("ARM_CLIENT_CERTIFICATE_PASSWORD", "")
-    if not os.access(os.environ["ARM_CLIENT_CERTIFICATE_PATH"], os.R_OK):
-        warn(f"Terraform Azure certificate not readable: {os.environ['ARM_CLIENT_CERTIFICATE_PATH']}")
-        return False
+    os.environ.setdefault("ARM_CLIENT_CERTIFICATE_PASSWORD", "")
     return True
 
 

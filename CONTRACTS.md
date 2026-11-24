@@ -51,7 +51,7 @@ AWS remains the shared base (SSH CA, Terraform state bucket, IDP host); Azure ho
 | Image gallery | resource group `cf-images`, gallery `cfimages`, one definition per OS release (`ubuntu`: Ubuntu 26.04, Linux; `windows-2025`: Windows Server 2025, Windows; both Gen2, x64, NVMe + SCSI); the group (tag `cf:module=images`), gallery and definitions are created by `infra/images/gallery.tf` |
 | Per-VM resources | resource group `cf-vm-<name>`; VNet, subnet, NSG (tcp/22 from anywhere; never 3389), static Standard public IP, NIC and VM all named `cf-<name>` (a Linux or Windows VM resource by OS family) |
 | IDP reader | service principal `cf-idp-azure-reader` (Reader, certificate); Secrets Manager `compute-factory/azure-reader`, `SecretString` JSON `{tenantId, clientId, subscriptionId, location, certificatePem}` |
-| Laptop admin | service principal `cf-admin-local` (Owner, certificate; `ARM_*` in `~/.zshrc`) for `infra/images` and `./poc` |
+| Local Terraform operator | Service principal supplied through `ARM_CLIENT_ID` and `ARM_CLIENT_CERTIFICATE_PATH`; independent of the IDP and Actions identities |
 
 Tooling versions (pin these):
 - Terraform `>= 1.10` (S3 `use_lockfile`), AWS provider `~> 6.0`.

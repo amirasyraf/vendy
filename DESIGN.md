@@ -830,9 +830,9 @@ for garbage collection but the running application stays up.
 4. **Shared infra, image tier and DNS**: remove the targeted Cloudflare record (concurrently with the
    step 3 sweeps). Destroy `infra/` only
    when the VM bucket can safely be removed. Destroy `infra/images` (CA and gallery) only when images
-   are not kept and the Azure VM/build groups and gallery versions are gone; it uses the Azure
-   certificate defaults. The two roots share no Terraform references, so their destroys run
-   concurrently. Independent AWS/Azure sweeps still apply when Terraform cannot complete; the
+   are not kept and the Azure VM/build groups and gallery versions are gone; it uses the operator's
+   `ARM_*` Azure certificate configuration. The two roots share no Terraform references, so their
+   destroys run concurrently. Independent AWS/Azure sweeps still apply when Terraform cannot complete; the
    CA fallback runs only when the image tier is being removed. Do not force-empty the state bucket.
    Retry Terraform state reconciliation of both roots after fallback cleanup when possible.
 5. **Verify before GitHub cleanup**: require empty local `infra/` state (and `infra/images` state unless

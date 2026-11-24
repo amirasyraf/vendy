@@ -29,9 +29,11 @@ The host key pair is `~/.ssh/id_ed25519` and `.pub`. The repo pins Node via `mis
    editing local password files does not update the running portal. Treat `.poc-users` and the
    plaintext `.poc-passwords` as private, gitignored files. The old GitHub OAuth app and the legacy
    `AUTH_GITHUB_CLIENT_ID` / `AUTH_GITHUB_CLIENT_SECRET` entries are not required.
-5. The laptop's Azure Terraform identity defaults to `~/.config/azure/cf-admin-local.pfx`; the IDP's separate Azure Reader
-   identity uses `.poc-azure-reader.pem`, a gitignored certificate and private key installed into an
-   AWS secret by Terraform. Azure CLI selection is checked separately. The Entra app that Actions
+5. For local Terraform, set `ARM_CLIENT_ID` and `ARM_CLIENT_CERTIFICATE_PATH` to your operator
+   service principal's application ID and PKCS#12 certificate; set `ARM_CLIENT_CERTIFICATE_PASSWORD`
+   if needed. The IDP's separate Azure Reader identity uses `.poc-azure-reader.pem`, a gitignored
+   certificate and private key installed into an AWS secret by Terraform. Azure CLI selection is
+   checked separately. The Entra app that Actions
    uses authenticates by OIDC, never with either certificate. Keep the existing Cloudflare Terraform
    root at `~/projects/cloudflare/amirasyraf.dev`; `poc` applies only the portal record there.
 
