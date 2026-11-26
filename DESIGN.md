@@ -812,7 +812,8 @@ without rebuilding. The existing host runs the packaged Compose/Caddy config and
 the build overlaps the infrastructure apply and host initialization. A gitignored checkpoint ties
 the build to the existing instance and records whether golden images were reused. `--gha --resume`
 checks the checkpoint and platform gate before using existing infrastructure; it never dispatches a
-new golden bake. The platform opens only after IDP readiness and golden-image verification.
+new golden bake. An explicitly supplied `--idp-run` can replace the saved IDP run after a fix, without
+changing the instance or bake. The platform opens only after IDP readiness and golden-image verification.
 Run `./poc prune-idp-images` separately when the dedicated host needs disk space; the registry pauses
 for garbage collection but the running application stays up.
 

@@ -7,7 +7,7 @@
 
   ./poc up                      create everything (assumes a clean slate apart from a kept SSH CA + golden images)
   ./poc up --gha                use GitHub Actions for the IDP image; no local Docker
-  ./poc up --gha --resume [<bake-id>]  finish a gated GitHub Actions bootstrap
+  ./poc up --gha --resume [<bake-id>] [--idp-run <run-id>]  finish a gated GitHub Actions bootstrap
   ./poc up --resume <run-id>    finish bootstrap on existing infra using one dispatched bake (running or succeeded)
   ./poc up --images-only        create the SSH CA/gallery if missing, bake every images.yaml row, prune old images
   ./poc down                    destroy everything, including user VMs, then verify nothing tagged cf:poc=true remains

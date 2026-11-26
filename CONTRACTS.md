@@ -724,7 +724,8 @@ type ObservedVm = {
   - copies the image's packaged `docker-compose.yml`, `Caddyfile` and `cluster-install.sh`, plus `<env-file>` as `.env`, to `/opt/idp`;
   - starts the host-local `registry` service (`127.0.0.1:15000` on the host only) and pushes the
     image to it through an SSH tunnel (only missing layers transfer);
-   - verifies the pulled ID before running `cluster-install.sh /opt/idp/.env <image-id>` (§12.4).
+   - verifies the exact pushed manifest digest when pulling from the host-local registry, then uses
+     that daemon's image ID for `cluster-install.sh /opt/idp/.env <image-id>` (§12.4).
      The installer uses a helper packaged in that image to fetch the Reader secret via the EC2 role
      and pipe the autoscaler's Kubernetes Secret directly to `kubectl`;
    - brings up the stack and verifies the running Backstage image ID. Fresh Caddy reads its config
@@ -732,9 +733,11 @@ type ObservedVm = {
      retries. Garbage collection is explicit via `./poc prune-idp-images`
     (`deploy/deploy.sh --prune <host>`), not part of rollout.
    It must be idempotent and must not prompt.
-- The `--ghcr <digest-ref> <image-id>` alternative pulls on the host, verifies the image ID,
-  `linux/arm64` and IDP label, reads packaged deployment files from that same image, then stages it
-  in the loopback registry and uses the same rollout. No local Docker or image copy; optional
+- The `--ghcr <digest-ref> <config-id>` alternative pulls on the host, verifies the exact registry digest,
+  `linux/arm64` and IDP label, then reads packaged deployment files from that same image. Depending on
+  the Docker image store, the daemon may report the supplied config digest or the manifest digest as
+  the image ID. The host stages the image in the loopback registry and uses the same rollout.
+  No local Docker or image copy; optional
   `GHCR_PULL_USER` and `GHCR_PULL_TOKEN` are used only for temporary registry authentication.
 - `./poc up` configures DNS and restores TLS storage as needed for bootstrap. `./poc deploy-idp
   [<image-id>]` reads the existing host and environment values from local Terraform state, leaves

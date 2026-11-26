@@ -44,7 +44,7 @@ Fill in `GITHUB_TOKEN`, then use the command that matches what you want to do:
 | `./poc set-password <username>` | Set a local POC login; the next deploy loads its hash. |
 | `./poc up` | Bring up the POC from empty shared state. |
 | `./poc up --gha` | Bring up the same POC, building and smoke-testing the IDP image on GitHub instead of the laptop. |
-| `./poc up --gha --resume [<bake-id>]` | Finish a gated Actions bootstrap using the original IDP build and golden images. |
+| `./poc up --gha --resume [<bake-id>] [--idp-run <run-id>]` | Finish a gated Actions bootstrap. Uses the original build unless given an exact replacement IDP run. |
 | `./poc status` | See resources, readiness, and recent pipeline runs. |
 | `./poc watch-bake <run-id>` | Check an existing bake without dispatching another. |
 | `./poc up --resume <run-id>` | Finish a gated bootstrap using a dispatched bake; the IDP deploys while that bake finishes. |

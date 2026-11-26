@@ -70,7 +70,7 @@ def _up_preflight(gha: bool) -> None:
         die("no IDP users; run ./poc set-password <user> first")
 
 
-def cmd_up(resume: str | None, *, gha: bool = False, resume_gha: bool = False) -> None:
+def cmd_up(resume: str | None, *, gha: bool = False, resume_gha: bool = False, idp_run: str | None = None) -> None:
     log("Preflight")
     _up_preflight(gha)
     resuming = resume is not None or resume_gha
@@ -97,8 +97,11 @@ def cmd_up(resume: str | None, *, gha: bool = False, resume_gha: bool = False) -
     stop = threading.Event()
     pending: list[Future] = []
     try:
+        resume_instance = None
+        reused = False
         if gha and resuming:
-            build, reused = load_checkpoint(tf_output(INFRA_DIR, "idp_instance_id"))
+            resume_instance = tf_output(INFRA_DIR, "idp_instance_id")
+            build, reused = load_checkpoint(resume_instance)
             if reused and resume:
                 die("this bootstrap reused golden images; do not supply a bake run ID")
             if not reused and resume is None:
@@ -169,8 +172,10 @@ def cmd_up(resume: str | None, *, gha: bool = False, resume_gha: bool = False) -
                 info("reusing images that trust this CA; no bake")
 
         if gha:
-            build = build or select_build()
+            build = select_build(idp_run) if idp_run else build or select_build()
             clone_deployer(build, tmp / "idp")
+            if idp_run and resume_instance:
+                save_checkpoint(build, resume_instance, reused)
             gha_log = LOGS / "idp-actions.log"
             info(f"IDP Actions verification log: {gha_log}")
             artifact = spawn(lambda: wait_for_artifact(build, stop), log_path=gha_log)
