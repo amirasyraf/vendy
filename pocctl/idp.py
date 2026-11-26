@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 from .core import (
     AWS_ACCOUNT, AWS_REGION, AZURE_READER_CLIENT_ID, AZURE_SUBSCRIPTION, AZURE_TENANT, CADDY_BACKUP, CADDY_VOLUME, CF_DNS_DIR, DOMAIN, GEN, HEALTH_URL, IDP_DIR, INFRA_DIR, LOGS,
@@ -107,8 +108,36 @@ def refresh_catalog_locations(ip: str) -> bool:
                                   f"https://{DOMAIN}/api/catalog/refresh", token=token), input=header)
         if not posted.ok:
             return False
-    echo("catalog refresh requested")
-    return True
+    names = [line.split(":", 1)[0] for line in USERS_FILE.read_text().splitlines() if ":" in line]
+    deadline = time.monotonic() + 60
+    while True:
+        missing = []
+        for name in names:
+            result = run(
+                _pinned_curl(
+                    ip,
+                    "-sS",
+                    "--max-time",
+                    "5",
+                    "-o",
+                    "/dev/null",
+                    "-w",
+                    "%{http_code}",
+                    f"https://{DOMAIN}/api/catalog/entities/by-name/User/default/{quote(name, safe='')}",
+                    token=token,
+                ),
+                input=header,
+            )
+            if not result.ok or result.out.strip() != "200":
+                missing.append(name)
+        if not missing:
+            echo("catalog refresh complete")
+            return True
+        if time.monotonic() >= deadline:
+            warn(f"catalog users not ready after 60s: {', '.join(missing)}")
+            return False
+        if pause(2):
+            return False
 
 
 def save_caddy_data(ip: str) -> bool:
