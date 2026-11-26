@@ -310,7 +310,8 @@ vendy-idp/                     # repository root
                                # and AWS region/secret IDs (not the secret values)
 ```
 
-- The image is built locally for arm64 and shipped to a loopback-only registry on the host via SSH.
+- The ARM64 image is built locally or in GitHub Actions. The local path ships it over SSH; with
+  `--gha` the host pulls the tested digest directly and stages it in the same loopback-only registry.
   That avoids ECR and building on the IDP host.
 - DNS: `idp.tf` in `~/projects/cloudflare/amirasyraf.dev` creates an A record to the EIP with `proxied = false`,
   so Caddy can get and renew its certificate. The POC manages this record as DNS-only.
@@ -805,6 +806,11 @@ cloud cleanliness, so use it on a POC that is up or was taken down with `down`/`
 Routine `./poc deploy-idp [<image-id>]` skips infrastructure setup and image cleanup. Build with
 `vendy-idp/deploy/build.sh`, smoke-test that local image ID, and pass the same ID to deploy
 without rebuilding. The existing host runs the packaged Compose/Caddy config and is health-checked.
+`./poc deploy-idp --gha [<run-id>]` instead uses the published Actions artifact. In `up --gha`,
+the build overlaps the infrastructure apply and host initialization. A gitignored checkpoint ties
+the build to the existing instance and records whether golden images were reused. `--gha --resume`
+checks the checkpoint and platform gate before using existing infrastructure; it never dispatches a
+new golden bake. The platform opens only after IDP readiness and golden-image verification.
 Run `./poc prune-idp-images` separately when the dedicated host needs disk space; the registry pauses
 for garbage collection but the running application stays up.
 

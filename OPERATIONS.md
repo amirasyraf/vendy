@@ -8,9 +8,9 @@ another checkout or host.
 
 ## Setup and credentials
 
-Bootstrap needs Terraform, Git, an authenticated `gh`, the AWS and Azure CLIs, Docker with buildx
-and Compose, `uv` (`./poc` is a uv script that provisions its own Python 3.10+ and PyYAML), `curl`, and OpenSSH (`ssh`, `scp`,
-`ssh-keygen`).
+Bootstrap needs Terraform, Git, an authenticated `gh`, the AWS and Azure CLIs, `uv` (`./poc` provisions
+its own Python 3.10+ and PyYAML), `curl`, and OpenSSH. Local-build mode additionally needs Docker
+with buildx and Compose and `scp`. `--gha` needs no local Docker.
 The host key pair is `~/.ssh/id_ed25519` and `.pub`. The repo pins Node via `mise` in `vendy-idp`.
 
 1. Put `vendy` and `vendy-idp` side by side; `./poc set-password` uses the local IDP hash helper
@@ -45,6 +45,7 @@ The host key pair is `~/.ssh/id_ed25519` and `.pub`. The repo pins Node via `mis
 | GitHub Actions' job `GITHUB_TOKEN` | Checks out and writes inventory in `vendy-platform` using `contents: write`. The displayed commit author is not a GitHub App. |
 | AWS/Azure GitHub OIDC | Grants cloud access to workflow jobs. This is unrelated to GitHub OAuth sign-in. |
 | Static workflow `BACKSTAGE_TOKEN` | Lets the stage job refresh catalog entries and check demo cleanup eligibility. It cannot read task or VM run state. |
+| `GHCR_PULL_USER` / `GHCR_PULL_TOKEN` | Export both for a private GHCR image. Use a separate classic PAT with only `read:packages` and access to `vendy-idp`. The host uses a temporary Docker config; the token does not enter Actions, `.poc.env`, or Backstage. Omit both for an explicitly public package. |
 | IDP EC2 instance role | Reads scoped AWS secrets, observes EC2, and checks golden AMI availability with `ec2:DescribeImages`; the Azure Reader secret is used for read-only Azure calls. |
 
 Full `up` generates a 364-day Reader certificate and writes the private key directly to
@@ -67,6 +68,8 @@ backups can contain secret material; don't copy them into tickets, logs, or Git.
 |---|---|
 | Bootstrap failed before a bake was confirmed | Read `./poc status` and `.generated/logs/`. If dispatch returned ambiguously, find the exact run in builder Actions first; don't dispatch it again based on missing output. |
 | A bake run exists but monitoring stopped | `./poc watch-bake <run-id>` is read-only. Exit `2` means unknown, not failed; it does not cancel the run. Exit `0` proves the GitHub conclusion, not artifact usability. |
+| A gated `up --gha` was interrupted | Inspect `.generated/logs/idp-actions.log` and resume with `./poc up --gha --resume`. It uses the checkpoint for the existing instance, attaches to the original IDP run and either re-verifies retained images or attaches to the saved bake. Supply the exact bake ID only when dispatch was ambiguous; do not assume the latest run is yours. Neither path reapplies Terraform. |
+| An Actions IDP build or image pull failed | Check the reported run and `idp.log`. A failed build can be rerun on GitHub (the same run ID); a missing artifact or package is not grounds to fall back to `latest`. Check registry visibility or the dedicated read-only credential before resuming. |
 | Bootstrap stopped (or was interrupted) after an exact bake was dispatched, and that bake is running or succeeded | `./poc up --resume <run-id>` bootstraps the IDP while it waits for the bake, then verifies the original bake artifacts, current matching images, owned running host, empty VM state/inventory, and idle workflows. It does not reapply Terraform or rebake. |
 | Terraform partially applied, or the bake actually failed | Inspect `images-apply.log`, `infra-apply.log`, or `bake.log` in `.generated/logs/` as applicable. Resume is not a general repair or rerun command. Preserve state and identify the failed step first. |
 | Azure Reader provisioning or revocation failed | Check the operator certificate and Graph app permissions. Do not upload a replacement Reader PEM. A gated `up --resume` reuses the current secret when otherwise eligible; if no bake was dispatched and bootstrap cannot resume, run `down --keep-images` and start a new cycle. Rerun `down` with the same retention option if Graph revocation could not be verified. |
@@ -111,7 +114,7 @@ or `CLEAN (images retained)` result after an intentional teardown.
 | Change | Checks |
 |---|---|
 | Documentation only | Verify examples, commands, and contracts against code; check links and Markdown diffs. No live startup needed. |
-| Portal or backend | Use the [IDP checks](https://github.com/amirasyraf/vendy-idp#checks). Exercise a local built image and fixture UI; on an existing host deploy the same tested ID with `./poc deploy-idp <image-id>`, then sign in and run the live checks. |
+| Portal or backend | Use the [IDP checks](https://github.com/amirasyraf/vendy-idp#checks). Deploy the tested image with `./poc deploy-idp <image-id>` or `./poc deploy-idp --gha [<run-id>]`, then sign in and run the live checks. |
 | VM workflow, schema, or Ansible | Run the [platform's offline integration and static checks](https://github.com/amirasyraf/vendy-platform#extending-and-checking). Exercise changed guest commands on equivalent disposable guests before any stage dispatch. |
 | Golden images | Run the [builder's full validation and guest preflight](https://github.com/amirasyraf/vendy-builder#local-checks) before Actions. `./poc up --images-only` always dispatches a bake and may remove superseded images after validating the new matrix. |
 

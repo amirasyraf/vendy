@@ -8,7 +8,8 @@ import sys
 
 from .core import Fatal, acquire_lock, cancel_background, configure_environment, die, error, prepare_lifecycle
 
-USAGE = ("usage: ./poc up [--images-only | --resume <run-id>]|down [--keep-images]|status|deploy-idp [<image-id>]|"
+USAGE = ("usage: ./poc up [--images-only | --resume <bake-id> | --gha [--resume [<bake-id>]]]|"
+         "down [--keep-images]|status|deploy-idp [<image-id> | --gha [<run-id>]]|"
          "prune-idp-images|set-password <user>|watch-bake <run-id>|logs [service] [since]|task <task-id>|run <run-id>")
 
 
@@ -20,16 +21,18 @@ def _lifecycle() -> None:
 def _dispatch(argv: list[str]) -> int:
     command, args = (argv[0], argv[1:]) if argv else ("", [])
     if command == "up":
-        if not (args == [] or args == ["--images-only"]
-                or (len(args) == 2 and args[0] == "--resume" and re.fullmatch(r"[1-9][0-9]*", args[1]))):
-            die("usage: ./poc up [--images-only | --resume <run-id>]")
+        gha = args[:1] == ["--gha"]
+        options = args[1:] if gha else args
+        if not (not options or not gha and options == ["--images-only"] or gha and options == ["--resume"]
+                or (len(options) == 2 and options[0] == "--resume" and re.fullmatch(r"[1-9][0-9]*", options[1]))):
+            die("usage: ./poc up [--images-only | --resume <bake-id> | --gha [--resume [<bake-id>]]]")
         from .lifecycle import cmd_images_only, cmd_up
 
         _lifecycle()
         if args == ["--images-only"]:
             cmd_images_only()
         else:
-            cmd_up(args[1] if args else None)
+            cmd_up(options[1] if len(options) == 2 else None, gha=gha, resume_gha=gha and bool(options))
     elif command == "down":
         if args not in ([], ["--keep-images"]):
             die("usage: ./poc down [--keep-images]")

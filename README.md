@@ -43,18 +43,22 @@ Fill in `GITHUB_TOKEN`, then use the command that matches what you want to do:
 |---|---|
 | `./poc set-password <username>` | Set a local POC login; the next deploy loads its hash. |
 | `./poc up` | Bring up the POC from empty shared state. |
+| `./poc up --gha` | Bring up the same POC, building and smoke-testing the IDP image on GitHub instead of the laptop. |
+| `./poc up --gha --resume [<bake-id>]` | Finish a gated Actions bootstrap using the original IDP build and golden images. |
 | `./poc status` | See resources, readiness, and recent pipeline runs. |
 | `./poc watch-bake <run-id>` | Check an existing bake without dispatching another. |
 | `./poc up --resume <run-id>` | Finish a gated bootstrap using a dispatched bake; the IDP deploys while that bake finishes. |
 | `./poc up --images-only` | Rebuild and verify golden images, then prune superseded images. |
 | `./poc deploy-idp [<image-id>]` | Update the app on the existing host. |
+| `./poc deploy-idp --gha [<run-id>]` | Update the existing host from a tested Actions build; no local Docker or image transfer. |
 | `./poc prune-idp-images` | Clean up unused IDP images and registry blobs. |
 | `./poc logs [service] [since]` | Read service logs; defaults to `backstage` and `30m`. |
 | `./poc task <task-uuid>` / `./poc run <run-id>` | Inspect a Scaffolder task or a VM run. |
 | `./poc down [--keep-images]` | Tear down the POC and all its VMs. The optional flag keeps the CA and images. |
 
-For a portal update, [build and check one local image](https://github.com/amirasyraf/vendy-idp#checks)
-and pass its image ID to `./poc deploy-idp`. This uses the existing host and leaves DNS alone.
+For a portal update from pushed `main`, use `./poc deploy-idp --gha`. For unpushed work, [build and
+check one local image](https://github.com/amirasyraf/vendy-idp#checks) and pass its image ID to
+`./poc deploy-idp`. Both use the existing host and leave DNS alone.
 
 **`./poc down` destroys the POC and its VMs.** Don't use it to recover from a failed bake or deploy.
 Read [the runbook](OPERATIONS.md#diagnose-before-retrying) if bootstrap stalls or teardown reports

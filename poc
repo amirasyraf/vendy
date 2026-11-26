@@ -6,12 +6,15 @@
 """Vendy POC lifecycle. The implementation is in pocctl/; see DESIGN.md section 12.
 
   ./poc up                      create everything (assumes a clean slate apart from a kept SSH CA + golden images)
+  ./poc up --gha                use GitHub Actions for the IDP image; no local Docker
+  ./poc up --gha --resume [<bake-id>]  finish a gated GitHub Actions bootstrap
   ./poc up --resume <run-id>    finish bootstrap on existing infra using one dispatched bake (running or succeeded)
   ./poc up --images-only        create the SSH CA/gallery if missing, bake every images.yaml row, prune old images
   ./poc down                    destroy everything, including user VMs, then verify nothing tagged cf:poc=true remains
   ./poc down --keep-images      the same, but keep the SSH CA and golden images (infra/images) for the next up
   ./poc status                  read-only overview
   ./poc deploy-idp [<image-id>] deploy to the existing host, building only when no artifact is supplied
+  ./poc deploy-idp --gha [<run-id>]  deploy the verified GitHub Actions artifact directly to the host
   ./poc prune-idp-images        explicitly collect old IDP registry blobs and dangling IDP images
   ./poc watch-bake <run-id>     monitor an existing bake without dispatching another
   ./poc set-password <user>     add/change an IDP login (hash stored in .poc-users)

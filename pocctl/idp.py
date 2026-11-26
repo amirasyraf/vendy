@@ -10,6 +10,7 @@ import re
 import shutil
 import tempfile
 import time
+from concurrent.futures import Future
 from pathlib import Path
 from urllib.parse import quote
 
@@ -18,6 +19,7 @@ from .core import (
     POC_ENV, USERS_FILE, ProcessGroup, Unknown, aws, aws_json, die, echo, info, nonempty, pause, poc_env_github_token,
     run, show_tail, spawn, ssh, tf, tf_output, tls_backup_has_cert, warn,
 )
+from .idp_actions import Artifact, check_pull_credentials, clone_deployer, select_build, wait_for_artifact
 
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 IPV4 = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+")
@@ -184,9 +186,10 @@ def _build_image(project_dir: Path, group: ProcessGroup) -> str | None:
     return image if IMAGE_ID.fullmatch(image) else None
 
 
-def deploy_idp(ip: str, mode: str, image: str | None = None, project_dir: Path = IDP_DIR) -> bool:
+def deploy_idp(ip: str, mode: str, image: str | None = None, project_dir: Path = IDP_DIR,
+               artifact: Artifact | None = None, artifact_future: Future[Artifact | None] | None = None) -> bool:
     """Deploy to the host and wait until it is healthy. Bootstrap also waits for host initialization,
-    publishes DNS and restores TLS storage, while the image builds locally in parallel."""
+    publishes DNS and restores TLS storage, while the image builds locally or in Actions in parallel."""
     fd, name = tempfile.mkstemp(dir=GEN, prefix="idp.env.")
     os.close(fd)
     env_file = Path(name)
@@ -194,7 +197,7 @@ def deploy_idp(ip: str, mode: str, image: str | None = None, project_dir: Path =
     build_group = ProcessGroup()
     try:
         if mode == "bootstrap":
-            if image is None:
+            if image is None and artifact is None and artifact_future is None:
                 echo(f"building the IDP image while the host initializes; log: {LOGS / 'idp-build.log'}")
                 build = spawn(lambda: _build_image(project_dir, build_group))
             if not wait_for_ssh_ready(ip):
@@ -213,11 +216,17 @@ def deploy_idp(ip: str, mode: str, image: str | None = None, project_dir: Path =
                     warn(f"IDP image build failed (see {LOGS / 'idp-build.log'})")
                     return False
                 echo(f"Built artifact {image}")
+        if artifact_future is not None:
+            echo("waiting for the GitHub Actions IDP image")
+            artifact = artifact_future.result()
+            if artifact is None:
+                return False
         start = time.monotonic()
         if not write_idp_env(env_file):
             return False
         echo(f"Prepare IDP configuration: {int(time.monotonic() - start)}s")
-        command = [str(project_dir / "deploy/deploy.sh"), ip, str(env_file), *([image] if image else [])]
+        args = ["--ghcr", *artifact] if artifact else [image] if image else []
+        command = [str(project_dir / "deploy/deploy.sh"), ip, str(env_file), *args]
         if not run(command, capture=False).ok:
             return False
         start = time.monotonic()
@@ -261,18 +270,30 @@ def existing_idp_ip() -> str:
 
 
 def cmd_deploy_idp(args: list[str]) -> None:
-    if len(args) > 1:
-        die("usage: ./poc deploy-idp [<sha256:image-id>]")
-    if args and not IMAGE_ID.fullmatch(args[0]):
-        die("pass the full image ID printed by vendy-idp/deploy/build.sh")
-    for tool in ("terraform", "aws", "docker", "curl", "ssh", "scp"):
+    gha = args[:1] == ["--gha"]
+    if not (not args or len(args) == 1 and (gha or IMAGE_ID.fullmatch(args[0]))
+            or gha and len(args) == 2 and re.fullmatch(r"[1-9][0-9]*", args[1])):
+        die("usage: ./poc deploy-idp [<sha256:image-id> | --gha [<run-id>]]")
+    tools = ("gh", "git") if gha else ("docker", "scp")
+    for tool in ("terraform", "aws", "curl", "ssh", *tools):
         if shutil.which(tool) is None:
             die(f"missing tool: {tool}")
     if not nonempty(USERS_FILE):
         die("no IDP users; run ./poc set-password <user> first")
     if not nonempty(POC_ENV):
         die(f"missing {POC_ENV}")
-    if not deploy_idp(existing_idp_ip(), "routine", args[0] if args else None):
+    ip = existing_idp_ip()
+    if gha:
+        check_pull_credentials()
+        build = select_build(args[1] if len(args) == 2 else None)
+        with tempfile.TemporaryDirectory(dir=GEN, prefix="deploy-gha.") as directory:
+            checkout = Path(directory) / "idp"
+            clone_deployer(build, checkout)
+            artifact = wait_for_artifact(build)
+            ok = artifact is not None and deploy_idp(ip, "routine", project_dir=checkout, artifact=artifact)
+    else:
+        ok = deploy_idp(ip, "routine", args[0] if args else None)
+    if not ok:
         die("IDP deploy failed; see the output above")
 
 

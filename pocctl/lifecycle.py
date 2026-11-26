@@ -19,7 +19,7 @@ from .cloud import (
 )
 from .core import (
     AWS_REGION, BUILDER_REPO, CA_FINGERPRINT_RE, CF_DNS_DIR, DOMAIN, GEN, IMAGES_DIR, INFRA_DIR, LOGS,
-    MAINTENANCE_VARIABLE, OWNER, PLATFORM_REPO, POC_ENV, SSH_KEY, STATE_BUCKET, USERS_FILE, WORKFLOWS, Unknown,
+    MAINTENANCE_VARIABLE, OWNER, PLATFORM_REPO, POC_ENV, SSH_KEY, STATE_BUCKET, USERS_FILE, WORKFLOWS, Fatal, Unknown,
     cancel_background, die,
     gh_read, images_apply_or_destroy, infra_apply_or_destroy, info, last_line, log, nonempty, poc_env_github_token,
     require, require_image_tools, require_split_layout, require_terraform_azure_auth, require_tools, root_state, run,
@@ -31,6 +31,9 @@ from .github import (
     verify_wiring_cleared, workflow_action,
 )
 from .idp import deploy_idp, dns_apply, existing_idp_ip
+from .idp_actions import (
+    CHECKPOINT, check_pull_credentials, clone_deployer, load_checkpoint, save_checkpoint, select_build, wait_for_artifact,
+)
 from .images import (
     apply_images_root, ca_fingerprint_from_ssm, current_images, image_tier_lines, report_images, run_bake,
     verify_bake_images, watch_bake,
@@ -47,11 +50,14 @@ def _clone_idp(target: Path) -> bool:
     return result.ok
 
 
-def _up_preflight() -> None:
-    require_image_tools("docker", "scp")
-    for check in (["docker", "info"], ["docker", "buildx", "version"], ["docker", "compose", "version"]):
-        if not run(check).ok:
-            die("Docker, buildx and Compose must be usable")
+def _up_preflight(gha: bool) -> None:
+    require_image_tools(*(() if gha else ("docker", "scp")))
+    if gha:
+        check_pull_credentials()
+    else:
+        for check in (["docker", "info"], ["docker", "buildx", "version"], ["docker", "compose", "version"]):
+            if not run(check).ok:
+                die("Docker, buildx and Compose must be usable")
     if not CF_DNS_DIR.is_dir() or not os.access(CF_DNS_DIR / "idp.tf", os.R_OK):
         die(f"missing Cloudflare IDP Terraform configuration: {CF_DNS_DIR}")
     if not os.access(SSH_KEY, os.R_OK) or not os.access(f"{SSH_KEY}.pub", os.R_OK):
@@ -64,13 +70,14 @@ def _up_preflight() -> None:
         die("no IDP users; run ./poc set-password <user> first")
 
 
-def cmd_up(resume: str | None) -> None:
+def cmd_up(resume: str | None, *, gha: bool = False, resume_gha: bool = False) -> None:
     log("Preflight")
-    _up_preflight()
+    _up_preflight(gha)
+    resuming = resume is not None or resume_gha
     check_repo_variables(BUILDER_REPO, PLATFORM_REPO)
     try:
         reader_operator = operator_token()
-        check_reader_app(reader_operator, resume is not None)
+        check_reader_app(reader_operator, resuming)
     except Unknown as exc:
         die(f"Azure Reader preflight: {exc}")
     require(tf(INFRA_DIR, "init", "-input=false", "-lockfile=readonly"), "shared Terraform init failed")
@@ -78,10 +85,10 @@ def cmd_up(resume: str | None) -> None:
         state = root_state(INFRA_DIR)
     except Unknown:
         die("cannot read local Terraform state; refusing to apply")
-    if resume is None and state:
-        die("infra state already exists; to finish bootstrap after a bake was dispatched use ./poc up --resume <run-id>. "
-            "Do not tear down to resume.")
-    if resume is not None and not state:
+    if not resuming and state:
+        retry = "./poc up --gha --resume" if gha else "./poc up --resume <run-id>"
+        die(f"infra state already exists; to finish a gated bootstrap use {retry}. Do not tear down to resume.")
+    if resuming and not state:
         die("no existing infra to resume; use ./poc up for a clean start")
     if verify_inventory_empty() != "empty":
         die("platform main has a nonempty or unreadable VM or container inventory; refusing to reset it during up")
@@ -90,13 +97,25 @@ def cmd_up(resume: str | None) -> None:
     stop = threading.Event()
     pending: list[Future] = []
     try:
-        # Before any mutation: bootstrap cannot succeed without it.
-        if not _clone_idp(tmp / "idp"):
+        if gha and resuming:
+            build, reused = load_checkpoint(tf_output(INFRA_DIR, "idp_instance_id"))
+            if reused and resume:
+                die("this bootstrap reused golden images; do not supply a bake run ID")
+            if not reused and resume is None:
+                marker = GEN / "bake-run-id"
+                resume = marker.read_text().strip() if marker.is_file() else ""
+                if not re.fullmatch(r"[1-9][0-9]*", resume):
+                    die("no confirmed bake ID; inspect builder Actions before resuming with the exact bake ID")
+        else:
+            build = None
+        # Before applying infra, ensure the published release can be retrieved.
+        if not gha and not _clone_idp(tmp / "idp"):
             die("could not clone vendy-idp main; nothing was changed")
+        artifact = None
         bake, bake_log = None, LOGS / "bake.log"
         images = None
 
-        if resume is not None:
+        if resuming:
             log("Check existing bootstrap")
             if not verify_maintenance_gate("1", PLATFORM_REPO):
                 die("platform is not gated; cannot resume a running POC")
@@ -120,6 +139,13 @@ def cmd_up(resume: str | None) -> None:
             fp = tf_output(IMAGES_DIR, "ssh_ca_fingerprint") or ""
             if not CA_FINGERPRINT_RE.fullmatch(fp) or ca_fingerprint_from_ssm() != fp:
                 die("cannot verify the existing POC SSH CA")
+            if resume is None:
+                try:
+                    images = current_images(fp, "main")
+                except Unknown:
+                    images = None
+                if images is None:
+                    die("cannot verify the golden images reused by this bootstrap")
         else:
             log("Keep resource workflows closed during bootstrap")
             set_maintenance_gate("1", BUILDER_REPO, PLATFORM_REPO)
@@ -142,6 +168,17 @@ def cmd_up(resume: str | None) -> None:
             if images is not None:
                 info("reusing images that trust this CA; no bake")
 
+        if gha:
+            build = build or select_build()
+            clone_deployer(build, tmp / "idp")
+            gha_log = LOGS / "idp-actions.log"
+            info(f"IDP Actions verification log: {gha_log}")
+            artifact = spawn(lambda: wait_for_artifact(build, stop), log_path=gha_log)
+            pending.append(artifact)
+
+        if not resuming:
+            CHECKPOINT.unlink(missing_ok=True)
+            (GEN / "bake-run-id").unlink(missing_ok=True)
             log("Shared infra (state bucket, IDP host, tokens, container worker pools)")
             if not infra_apply_or_destroy("apply", log=LOGS / "infra-apply.log").ok:
                 show_tail(LOGS / "infra-apply.log", 40)
@@ -149,6 +186,9 @@ def cmd_up(resume: str | None) -> None:
             ip, bucket = tf_output(INFRA_DIR, "idp_ip") or "", tf_output(INFRA_DIR, "state_bucket")
             if not IPV4.fullmatch(ip) or bucket != STATE_BUCKET:
                 die("infra returned an unexpected host or state bucket")
+            if build is not None:
+                instance = tf_output(INFRA_DIR, "idp_instance_id") or die("infra returned no IDP instance ID")
+                save_checkpoint(build, instance, images is not None)
         info(f"IDP host {ip}, state bucket {bucket}")
 
         log("Provision the portal's Azure Reader credential")
@@ -178,7 +218,8 @@ def cmd_up(resume: str | None) -> None:
             pending.append(bake)
 
         log("GitHub wiring")
-        require(run(["gh", "variable", "set", "TF_STATE_BUCKET", "-R", PLATFORM_REPO, "-b", bucket]), "could not set TF_STATE_BUCKET")
+        require(run(["gh", "variable", "set", "TF_STATE_BUCKET", "-R", PLATFORM_REPO, "-b", STATE_BUCKET]),
+                "could not set TF_STATE_BUCKET")
         require(run(["gh", "variable", "set", "BACKSTAGE_URL", "-R", PLATFORM_REPO, "-b", f"https://{DOMAIN}"]),
                 "could not set BACKSTAGE_URL")
         token = tf_output(INFRA_DIR, "backstage_token") or die("could not read the Backstage token output")
@@ -193,9 +234,13 @@ def cmd_up(resume: str | None) -> None:
             die("platform gate changed; refusing to publish the IDP")
         idp_log = LOGS / "idp.log"
         info(f"live log: {idp_log}")
-        deploy = spawn(lambda: deploy_idp(ip, "bootstrap", None, tmp / "idp"), log_path=idp_log)
+        deploy = spawn(lambda: deploy_idp(ip, "bootstrap", None, tmp / "idp", artifact_future=artifact), log_path=idp_log)
         pending.append(deploy)
-        idp_ok = deploy.result()
+        try:
+            idp_ok = deploy.result()
+        except Fatal as exc:
+            warn(str(exc))
+            idp_ok = False
         if not idp_ok:
             show_tail(idp_log, 35)
             warn("IDP bootstrap failed; the platform remains gated. Inspect the log before retrying.")
@@ -226,6 +271,8 @@ def cmd_up(resume: str | None) -> None:
                 else:
                     report_images(images)
         if not (idp_ok and bake_ok):
+            if gha:
+                warn("Inspect the original run and logs, then use ./poc up --gha --resume when eligible.")
             die("bootstrap incomplete; the platform remains gated")
 
         log("Enable VM and container stages")
@@ -233,6 +280,7 @@ def cmd_up(resume: str | None) -> None:
         set_maintenance_gate("0", PLATFORM_REPO)
         if not verify_maintenance_gate("0", PLATFORM_REPO):
             die("platform maintenance gate did not open")
+        CHECKPOINT.unlink(missing_ok=True)
 
         log("Up")
         info(f"IDP:          https://{DOMAIN}")
@@ -449,6 +497,7 @@ def cmd_down(keep_images_requested: bool) -> None:
             die("NOT CLEAN: resource workflows are no longer quiescent")
         if not verify_wiring_cleared():
             die("NOT CLEAN: platform GitHub wiring remains or could not be read")
+        CHECKPOINT.unlink(missing_ok=True)
         if keep_images_requested:
             log("Kept image tier")
             for line in image_tier_lines():

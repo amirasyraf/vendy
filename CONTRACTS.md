@@ -714,6 +714,11 @@ type ObservedVm = {
 - `vendy-idp/deploy/build.sh` builds and type-checks a local `linux/arm64` image, tags it
   `compute-factory-idp:latest`, and prints the full `sha256:` image ID on stdout (logs and timings on
   stderr). `IDP_IMAGE=<image-id>` pins the local smoke check to that image.
+- `vendy-idp/.github/workflows/build-idp.yml` dispatches with `commit` (the expected `main` SHA);
+  it only runs on `main` at that commit. It builds and smoke-tests the ARM64 image before publishing
+  to `ghcr.io/amirasyraf/vendy-idp`. Artifact `idp-image-<run-attempt>` contains `idp-image.json`
+  with string fields `commit`, `run_id`, `attempt`, `image` (full digest reference) and `image_id`
+  (Docker config ID). The POC verifies the exact successful workflow run, attempt, and commit.
 - `vendy-idp/deploy/deploy.sh <host> <env-file> [<image-id>]`:
   - ships a supplied local IDP image directly; if omitted, builds first using `deploy/build.sh`;
   - copies the image's packaged `docker-compose.yml`, `Caddyfile` and `cluster-install.sh`, plus `<env-file>` as `.env`, to `/opt/idp`;
@@ -726,7 +731,11 @@ type ObservedVm = {
       at startup; a reused running Caddy reloads it with bounded
      retries. Garbage collection is explicit via `./poc prune-idp-images`
     (`deploy/deploy.sh --prune <host>`), not part of rollout.
-  It must be idempotent and must not prompt.
+   It must be idempotent and must not prompt.
+- The `--ghcr <digest-ref> <image-id>` alternative pulls on the host, verifies the image ID,
+  `linux/arm64` and IDP label, reads packaged deployment files from that same image, then stages it
+  in the loopback registry and uses the same rollout. No local Docker or image copy; optional
+  `GHCR_PULL_USER` and `GHCR_PULL_TOKEN` are used only for temporary registry authentication.
 - `./poc up` configures DNS and restores TLS storage as needed for bootstrap. `./poc deploy-idp
   [<image-id>]` reads the existing host and environment values from local Terraform state, leaves
   DNS and TLS storage alone, and verifies readiness. Both generate these `.env` keys:
