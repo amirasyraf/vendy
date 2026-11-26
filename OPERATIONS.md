@@ -36,6 +36,8 @@ The host key pair is `~/.ssh/id_ed25519` and `.pub`. The repo pins Node via `mis
    Azure CLI selection is checked separately. No Reader PEM or personal browser login is required.
    The GitHub Actions app authenticates by OIDC, never with either certificate. Keep the existing Cloudflare Terraform
    root at `~/projects/cloudflare/amirasyraf.dev`; `poc` applies only the portal record there.
+6. `--gha` pulls the public [`vendy-idp` package](https://github.com/users/amirasyraf/packages/container/package/vendy-idp)
+   anonymously. If using a private package, set the dedicated pull credential below instead.
 
 | Identity or credential | What it does |
 |---|---|
@@ -72,7 +74,7 @@ backups can contain secret material; don't copy them into tickets, logs, or Git.
 | An Actions IDP build or image pull failed | Check the reported run and `idp.log`. A failed build can be rerun on GitHub (the same run ID); a missing artifact or package is not grounds to fall back to `latest`. Check registry visibility or the dedicated read-only credential before resuming. |
 | Bootstrap stopped (or was interrupted) after an exact bake was dispatched, and that bake is running or succeeded | `./poc up --resume <run-id>` bootstraps the IDP while it waits for the bake, then verifies the original bake artifacts, current matching images, owned running host, empty VM state/inventory, and idle workflows. It does not reapply Terraform or rebake. |
 | Terraform partially applied, or the bake actually failed | Inspect `images-apply.log`, `infra-apply.log`, or `bake.log` in `.generated/logs/` as applicable. Resume is not a general repair or rerun command. Preserve state and identify the failed step first. |
-| Azure Reader provisioning or revocation failed | Check the operator certificate and Graph app permissions. Do not upload a replacement Reader PEM. A gated `up --resume` reuses the current secret when otherwise eligible; if no bake was dispatched and bootstrap cannot resume, run `down --keep-images` and start a new cycle. Rerun `down` with the same retention option if Graph revocation could not be verified. |
+| Azure Reader provisioning or revocation failed | Check the operator certificate and Graph app permissions. Do not upload a replacement Reader PEM. When eligible, a gated bootstrap reuses the current secret on resume; with `--gha`, resume also works after golden-image reuse. If bootstrap cannot resume, run `down --keep-images` only when ready to start a new cycle. Rerun `down` with the same retention option if Graph revocation could not be verified. |
 | Portal inaccessible or app release failed | For a bootstrap, inspect `.generated/logs/idp.log` and `dns.log`. On an existing host, `./poc logs caddy 30m` and `./poc logs backstage 30m` separate DNS/TLS/proxy failures from backend readiness and catalog errors. A routine release does not reapply DNS. |
 | An image says **Not available** | Confirm the latest matching AMI or eligible Azure gallery version is usable (including Azure replication). If the image exists, check the IDP backend's `Image availability` warning for a cloud read failure. A new launch request is also refused when availability cannot be verified. |
 | Task page is blank or stuck | `./poc task <task-uuid>` shows the stored task and events. If events exist, inspect `/events` responses, Caddy access logs and `Browser ...` entries. If a deploy just ran, check for the new-version banner or `Browser stale-bundle`. |

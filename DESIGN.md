@@ -738,8 +738,8 @@ commands use the default workspace and reject ambient `TF_CLI_ARGS*` / `TF_VAR_*
 
 ### 12.2 `./poc up`
 
-1. **Preflight**: check Docker/buildx, CLI tools, the AWS account, Azure subscription, the operator's
-   certificate and Microsoft Graph access to the persistent Reader app,
+1. **Preflight**: check CLI tools, Docker/buildx and Compose for local-build mode only, the AWS
+   account, Azure subscription, the operator's certificate and Microsoft Graph access to the persistent Reader app,
    SSH key, Cloudflare configuration, `.poc.env`, and repository AWS/Azure wiring. Refuse to apply
    if `infra/` state is unreadable/nonempty or platform `main` does not have an empty inventory.
    Gate and disable resource workflows; verify they are quiescent and the POC cloud/DNS scope is clean
@@ -765,16 +765,18 @@ commands use the default workspace and reject ambient `TF_CLI_ARGS*` / `TF_VAR_*
    snapshots, gallery versions); a failed prune only warns.
 5. **IDP**: wire `TF_STATE_BUCKET`, `BACKSTAGE_URL` and `BACKSTAGE_TOKEN` in the platform repo.
    Wait for host initialization, apply the targeted Cloudflare DNS record, restore the TLS backup
-   unless Caddy is already running, and deploy from a temporary clone of IDP `main`; the image builds
-   locally from that clone while the host initializes (`idp-build.log`). Sibling checkouts are not
-   rebased or used as bootstrap sources. Require HTTP 200 and authenticated catalog access/refresh,
+   unless Caddy is already running, and use a temporary checkout of the IDP commit. Local mode
+   builds from that checkout while the host initializes (`idp-build.log`); `--gha` starts or reuses
+   the build for the pinned commit before the shared apply (`idp-actions.log`) and pulls it on the
+   host by digest. Sibling checkouts are not rebased or used as bootstrap sources.
+   Require HTTP 200 and authenticated catalog access/refresh,
    connecting to the new host's IP rather than through local DNS, before opening `stage.yml` and the
    platform gate. The IDP does not consume golden images, so a
    needed bake runs in the background during step 5's wiring and bootstrap; the platform gate opens
    only after both the IDP checks and the bake verification succeed.
 
 `up` never clears inventory and has no force option. Failed bootstrap retains resources; check
-`./poc status` and `.generated/logs/{images-apply,infra-apply,bake,idp,idp-build}.log`. An exact dispatch ID is saved in
+`./poc status` and `.generated/logs/{images-apply,infra-apply,bake,idp,idp-build,idp-actions}.log`. An exact dispatch ID is saved in
 `.generated/bake-run-id`. `./poc watch-bake <run-id>` only monitors the run: it returns 0 for success,
 1 for a completed non-success conclusion, and 2 if the outcome is unknown. The monitor polls every
 30 seconds with a two-hour limit (bake jobs are capped at 60 minutes) and stops after 10 consecutive failed status reads. It does not
