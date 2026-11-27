@@ -91,6 +91,11 @@ provider "azuread" {
   tenant_id = var.azure_tenant_id
 }
 
+provider "azapi" {
+  tenant_id       = var.azure_tenant_id
+  subscription_id = var.azure_subscription_id
+}
+
 resource "azuread_application_registration" "buckets" {
   display_name     = "cf-idp-azure-buckets"
   sign_in_audience = "AzureADMyOrg"
@@ -111,36 +116,55 @@ resource "azurerm_resource_group" "buckets" {
   tags     = local.bucket_tags
 }
 
-resource "azurerm_storage_account" "buckets" {
-  name                            = "cfbuckets${local.account_id}"
-  resource_group_name             = azurerm_resource_group.buckets.name
-  location                        = azurerm_resource_group.buckets.location
-  account_tier                    = "Standard"
-  account_replication_type        = "LRS"
-  allow_nested_items_to_be_public = false
-  shared_access_key_enabled       = false
-  default_to_oauth_authentication = true
-  https_traffic_only_enabled      = true
-  min_tls_version                 = "TLS1_2"
-  tags                            = local.bucket_tags
+# AzureRM v4 probes the data plane using shared keys during account creation.
+# Use Azure Resource Manager directly so shared-key access is never enabled.
+resource "azapi_resource" "bucket_storage" {
+  type      = "Microsoft.Storage/storageAccounts@2023-05-01"
+  name      = "cfbuckets${local.account_id}"
+  parent_id = azurerm_resource_group.buckets.id
+  location  = azurerm_resource_group.buckets.location
+  tags      = local.bucket_tags
+  body = {
+    kind = "StorageV2"
+    sku  = { name = "Standard_LRS" }
+    properties = {
+      accessTier                   = "Hot"
+      allowBlobPublicAccess        = false
+      allowSharedKeyAccess         = false
+      defaultToOAuthAuthentication = true
+      minimumTlsVersion            = "TLS1_2"
+      supportsHttpsTrafficOnly     = true
+    }
+  }
+}
 
-  blob_properties {
-    cors_rule {
-      allowed_origins    = [var.bucket_web_origin]
-      allowed_methods    = ["PUT", "GET"]
-      allowed_headers    = ["content-type", "if-match", "if-none-match", "x-ms-*"]
-      exposed_headers    = ["ETag"]
-      max_age_in_seconds = 300
+# The default blob service is created/deleted with its storage account. Only
+# update its ARM properties; the child does not have a standalone delete API.
+resource "azapi_update_resource" "bucket_blob_service" {
+  type        = "Microsoft.Storage/storageAccounts/blobServices@2023-05-01"
+  resource_id = "${azapi_resource.bucket_storage.id}/blobServices/default"
+  body = {
+    properties = {
+      cors = {
+        corsRules = [{
+          allowedOrigins  = [var.bucket_web_origin]
+          allowedMethods  = ["PUT", "GET"]
+          allowedHeaders  = ["content-type", "if-match", "if-none-match", "x-ms-*"]
+          exposedHeaders  = ["ETag"]
+          maxAgeInSeconds = 300
+        }]
+      }
     }
   }
 }
 
 resource "azurerm_role_assignment" "buckets" {
-  scope                            = azurerm_storage_account.buckets.id
+  scope                            = azapi_resource.bucket_storage.id
   role_definition_name             = "Storage Blob Data Contributor"
   principal_id                     = azuread_service_principal.buckets.object_id
   principal_type                   = "ServicePrincipal"
   skip_service_principal_aad_check = true
+  depends_on                       = [azapi_update_resource.bucket_blob_service]
 }
 
 resource "aws_secretsmanager_secret" "azure_buckets" {
@@ -162,7 +186,7 @@ output "bucket_aws_upload_role_arn" {
 }
 
 output "bucket_azure_account" {
-  value = azurerm_storage_account.buckets.name
+  value = azapi_resource.bucket_storage.name
 }
 
 output "bucket_azure_secret_id" {

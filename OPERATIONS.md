@@ -71,7 +71,8 @@ Full `up` creates Bucket infrastructure with the shared Terraform root. To enabl
 already-running POC, initialize `infra` and use a reviewed additive plan for
 `aws_iam_role_policy.idp_buckets`, `aws_iam_role_policy.bucket_upload`,
 `azurerm_role_assignment.buckets` and `aws_secretsmanager_secret_version.azure_buckets` (and their
-dependencies), then redeploy the IDP on the same host. Keep the local state and its backups
+dependencies), then redeploy the IDP on the same host. The storage account and its browser CORS
+rules are managed through Azure Resource Manager with shared-key access disabled. Keep the local state and its backups
 private: Terraform manages the dedicated Azure application's client secret and publishes it only via
 AWS Secrets Manager. If that credential needs rotation, replace the dedicated
 `azuread_application_password.buckets` resource and redeploy the IDP to refresh its in-memory client.
