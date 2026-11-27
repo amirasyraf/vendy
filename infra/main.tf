@@ -4,6 +4,7 @@ terraform {
     aws     = { source = "hashicorp/aws", version = "~> 6.0" }
     random  = { source = "hashicorp/random", version = "~> 3.6" }
     azurerm = { source = "hashicorp/azurerm", version = "~> 4.0" }
+    azuread = { source = "hashicorp/azuread", version = "~> 3.0" }
   }
   # Local state on purpose: nothing remote may outlive `./poc down`. The SSH CA and image gallery
   # are in the separate images/ root, which `./poc down --keep-images` keeps.

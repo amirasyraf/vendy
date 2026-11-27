@@ -40,7 +40,8 @@ action IDs, `computeFactory` config, `compute-factory-workflows` token subject, 
 
 ### 1a. Azure constants
 
-AWS remains the shared base (SSH CA, Terraform state bucket, IDP host); Azure holds only VMs and images.
+AWS remains the shared base (SSH CA, Terraform state bucket, IDP host); Azure also hosts
+VMs, images, container workers and the Bucket product.
 
 | Name | Value |
 |---|---|
@@ -60,6 +61,26 @@ Tooling versions (pin these):
   (the builder adds `pywinrm` for the Windows bake). Collection `ansible.windows` is
   pinned in both repos' `ansible/requirements.yml` and installed by the workflows.
 - Node 24 is pinned by `vendy-idp/mise.toml` and used by its Docker image. The package engine also accepts Node 22.
+
+### 1b. Bucket
+
+- The IDP owns the `buckets` registry and credential-issuance audit in the Backstage `buckets`
+  database. `cf:bucket:create` submits the Scaffolder task ID as the retry key. Catalog records
+  have `spec.type: bucket`, `spec.owner: group:default/<team>`, `cf/bucket-id` (the registry UUID)
+  and `cf/platform`. Ready entries are projected from the IDP; no platform repository writes occur.
+- `infra/buckets.tf` supplies `BUCKET_AWS_ACCOUNT`, `BUCKET_AWS_UPLOAD_ROLE_ARN`,
+  `BUCKET_AZURE_ACCOUNT`, and `BUCKET_AZURE_SECRET_ID` to `pocctl/idp.py` (plus the existing
+  `AWS_REGION`). The Azure secret at `compute-factory/azure-buckets` contains `{tenantId, clientId,
+  clientSecret}` for `cf-idp-azure-buckets`, scoped to the dedicated account. The Azure Reader
+  is separate. The S3 STS role trusts the IDP instance profile and requires a session tag with
+  the target bucket name. A matching session policy limits the CLI grant to object writes
+  (including multipart abort) in that bucket.
+- S3 names are `cf-bucket-<aws-account>-<uuid-without-dashes>`, with `cf:poc=true`,
+  `cf:module=buckets` and `cf:bucket-id=<uuid>` tagged at creation. Azure uses
+  `cfbuckets<aws-account>` in `cf-buckets`, tagged `cf:poc=true`, `cf:module=infra`,
+  `cf:purpose=buckets`. Each private container is `bucket-<uuid>` with `vendybucket=<uuid>`
+  metadata. S3 state and user objects never share a bucket. `./poc down` removes the
+  dedicated resources and all their data even with `--keep-images`.
 
 ## 2. Golden image (bake → provision)
 

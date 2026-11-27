@@ -13,6 +13,10 @@ CPU architecture, and get `https://<name>.apps.idp.amirasyraf.dev`. Worker nodes
 AWS or Azure, so the first container on an idle pool takes a few minutes. See
 [DESIGN.md §13](DESIGN.md#13-containers).
 
+**Storage → Bucket** provisions team-owned S3 buckets and Azure Blob containers. Manage files in
+Vendy or generate temporary AWS CLI / AzCopy upload credentials. Full POC teardown deletes
+Bucket data, including when keeping golden images.
+
 ## Repositories
 
 | Repo | Purpose |

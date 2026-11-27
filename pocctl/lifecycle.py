@@ -12,6 +12,7 @@ from concurrent.futures import wait as wait_futures
 from pathlib import Path
 
 from .azure_reader import check_reader_app, ensure_reader, operator_token, revoke_reader
+from .buckets import purge_buckets, sweep_azure_bucket_group
 from .cloud import (
     delete_image_versions, destroy_vms, prepare_vm_states, remove_empty_state_bucket, state_bucket_keys, stop_idp,
     sweep_azure, sweep_infra_orphans, sweep_tagged, verify_clean, verify_cloud_clean, verify_images_state_empty,
@@ -402,8 +403,12 @@ def cmd_down(keep_images_requested: bool) -> None:
         cancel_runs()
         if not verify_quiescent():
             die("NOT CLEAN: cannot verify resource workflow quiescence")
-        if not stop_idp():
+        idp_stopped = stop_idp()
+        if not idp_stopped:
             warn("could not stop every owned IDP; workflows are frozen and the owned AWS sweep will attempt termination")
+        log("Empty and delete provisioned S3 buckets; verify Azure Bucket ownership")
+        if not purge_buckets(idp_stopped, workers):
+            die("NOT CLEAN: Bucket cleanup or ownership verification failed")
         plan = prepare_vm_states(tmp / "locks")
         if plan is None:
             die("NOT CLEAN: cannot establish state and lock safety; no resource sweep was attempted")
@@ -459,6 +464,8 @@ def cmd_down(keep_images_requested: bool) -> None:
         if azure_ok and not sweep_azure(False, not versions_ok):
             azure_ok = False
             warn("final Azure sweep failed")
+        if not sweep_azure_bucket_group():
+            azure_ok = False
         if not aws_sweep.result():
             warn(f"final AWS {AWS_REGION} sweep failed")
         if not sweep_infra_orphans(versions_ok):

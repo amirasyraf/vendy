@@ -69,6 +69,19 @@ def write_idp_env(path: Path) -> bool:
         f"AZURE_WORKERS_RG={outputs['azure_workers_rg']}\nAZURE_WORKER_SCALE_SETS={outputs['azure_worker_scale_sets']}\n"
         f"AZURE_AUTOSCALER_CLIENT_ID={AZURE_READER_CLIENT_ID}\n"
     )
+    bucket_outputs = {
+        env: tf_output(INFRA_DIR, output) for env, output in (
+            ("BUCKET_AWS_UPLOAD_ROLE_ARN", "bucket_aws_upload_role_arn"),
+            ("BUCKET_AZURE_ACCOUNT", "bucket_azure_account"),
+            ("BUCKET_AZURE_SECRET_ID", "bucket_azure_secret_id"),
+        )
+    }
+    if all(bucket_outputs.values()):
+        content += f"BUCKET_AWS_ACCOUNT={AWS_ACCOUNT}\n"
+        content += "".join(f"{name}={value}\n" for name, value in bucket_outputs.items())
+    elif any(bucket_outputs.values()):
+        warn("Bucket infrastructure outputs are incomplete")
+        return False
     fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_CREAT, 0o600)
     with os.fdopen(fd, "w") as stream:
         stream.write(content)

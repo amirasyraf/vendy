@@ -11,6 +11,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from .buckets import AWS_BUCKET_PREFIX, AZURE_BUCKET_GROUP
 from .core import (
     AWS_ACCOUNT, AWS_REGION, AZURE_READER_SECRET_ID, CLEAN_MAX_ATTEMPTS, CLEAN_RETRY_SECONDS, DOMAIN, GEN, INFRA_DIR,
     IMAGES_DIR, LOGS,
@@ -296,7 +297,7 @@ def sweep_tagged(exclude_infra: bool, keep_images: bool) -> bool:
 def sweep_azure(exclude_infra: bool, keep_gallery: bool) -> bool:
     """Every VM and Packer build has its own resource group tagged cf:poc=true; the image tier's
     gallery group cf-images is cf:module=images."""
-    condition = AZ_POC
+    condition = f"{AZ_POC} && name!='{AZURE_BUCKET_GROUP}'"
     if exclude_infra:
         condition += " && tags.\"cf:module\"!='infra'"
     if keep_gallery:
@@ -631,6 +632,14 @@ def verify_cloud_clean(allow_images: bool) -> bool:
             "ec2", "describe-key-pairs", "--filters", "Name=key-name,Values=cf-idp-admin", "--query", "KeyPairs[].KeyPairId", *text)),
         ("state bucket", "", aws_cmd("s3api", "list-buckets", "--prefix", STATE_BUCKET,
                                      "--query", f"Buckets[?Name=='{STATE_BUCKET}'].Name", *text)),
+        ("S3 Bucket product", "", aws_cmd("s3api", "list-buckets", "--prefix", AWS_BUCKET_PREFIX,
+                                           "--query", "Buckets[].Name", *text)),
+        ("Bucket upload role", "NoSuchEntity", aws_cmd(
+            "iam", "get-role", "--role-name", "cf-bucket-upload", "--query", "Role.RoleName", *text)),
+        ("Azure Bucket resource group", "", az_cmd(
+            "group", "list", "--query", f"[?name=='{AZURE_BUCKET_GROUP}'].id", "-o", "tsv")),
+        ("Azure Bucket secret", "ResourceNotFoundException", aws_cmd(
+            "secretsmanager", "describe-secret", "--secret-id", "compute-factory/azure-buckets", "--query", "ARN", *text)),
         ("IAM role cf-idp", "NoSuchEntity", aws_cmd("iam", "get-role", "--role-name", "cf-idp", "--query", "Role.RoleName", *text)),
         ("IAM instance profile cf-idp", "NoSuchEntity", aws_cmd(
             "iam", "get-instance-profile", "--instance-profile-name", "cf-idp", "--query", "InstanceProfile.InstanceProfileName", *text)),

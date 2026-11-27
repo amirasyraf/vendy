@@ -31,8 +31,9 @@ The host key pair is `~/.ssh/id_ed25519` and `.pub`. The repo pins Node via `mis
    `AUTH_GITHUB_CLIENT_ID` / `AUTH_GITHUB_CLIENT_SECRET` entries are not required.
 5. Set `ARM_CLIENT_ID` and `ARM_CLIENT_CERTIFICATE_PATH` to your operator service principal's
    application ID and PKCS#12 certificate; set `ARM_CLIENT_CERTIFICATE_PASSWORD` if needed.
-   Full `up`/`down` also use that operator certificate for Microsoft Graph (`Application.ReadWrite.All`
-   or `Application.ReadWrite.OwnedBy` with ownership of the persistent `cf-idp-azure-reader` app).
+    Full `up`/`down` also use that operator certificate for Microsoft Graph (`Application.ReadWrite.All`
+    for the Bucket application and the persistent `cf-idp-azure-reader` app) and to assign and remove
+    the Bucket application's storage-account role.
    Azure CLI selection is checked separately. No Reader PEM or personal browser login is required.
    The GitHub Actions app authenticates by OIDC, never with either certificate. Keep the existing Cloudflare Terraform
    root at `~/projects/cloudflare/amirasyraf.dev`; `poc` applies only the portal record there.
@@ -63,6 +64,23 @@ predating this flow (and their old local files or state backups) aren't removed 
 The public platform repo contains VM inventory and its history, including request metadata and public
 addresses. Don't enter secrets or real sensitive data in a POC request. Terraform state and its
 backups can contain secret material; don't copy them into tickets, logs, or Git.
+
+### Bucket infrastructure
+
+Full `up` creates Bucket infrastructure with the shared Terraform root. To enable Bucket on an
+already-running POC, initialize `infra` and use a reviewed additive plan for
+`aws_iam_role_policy.idp_buckets`, `aws_iam_role_policy.bucket_upload`,
+`azurerm_role_assignment.buckets` and `aws_secretsmanager_secret_version.azure_buckets` (and their
+dependencies), then redeploy the IDP on the same host. Keep the local state and its backups
+private: Terraform manages the dedicated Azure application's client secret and publishes it only via
+AWS Secrets Manager. If that credential needs rotation, replace the dedicated
+`azuread_application_password.buckets` resource and redeploy the IDP to refresh its in-memory client.
+
+Full `down`, including `down --keep-images`, wipes user objects and the bucket registry. It stops
+the IDP, verifies S3 ownership tags and the dedicated Azure group, freezes S3 writes, then removes
+multipart uploads, object versions, delete markers and the S3 buckets. Terraform removes the
+Azure storage account and its containers and the dedicated service principal. Teardown reports
+ownership ambiguity or leftovers as `NOT CLEAN`; a name prefix alone never authorizes deletion.
 
 ## Diagnose before retrying
 

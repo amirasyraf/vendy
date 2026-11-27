@@ -59,7 +59,7 @@ are implemented; neither guarantees a cost ceiling.
 | Azure | Subscription `amirasyraf` (`74b39a79-…`), tenant `c26545da-…`, region `australiaeast`. One resource group, VNet, NSG (22 from anywhere) and static public IP per VM |
 | Shared base for Azure | AWS stays the shared base: the SSH CA (Secrets Manager), Terraform state (S3) and the IDP host. Azure stages log in to both clouds |
 | GHA -> Azure | Entra app `cf-github-actions` with federated credentials for the builder and platform repos on `main` (immutable-subject format); Contributor on the subscription. No secrets |
-| IDP -> Azure | Reader service principal `cf-idp-azure-reader`; `up` issues its cycle certificate in Secrets Manager `compute-factory/azure-reader`, read by the IDP host role |
+| IDP -> Azure | Reader service principal `cf-idp-azure-reader`; `up` issues its cycle certificate in `compute-factory/azure-reader`. Bucket has a separate storage-account-scoped identity in `compute-factory/azure-buckets`. |
 
 ## 3. Architecture
 
