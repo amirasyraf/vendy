@@ -288,7 +288,7 @@ def sweep_tagged(exclude_infra: bool, keep_images: bool) -> bool:
     # Windows VM login passwords (platform scripts/vm-password.sh); a VM destroy normally removes its own.
     for secret in listed("VM password secrets", "secretsmanager", "list-secrets", "--filters",
                          "Key=name,Values=compute-factory/vm/", "Key=tag-key,Values=cf:poc", "--query",
-                         "SecretList[?starts_with(Name, `compute-factory/vm/`) && Tags[?Key==`cf:poc`&&Value==`true`]].Name"):
+                          "SecretList[?starts_with(Name, 'compute-factory/vm/') && Tags[?Key=='cf:poc' && Value=='true']].Name"):
         failed |= not delete_aws(f"VM password secret {secret}", "ResourceNotFoundException", "secretsmanager", "delete-secret",
                                  "--secret-id", secret, "--force-delete-without-recovery")
     return not failed
